@@ -31,7 +31,11 @@ import { tmpdir } from 'node:os';
 
 import type { GSDConfig } from './config.js';
 import type { ExecutionEngineFactory } from './phase-runner.js';
-import { GitWorktreeManager, GitMergeSerializer } from './execution-engine.js';
+import {
+  GitWorktreeManager,
+  GitMergeSerializer,
+  GitPhaseIntegrationManager,
+} from './execution-engine.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -200,11 +204,16 @@ export async function buildGitExecutionEngineFactory(
     // `git worktree add` creates the leaf dir but not intermediate parents; the
     // manager does not mkdir its root, so ensure it exists here.
     mkdirSync(worktreeRoot, { recursive: true });
+    const serializer = new GitMergeSerializer(projectDir, protectedBranch, runGate);
     return {
       worktrees: new GitWorktreeManager(projectDir, worktreeRoot),
-      serializer: new GitMergeSerializer(projectDir, protectedBranch, runGate),
+      serializer,
       baseSha,
       isolated: true,
+      // Per-phase branch + promote-on-green (ADR 0013 option 4). Shares the
+      // serializer so its promote merge reuses the same guard suite.
+      phaseIntegration: new GitPhaseIntegrationManager(projectDir, serializer),
+      protectedBranch,
     };
   };
 }

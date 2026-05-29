@@ -37,9 +37,22 @@ import {
   resolveConcurrencyCap,
   SharedCwdWorktreeManager,
   NoopMergeSerializer,
+  NoopPhaseIntegrationManager,
   type WorktreeManager,
   type MergeSerializer,
+  type PhaseIntegrationManager,
 } from './execution-engine.js';
+import {
+  createPhaseCheckpoint,
+  ensureCheckpointGitignore,
+  integrationBranchFor,
+  doneTagFor,
+} from './query/phase-checkpoint.js';
+import { recordPhasePromotion } from './query/phase-manifest.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 // ─── Wave tracker ──────────────────────────────────────────────────────────────
 
@@ -187,6 +200,14 @@ export interface ExecutionEngineFactory {
      * no-op (shared-cwd) engine, whose create() never throws.
      */
     isolated?: boolean;
+    /**
+     * Per-phase branch + promote-on-green collaborator (ADR 0013 option 4).
+     * Present only on the real isolated engine; absent → the no-op path with no
+     * integration branch (the runner substitutes a {@link NoopPhaseIntegrationManager}).
+     */
+    phaseIntegration?: PhaseIntegrationManager;
+    /** Protected branch the phase promotes onto. '' for the no-op path. */
+    protectedBranch?: string;
   };
 }
 
@@ -215,6 +236,23 @@ export class PhaseRunner {
   private readonly config: GSDConfig;
   private readonly logger?: GSDLogger;
   private readonly executionEngineFactory?: ExecutionEngineFactory;
+
+  /**
+   * Active per-phase integration context (ADR 0013 option 4). Set at the FIRST
+   * isolated execute of a phase (checkpoint + integration branch begun); read at
+   * promote-on-green after verify passes. Cleared when the phase settles. Only
+   * the orchestrator touches it; null on the no-op (shared-cwd) path.
+   */
+  private phaseIntegration:
+    | {
+        phaseNumber: string;
+        integrationBranch: string;
+        protectedBranch: string;
+        lastGoodSha: string;
+        baseTag: string;
+        manager: PhaseIntegrationManager;
+      }
+    | null = null;
 
   constructor(deps: PhaseRunnerDeps) {
     this.projectDir = deps.projectDir;
@@ -415,9 +453,38 @@ export class PhaseRunner {
       }
     }
 
+    // ── Step 5.5: Promote-on-green (ADR 0013 option 4) ──
+    // The PHASE is the atomic protected-branch unit: protected moves ONLY here,
+    // and ONLY when the phase is green — gate testExit==0 (carried by the execute
+    // step's success, inv-3) AND verifyPassed. A non-green phase does NOTHING to
+    // protected; the integration branch is left at LAST_GOOD-forked state for
+    // chunk 2's rollback. No-op when no isolated phase integration is active.
+    const verifyPassed = steps.every(s => s.step !== PhaseStepType.Verify || s.success);
+    const executePassed = steps.every(s => s.step !== PhaseStepType.Execute || s.success);
+    const phaseGreen = !halted && verifyPassed && executePassed;
+    if (this.phaseIntegration?.phaseNumber === phaseNumber) {
+      if (phaseGreen) {
+        try {
+          await this.promotePhaseOnGreen(phaseNumber);
+        } catch (err) {
+          // A promote failure must NOT corrupt the lifecycle result; protected is
+          // either fully promoted or untouched (atomic merge). Log and leave the
+          // integration branch in place for chunk 2's recovery.
+          this.logger?.warn(
+            `Phase ${phaseNumber} promote-on-green failed (protected left untouched): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } else {
+        // Not green: protected stays at LAST_GOOD. Drop the active context so the
+        // next phase in the loop starts a fresh checkpoint (chunk 2 owns the
+        // integration-branch cleanup/rollback for the failed phase).
+        this.logger?.warn(`Phase ${phaseNumber} not green — protected left at LAST_GOOD (no promote)`);
+        this.phaseIntegration = null;
+      }
+    }
+
     // ── Step 6: Advance ──
     // Only advance if verify passed — never mark a phase complete when gaps were found.
-    const verifyPassed = steps.every(s => s.step !== PhaseStepType.Verify || s.success);
     if (!halted && verifyPassed) {
       const advanceResult = await this.runAdvanceStep(phaseNumber, sessionOpts, callbacks);
       steps.push(advanceResult);
@@ -895,6 +962,20 @@ export class PhaseRunner {
     const phaseLevel = Number.parseInt(phaseNumber, 10);
     const phaseTag = Number.isFinite(phaseLevel) ? phaseLevel : 0;
 
+    // ── Per-phase integration spine (ADR 0013 option 4) ──
+    // Under the REAL isolated engine that opts into the spine (provides a
+    // phaseIntegration manager + protectedBranch), make the PHASE the atomic
+    // protected-branch unit: checkpoint LAST_GOOD, fork the phase integration
+    // branch off it, and retarget per-plan merges onto it. Protected is left at
+    // LAST_GOOD and only promotes on green (after verify, in run()). Begun ONCE
+    // per phase — gap-closure re-execute reuses the existing integration branch
+    // rather than resetting it (a reset would discard the first execute's merges).
+    // Gated on `phaseIntegration` (not merely `isolated`) so an isolated engine
+    // that does not provide the spine keeps PR #8's per-plan-onto-protected path.
+    if (engine.isolated === true && engine.phaseIntegration) {
+      await this.beginPhaseIntegration(phaseNumber, engine);
+    }
+
     // WaveTracker: emit synthetic WaveStart/WaveComplete at level boundaries so
     // event-stream cardinality stays byte-compatible. Only when parallelizing
     // (parallelization===false emits no wave events, matching prior behaviour).
@@ -1131,6 +1212,92 @@ export class PhaseRunner {
       .filter((d): d is PlanDisposition => d !== undefined);
 
     return { planResults, dispositions };
+  }
+
+  // ─── Per-phase integration spine (ADR 0013 option 4) ─────────────────────
+
+  /**
+   * At the first isolated execute of a phase: checkpoint LAST_GOOD (tag +
+   * doc snapshot), ensure the checkpoint dirs are git-ignored, fork the phase
+   * integration branch off LAST_GOOD, and retarget per-plan merges onto it.
+   * Idempotent across gap-closure re-execute: if this phase's integration is
+   * already begun, reuses it (does NOT reset the branch, which would discard the
+   * first execute's merges).
+   */
+  private async beginPhaseIntegration(
+    phaseNumber: string,
+    engine: { phaseIntegration?: PhaseIntegrationManager; protectedBranch?: string },
+  ): Promise<void> {
+    if (this.phaseIntegration?.phaseNumber === phaseNumber) {
+      // Already begun for this phase (gap-closure re-execute) — keep accumulating
+      // on the existing integration branch; do not re-checkpoint or reset.
+      return;
+    }
+
+    const manager = engine.phaseIntegration ?? new NoopPhaseIntegrationManager();
+    const protectedBranch = engine.protectedBranch ?? '';
+    const integrationBranch = integrationBranchFor(phaseNumber);
+
+    // Checkpoint + git-ignore the snapshot dirs BEFORE forking the branch, so the
+    // guard suite's `git add -A` can never stage them.
+    await ensureCheckpointGitignore(this.projectDir);
+    const checkpoint = await createPhaseCheckpoint({
+      projectDir: this.projectDir,
+      phaseNumber,
+      protectedBranch,
+    });
+
+    await manager.begin(integrationBranch, checkpoint.lastGoodSha);
+
+    this.phaseIntegration = {
+      phaseNumber,
+      integrationBranch,
+      protectedBranch,
+      lastGoodSha: checkpoint.lastGoodSha,
+      baseTag: checkpoint.baseTag,
+      manager,
+    };
+  }
+
+  /**
+   * Promote the active phase's integration branch onto protected — ONE guarded
+   * `merge --no-ff` — record the promotion in the manifest, and tag
+   * `gsd/phase-<N>-done`. Called from run() ONLY after the phase goes green
+   * (gate testExit==0 AND verifyPassed). On a non-green phase this is never
+   * called, so protected stays at LAST_GOOD (the integration branch is left in
+   * place for chunk 2's rollback/retry).
+   *
+   * The orchestrator stamps the promotion timestamp here (no clock in the
+   * manifest writer). Single-writer: only this method moves protected.
+   */
+  private async promotePhaseOnGreen(phaseNumber: string): Promise<void> {
+    const ctx = this.phaseIntegration;
+    if (!ctx || ctx.phaseNumber !== phaseNumber) return;
+
+    const headSha = await ctx.manager.promote(
+      ctx.integrationBranch,
+      ctx.protectedBranch,
+      ctx.lastGoodSha,
+    );
+
+    await recordPhasePromotion({
+      projectDir: this.projectDir,
+      phaseNumber,
+      baseTag: ctx.baseTag,
+      baseSha: ctx.lastGoodSha,
+      headSha,
+      // Orchestrator stamps the clock (the manifest writer has none).
+      promotedAt: new Date().toISOString(),
+    });
+
+    // Tag the promoted protected HEAD. Force so a re-promote (resume) re-pins.
+    await execFileAsync(
+      'git',
+      ['tag', '-f', '-a', doneTagFor(phaseNumber), '-m', `gsd phase ${phaseNumber} promoted @ ${headSha}`, headSha],
+      { cwd: this.projectDir },
+    );
+
+    this.phaseIntegration = null;
   }
 
   /** Synthesize a failed PlanResult for a plan blocked by a failed ancestor. */
