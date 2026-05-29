@@ -221,7 +221,7 @@ The orchestrator-shell / background-workflow / schema-verdict split is reusable:
 
 - **Post-execution verification** — `parallel()` the independent read-only gates (static verify, behavioral test run, code-review, regression, drift); collapses sum → max. Lowest risk (read-only).
 - **`plan-phase`** — `pipeline(research → pattern-map → plan → check)`; fan out per-plan planners (outline → `parallel()` per-plan); revise only changed plans.
-- **`map-codebase` / `code-review`** — dynamic mapper set; review-dimension → verify-finding → fix pipeline.
+- **`map-codebase` / `code-review`** — dynamic mapper set; review-dimension → verify-finding → fix pipeline. *Review-dimension fan-out landed (PR #5): `dynamic-workflows/gsd-code-review-fanout.js` runs 3 read-only dimension reviewers (bugs/security/quality) over the full file set, composed deterministically into a byte-compatible `REVIEW.md` by `compose-review.cjs`; verify-finding deferred; `--fix` stays on the Agent tool.*
 - **`autonomous` cross-phase** — only after the rollback protocol (D5).
 
 ## Consequences

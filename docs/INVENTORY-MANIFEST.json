@@ -1,5 +1,5 @@
 {
-  "generated": "2026-05-21",
+  "generated": "2026-05-29",
   "families": {
     "agents": [
       "gsd-advisor-researcher",
@@ -270,6 +270,7 @@
       "command-aliases.generated.cjs",
       "command-routing-hub.cjs",
       "commands.cjs",
+      "compose-review.cjs",
       "config-schema.cjs",
       "config.cjs",
       "configuration.generated.cjs",

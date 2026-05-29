@@ -1,0 +1,6 @@
+---
+type: Added
+pr: 5
+---
+
+**Code-review dimension fan-out (ADR 0013 rollout).** `/gsd:code-review` now fans the review out across three read-only dimension agents — bugs/logic, security, and code-quality — each reviewing the full file set at the resolved depth, via a new `dynamic-workflows/gsd-code-review-fanout.js` workflow. The dimension agents return structured findings and write nothing; the orchestrator owns the single `REVIEW.md` write through a new deterministic, dependency-free `get-shit-done/bin/lib/compose-review.cjs` (single-writer invariant). The composed `REVIEW.md` stays byte-compatible with the previous `gsd-code-reviewer` `write_review` contract — frontmatter `status` / `files_reviewed_list` / severity counts and `CR-`/`WR-`/`IN-` finding IDs — so `present_results` and the `--fix`/`--auto` pipeline are unaffected (the `--fix` path is untouched). Read-only and collision-safe: no branch runs tests or writes files, so the fan-out is safe against the shared working tree. When the Workflow tool is unavailable (Codex, Gemini CLI, Antigravity), the workflow falls through to the verbatim single-agent `gsd-code-reviewer` path that authors `REVIEW.md` itself. The verify-finding middle stage is deferred (single `parallel()` barrier only). See `docs/adr/0013-dynamic-workflow-parallelization.md` §Rollout template.

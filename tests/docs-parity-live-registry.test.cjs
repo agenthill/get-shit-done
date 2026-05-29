@@ -147,6 +147,13 @@ const INTERNAL_COMPONENT_SLUGS = new Set([
   // docs/discussions/grok-build-support-2026-05.md. The regex captures
   // "/gsd-sync-skills" from the path. Invoked via Skill(skill="gsd-sync-skills").
   'sync-skills',
+
+  // gsd-code-review-fanout — dynamic-workflow filename
+  // (dynamic-workflows/gsd-code-review-fanout.js), NOT a registered slash
+  // command (no commands/gsd/code-review-fanout.md). Docs reference it as a
+  // filesystem path component in docs/adr/0013-dynamic-workflow-parallelization.md;
+  // the regex captures "/gsd-code-review-fanout" from the path.
+  'code-review-fanout',
 ]);
 
 /**
