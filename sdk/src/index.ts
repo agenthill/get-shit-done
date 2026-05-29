@@ -38,8 +38,12 @@ import { PromptFactory } from './phase-prompt.js';
 import { detectRuntime } from './query/helpers.js';
 import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
 import { classifyAgentFailure } from './query/agent-failure-classifier.js';
-import { rollbackTier1 } from './query/rollback-engine.js';
+import { rollbackTier1, cascadeRollbackTier2 } from './query/rollback-engine.js';
 import { writeRollbackLedger } from './query/rollback-ledger.js';
+import { readPhaseManifest } from './query/phase-manifest.js';
+import { classifyCascade } from './query/tier2-cascade-classifier.js';
+import { readPhaseDependsOn } from './query/phase-depends-on.js';
+import { GitMergeSerializer } from './execution-engine.js';
 import { stateSignalWaiting, stateSignalResume } from './query/state-mutation.js';
 
 export { PlanningJournal } from './planning-journal.js';
@@ -397,6 +401,27 @@ export class GSD {
           });
           return { result, halted: true };
         }
+
+        // ── Tier-2 cascade attribution (ADR 0013 option 4, chunk 3) ──
+        // After phase N's clean Tier-1, BEFORE deciding to informed-retry, ask
+        // whether the failure implicates an ALREADY-PROMOTED predecessor.
+        // ATTRIBUTABLE-ONLY else HALT:
+        //   - revert-confident  → cascade-revert the attributable depends_on-
+        //                         linked predecessors, then HALT for a human
+        //                         (reverting promoted work unattended is
+        //                         halt-worthy; never auto-retry after Tier-2).
+        //   - cannot-classify   → HALT with a clean tree (an inability to decide
+        //                         must NEVER masquerade as no-cascade).
+        //   - no-cascade-confident → fall through to chunk-2's informed retry.
+        const cascadeHalt = await this.maybeCascadeTier2(
+          phase,
+          result.rollbackContext,
+          { attempt, signal, detail },
+          failureContext,
+        );
+        if (cascadeHalt) {
+          return { result, halted: true };
+        }
       }
 
       // Accumulate this attempt's failure context.
@@ -461,6 +486,126 @@ export class GSD {
   }
 
   /**
+   * Tier-2 cascade decision (ADR 0013 option 4, chunk 3). Run AFTER phase N's
+   * clean Tier-1 rollback, BEFORE the informed-retry decision. Reads the phase
+   * manifest + the failure's implicated files and classifies whether a promoted
+   * predecessor should be cascade-reverted:
+   *
+   *   - `revert-confident`     → run the Tier-2 cascade over the attributable
+   *                              set, persist a {tier:2, cascade_set,
+   *                              status:'halted'} ledger, and return true (HALT).
+   *   - `cannot-classify`      → persist a halted ledger and return true (HALT
+   *                              clean — never cascade on a guess).
+   *   - `no-cascade-confident` → return false (fall through to informed retry).
+   *
+   * Returns true when the caller must HALT the autonomous loop.
+   */
+  private async maybeCascadeTier2(
+    phase: RoadmapPhaseInfo,
+    rollbackContext: NonNullable<PhaseRunnerResult['rollbackContext']>,
+    thisAttempt: PhaseFailureContext,
+    failureContext: PhaseFailureContext[],
+  ): Promise<boolean> {
+    const manifest = await readPhaseManifest(this.projectDir);
+    // No promoted predecessor at all → there is nothing to cascade onto; skip
+    // the classifier entirely and let the informed-retry path handle phase N.
+    if (Object.keys(manifest).length === 0) return false;
+
+    const implicatedFiles = extractImplicatedFiles(thisAttempt.detail);
+    // A genuine failure whose detail names no files cannot be ATTRIBUTED. When a
+    // depends_on-linked promoted predecessor is a cascade candidate, that
+    // inability-to-decide must HALT (cannot-classify), never silently retry past
+    // a predecessor the failure might have broken. The classifier only applies
+    // this gate once a candidate exists (no candidate ⇒ confident no-cascade).
+    const implicatedFilesUncertain = implicatedFiles.length === 0;
+
+    // The failing phase has not promoted, so its phase-level depends_on lives
+    // only in the ROADMAP. Read it so the classifier's closure walk starts from
+    // the failing phase's real dependency edges.
+    let failingPhaseDependsOn: string[] = [];
+    try {
+      failingPhaseDependsOn = await readPhaseDependsOn(this.projectDir, phase.number, this.workstream);
+    } catch {
+      failingPhaseDependsOn = [];
+    }
+
+    let cls;
+    try {
+      cls = await classifyCascade({
+        projectDir: this.projectDir,
+        failingPhase: phase.number,
+        manifest,
+        implicatedFiles,
+        implicatedFilesUncertain,
+        failingPhaseDependsOn,
+      });
+    } catch (err) {
+      // The classifier itself failing is an inability to decide → HALT clean.
+      const clsDetail = err instanceof Error ? err.message : String(err);
+      await writeRollbackLedger(this.projectDir, {
+        failed_phase: phase.number,
+        attempt_count: thisAttempt.attempt,
+        failure_context: [
+          ...failureContext,
+          { ...thisAttempt, detail: `${thisAttempt.detail} | Tier-2 classifier error: ${clsDetail}` },
+        ],
+        status: 'halted',
+        tier: 2,
+        cascade_set: [],
+      });
+      return true;
+    }
+
+    if (cls.verdict === 'no-cascade-confident') {
+      return false; // fall through to chunk-2's informed retry
+    }
+
+    if (cls.verdict === 'cannot-classify') {
+      // HALT clean — inability to decide must never be downgraded to no-cascade.
+      await writeRollbackLedger(this.projectDir, {
+        failed_phase: phase.number,
+        attempt_count: thisAttempt.attempt,
+        failure_context: [...failureContext, thisAttempt],
+        status: 'halted',
+        tier: 2,
+        cascade_set: [],
+      });
+      return true;
+    }
+
+    // revert-confident: cascade-revert the attributable set, then HALT.
+    const serializer = new GitMergeSerializer(
+      this.projectDir,
+      rollbackContext.protectedBranch,
+      async () => 0, // the revert's guard suite never runs the build gate
+    );
+    const casc = await cascadeRollbackTier2({
+      projectDir: this.projectDir,
+      protectedBranch: rollbackContext.protectedBranch,
+      cascadeSet: cls.cascadeSet,
+      manifest,
+      serializer,
+      ...(this.workstream && { workstream: this.workstream }),
+    });
+
+    await writeRollbackLedger(this.projectDir, {
+      failed_phase: phase.number,
+      attempt_count: thisAttempt.attempt,
+      failure_context: [
+        ...failureContext,
+        {
+          ...thisAttempt,
+          detail: `${thisAttempt.detail} | Tier-2 ${casc.status}: reverted [${casc.revertedPhases.join(', ')}]${casc.haltReason ? ` (${casc.haltReason})` : ''}`,
+        },
+      ],
+      status: 'halted',
+      tier: 2,
+      cascade_set: cls.cascadeSet,
+    });
+    return true;
+  }
+
+  /**
    * Filter to incomplete phases and sort numerically.
    * Uses parseFloat to handle decimal phase numbers (e.g. '5.1').
    */
@@ -495,6 +640,42 @@ export class GSD {
 
     return undefined;
   }
+}
+
+/**
+ * Extract repo-relative file paths a failure detail implicates (ADR 0013 option
+ * 4, chunk 3). The Tier-2 classifier intersects these with a promoted
+ * predecessor's touched paths to decide attribution. Conservative: matches
+ * path-like tokens with a slash-or-known-source-extension, strips surrounding
+ * punctuation, dedupes. An EMPTY result is a confident "no files named" for a
+ * gate/verify failure (→ no-cascade); for a throw it is treated as uncertain by
+ * the caller. We do NOT invent attributions — only tokens that clearly look
+ * like file paths are returned.
+ */
+export function extractImplicatedFiles(detail: string): string[] {
+  if (!detail) return [];
+  const out = new Set<string>();
+  // Path-like tokens: a run of path chars containing a slash OR ending in a
+  // recognized source/test/doc extension. Anchored on whitespace, quotes,
+  // parens, and common list punctuation so we trim delimiters.
+  const tokenRe = /[A-Za-z0-9_.\-/]+/g;
+  const sourceExt =
+    /\.(ts|tsx|js|jsx|mjs|cjs|json|md|py|rs|go|java|rb|sh|yml|yaml|toml|css|scss|html|sql)$/i;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(detail)) !== null) {
+    let tok = m[0];
+    // Strip trailing sentence punctuation a token may have captured.
+    tok = tok.replace(/[.,;:)]+$/, '');
+    if (tok.length < 3) continue;
+    // Drop a trailing `:line` / `:line:col` location suffix so the path matches
+    // a predecessor's touched-path exactly (e.g. `lib/bar.js:12` → `lib/bar.js`).
+    tok = tok.replace(/(:\d+){1,2}$/, '');
+    const looksLikePath = tok.includes('/') || sourceExt.test(tok);
+    if (!looksLikePath) continue;
+    // Normalize a leading `./`.
+    out.add(tok.replace(/^\.\//, ''));
+  }
+  return [...out];
 }
 
 // ─── Re-exports for advanced usage ──────────────────────────────────────────

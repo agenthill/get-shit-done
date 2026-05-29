@@ -62,6 +62,14 @@ export interface ClassifyCascadeInput {
    * resolves to no-cascade. Default false.
    */
   implicatedFilesUncertain?: boolean;
+  /**
+   * The failing phase's OWN phase-level `depends_on` (canonicalized phase
+   * numbers), read from the ROADMAP. The failing phase has NOT promoted, so it
+   * has no manifest entry and its dependency edges are not otherwise known. When
+   * supplied, the closure walk is seeded from these edges. Absent/empty ⇒ the
+   * failing phase declares no dependencies ⇒ no-cascade.
+   */
+  failingPhaseDependsOn?: string[];
 }
 
 export interface ClassifyCascadeResult {
@@ -111,17 +119,20 @@ async function commitTouchedPaths(projectDir: string, commit: string): Promise<s
  * predecessor. ATTRIBUTABLE-ONLY, else HALT.
  *
  * Decision order (each ambiguity is cannot-classify, never no-cascade):
- *   1. Corrupt/missing manifest (the failing phase is absent, or any entry is
- *      structurally invalid) → cannot-classify.
- *   2. Cyclic phase depends_on graph (transitiveDependsOnClosure.hasCycle) →
+ *   1. Corrupt/missing manifest (any entry structurally invalid) →
  *      cannot-classify.
- *   3. Implicated files uncertain → cannot-classify.
- *   4. closure ∩ promoted: the depends_on-linked promoted predecessors. Empty →
- *      no-cascade-confident (the failure has no promoted predecessor to blame).
+ *   2. Cyclic phase depends_on graph (transitiveDependsOnClosure.hasCycle) →
+ *      cannot-classify. (The failing phase's own edges are seeded from
+ *      `failingPhaseDependsOn` since it has not promoted.)
+ *   3. closure ∩ promoted: the depends_on-linked promoted predecessors. Empty →
+ *      no-cascade-confident (no promoted predecessor to blame — REGARDLESS of
+ *      file uncertainty, since there is no live cascade decision).
+ *   4. Implicated files uncertain WHILE a cascade candidate exists →
+ *      cannot-classify (cannot attribute → refuse to guess).
  *   5. For each linked promoted predecessor, intersect the failure's implicated
  *      files with the UNION of that predecessor's commits' touched paths
  *      (diff-tree). A git failure diffing any candidate's commit →
- *      cannot-classify.
+ *      cannot-classify. (A CERTAIN empty implicated set → no-cascade.)
  *   6. attributable set non-empty → revert-confident (cascade set, reverse
  *      promotion order). Empty → no-cascade-confident.
  */
@@ -146,7 +157,28 @@ export async function classifyCascade(
   }
 
   // ── 2. PHASE-TIER cycle check ──
-  const { closure, hasCycle } = transitiveDependsOnClosure(manifest, failingPhase);
+  // The failing phase has NOT promoted, so it is absent from the manifest and
+  // its dependency edges are unknown to the closure walk. Seed a transient
+  // manifest entry from `failingPhaseDependsOn` (read from the ROADMAP) so the
+  // closure starts from the failing phase's real edges. Does not mutate the
+  // caller's manifest.
+  const failingCanon = canonicalizePhaseId(failingPhase) || failingPhase;
+  let walkManifest = manifest;
+  const alreadyPresent = entries.some(([k]) => (canonicalizePhaseId(k) || k) === failingCanon);
+  if (!alreadyPresent && (input.failingPhaseDependsOn?.length ?? 0) > 0) {
+    walkManifest = {
+      ...manifest,
+      [failingCanon]: {
+        base_tag: '',
+        base_sha: '',
+        head_sha: '',
+        commits: [],
+        promoted_at: '',
+        depends_on: input.failingPhaseDependsOn!,
+      },
+    };
+  }
+  const { closure, hasCycle } = transitiveDependsOnClosure(walkManifest, failingPhase);
   if (hasCycle) {
     return {
       verdict: 'cannot-classify',
@@ -155,16 +187,7 @@ export async function classifyCascade(
     };
   }
 
-  // ── 3. Implicated-file uncertainty ──
-  if (input.implicatedFilesUncertain) {
-    return {
-      verdict: 'cannot-classify',
-      cascadeSet: [],
-      reason: 'failure implicated-files could not be determined — refusing to guess',
-    };
-  }
-
-  // ── 4. closure ∩ promoted predecessors ──
+  // ── 3. closure ∩ promoted predecessors ──
   // A phase is "promoted" iff it has a manifest entry. Canonicalize for matching.
   const promoted = new Set(entries.map(([k]) => canonicalizePhaseId(k) || k));
   const failing = canonicalizePhaseId(failingPhase) || failingPhase;
@@ -173,10 +196,25 @@ export async function classifyCascade(
     .filter(p => p !== failing && promoted.has(p));
 
   if (linkedPromoted.length === 0) {
+    // No promoted predecessor is even a candidate → confidently no-cascade,
+    // REGARDLESS of implicated-file uncertainty (there is nothing to blame, so
+    // ambiguity about WHICH files broke cannot affect the cascade decision).
     return {
       verdict: 'no-cascade-confident',
       cascadeSet: [],
       reason: 'no promoted predecessor in the failing phase\'s depends_on closure',
+    };
+  }
+
+  // ── 4. Implicated-file uncertainty (only once a cascade candidate exists) ──
+  // A depends_on-linked promoted predecessor IS a candidate, so we MUST be able
+  // to attribute the failure to decide. If the implicated files are unknown,
+  // refuse to guess → cannot-classify (the #2983 rule).
+  if (input.implicatedFilesUncertain) {
+    return {
+      verdict: 'cannot-classify',
+      cascadeSet: [],
+      reason: 'failure implicated-files could not be determined while a depends_on-linked promoted predecessor exists — refusing to guess',
     };
   }
 
