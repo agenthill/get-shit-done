@@ -117,6 +117,55 @@ export async function readPhaseDependsOn(
 }
 
 /**
+ * Read a phase's `**Requirements:**` IDs from the current-milestone ROADMAP.
+ * Same section-scan as {@link readPhaseDependsOn}, reading the `**Requirements:**`
+ * line instead. Returns `[]` when absent. Used by the Tier-2 unwind to know
+ * which requirement IDs to mark incomplete for a reverted phase. Mirrors the
+ * requirement-ID extraction in phaseComplete (phase-lifecycle.ts:1318-1324):
+ * strip brackets, split on commas/whitespace, drop blanks.
+ */
+export async function readPhaseRequirements(
+  projectDir: string,
+  phaseNumber: string,
+  workstream?: string,
+): Promise<string[]> {
+  const roadmapPath = planningPaths(projectDir, workstream).roadmap;
+  let rawContent: string;
+  try {
+    rawContent = await readFile(roadmapPath, 'utf-8');
+  } catch {
+    return [];
+  }
+
+  const content = await extractCurrentMilestone(rawContent, projectDir, workstream);
+  const headerRe = new RegExp(
+    `#{2,4}\\s*Phase\\s+0*${escapeRegex(phaseNumber.replace(/^0+/, ''))}\\s*:`,
+    'i',
+  );
+  const headerMatch = content.match(headerRe);
+  if (!headerMatch || headerMatch.index === undefined) return [];
+
+  const sectionStart = headerMatch.index;
+  const rest = content.slice(sectionStart + headerMatch[0].length);
+  const nextHeader = rest.match(/\n#{2,4}\s+Phase\s+\d/i);
+  const sectionEnd =
+    nextHeader && nextHeader.index !== undefined
+      ? sectionStart + headerMatch[0].length + nextHeader.index
+      : content.length;
+  const section = content.slice(sectionStart, sectionEnd);
+
+  const reqMatch = section.match(/\*\*Requirements\*?\*?:?\s*([^\n]+)/i);
+  if (!reqMatch) return [];
+  return reqMatch[1]!
+    .replace(/[[\]]/g, '')
+    .split(/[,\s]+/)
+    .map(r => r.trim())
+    .filter(Boolean)
+    // Drop obvious non-ID placeholders like "TBD".
+    .filter(r => /^[A-Za-z]/.test(r) && r.toUpperCase() !== 'TBD');
+}
+
+/**
  * Result of a transitive-closure walk over the manifest's phase-level
  * `depends_on` edges.
  */

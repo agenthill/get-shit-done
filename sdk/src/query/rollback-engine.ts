@@ -28,12 +28,16 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { copyFile, access } from 'node:fs/promises';
+import { copyFile, access, mkdir, rename, readFile, readdir } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { join } from 'node:path';
 import { GSDError, ErrorClassification } from '../errors.js';
 import { branchNameFor } from '../execution-engine.js';
-import { baseTagFor } from './phase-checkpoint.js';
+import { baseTagFor, checkpointDirFor } from './phase-checkpoint.js';
+import type { PhaseManifest } from './phase-manifest.js';
+import { phaseUncomplete, requirementsMarkIncomplete } from './phase-lifecycle.js';
+import { readPhaseRequirements } from './phase-depends-on.js';
+import { normalizePhaseName, phaseTokenMatches, planningPaths } from './helpers.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -151,6 +155,419 @@ export async function rollbackTier1(input: RollbackTier1Input): Promise<Rollback
     reapedBranches,
     restoredDocs,
   };
+}
+
+// ─── Tier-2: cascade-revert an ALREADY-PROMOTED predecessor (chunk 3) ─────────
+
+/** Minimal serializer surface the Tier-2 revert reuses (the guard suite over the
+ * revert delta). Satisfied by GitMergeSerializer.runGuardSuite. */
+export interface GuardSuiteRunner {
+  runGuardSuite(baseTip: string): Promise<void>;
+}
+
+export interface RollbackTier2Input {
+  projectDir: string;
+  /** The protected branch the reverts land on (history-preserving). */
+  protectedBranch: string;
+  /** Protected HEAD BEFORE this phase's revert — the guard-suite baseTip. */
+  protectedTipBeforeRevert: string;
+  /** The promoted phase being unwound. */
+  phaseNumber: string;
+  /** The phase's manifest entry (its `commits` are reverted, newest-first). */
+  manifest: PhaseManifest;
+  /** Reuses the merge serializer's guard suite over the revert delta. */
+  serializer: GuardSuiteRunner;
+  workstream?: string;
+}
+
+export type RollbackTier2Status = 'reverted' | 'halted';
+
+export interface RollbackTier2Result {
+  status: RollbackTier2Status;
+  /** Protected HEAD after the revert commit (when status === 'reverted'). */
+  protectedSha?: string;
+  /** The single revert commit sha (when status === 'reverted'). */
+  revertCommit?: string;
+  /** Quarantined doc basenames moved under `.planning/.rollback-quarantine/phase-M/`. */
+  quarantined: string[];
+  /** Requirement IDs marked incomplete. */
+  requirementsMarkedIncomplete: string[];
+  /** Reason the unwind HALTed (status === 'halted'). */
+  haltReason?: string;
+}
+
+/** `.planning/.rollback-quarantine/phase-<N>` — where reverted summaries move. */
+function quarantineDirFor(projectDir: string, phaseNumber: string): string {
+  const safe = String(phaseNumber).replace(/[^A-Za-z0-9._-]/g, '-');
+  return join(projectDir, '.planning', '.rollback-quarantine', `phase-${safe}`);
+}
+
+/**
+ * Tier-2 cascade revert of ONE already-promoted phase, in the FORCED restore
+ * order (ADR 0013 option 4, chunk 3, step 8). The caller drives the cascade set
+ * in REVERSE promotion order, calling this once per reverted phase, snapshotting
+ * the protected tip before each call.
+ *
+ * Forced restore order (each is fail-closed; a conflict or a missing snapshot
+ * HALTs with a CLEAN tree — never a half-reverted protected branch):
+ *
+ *   1. GIT: `git revert --no-commit` over the phase's manifest commits
+ *      (history-preserving — NEVER reset-hard on protected, reverse order so a
+ *      later commit reverts before the earlier it built on), run the guard suite
+ *      over the revert delta (`protectedTipBeforeRevert..HEAD`), then commit ONE
+ *      `revert(phase-M): autonomous unwind`. ON CONFLICT with a kept later
+ *      phase: `git revert --abort` + `git reset HEAD` + `git restore .` FIRST
+ *      (leave a clean tree), THEN return status:'halted' (judge-defect #1).
+ *   2. QUARANTINE (move, NOT delete): the phase's `*-SUMMARY.md` /
+ *      `VERIFICATION.md` / `UAT.md` move to `.planning/.rollback-quarantine/
+ *      phase-M/` so disk_status reverts complete→planned and `has_summary` flips.
+ *   3. ROADMAP: `phase.uncomplete` for M (ROADMAP-complete is trusted over disk).
+ *   4. REQUIREMENTS: `requirements.mark-incomplete` for M's requirements.
+ *   5. STATE: restore STATE.md from the phase-M checkpoint snapshot (preserves
+ *      cumulative counters disk-rederive can't reconstruct). Missing/corrupt
+ *      snapshot → HALT (do NOT produce an inconsistent STATE).
+ *
+ * This function does NOT write ROLLBACK.json or re-derive the loop's halt state;
+ * the caller writes the Tier-2 ledger after the cascade completes. A HALT here
+ * returns status:'halted' with a clean tree so the caller stops the cascade.
+ */
+export async function rollbackTier2(input: RollbackTier2Input): Promise<RollbackTier2Result> {
+  const {
+    projectDir,
+    protectedBranch,
+    protectedTipBeforeRevert,
+    phaseNumber,
+    manifest,
+    serializer,
+    workstream,
+  } = input;
+  const git = (args: string[]) => execFileAsync('git', args, { cwd: projectDir });
+
+  const result: RollbackTier2Result = {
+    status: 'reverted',
+    quarantined: [],
+    requirementsMarkedIncomplete: [],
+  };
+
+  const entry = manifest[String(phaseNumber)];
+  if (!entry) {
+    return { ...result, status: 'halted', haltReason: `no manifest entry for phase ${phaseNumber}` };
+  }
+
+  // ── 1. GIT revert (history-preserving) ──
+  // Be on protected before reverting (the revert commit lands here). protected
+  // is at protectedTipBeforeRevert.
+  await git(['checkout', protectedBranch]);
+
+  // The phase manifest (`.planning/.phase-manifest.json`) is a derived ledger
+  // written AFTER each promote, so it can be dirty in the working tree when
+  // Tier-2 runs. `git revert` refuses on a dirty tracked file ("local changes
+  // would be overwritten"), so checkpoint any pending manifest write into a
+  // commit first — keeps the tree clean for the revert WITHOUT discarding the
+  // ledger. Best-effort: a no-op when the manifest is unchanged/absent.
+  await stageAndCommitManifestIfDirty(git);
+
+  // Revert the phase's commits NEWEST-first so a later commit's revert applies
+  // cleanly over the earlier ones still present. --no-commit accumulates the
+  // combined inverse into the index/worktree for a SINGLE revert commit.
+  //
+  // The integration spine promotes a phase with `merge --no-ff`, so the
+  // manifest range (base..head) contains BOTH the merge commit AND the work
+  // commits brought in through its second parent. Reverting a `-m 1` merge
+  // already undoes that whole merged subtree, so separately reverting the work
+  // commits would DOUBLE-revert and spuriously conflict. We therefore skip any
+  // commit reachable through a reverted merge's second parent (it is already
+  // covered). Merge commits are reverted with `--mainline 1`; plain commits
+  // plainly.
+  const commits = [...(entry.commits ?? [])].reverse(); // newest-first
+  const covered = new Set<string>();
+  let conflicted = false;
+  let conflictDetail = '';
+  for (const commit of commits) {
+    if (covered.has(commit)) continue;
+    const parents = await commitParents(projectDir, commit);
+    const isMerge = parents.length > 1;
+    try {
+      if (isMerge) {
+        await git(['revert', '--no-commit', '--mainline', '1', commit]);
+        // Mark the second-parent subtree (the merged work) as covered so we do
+        // not double-revert those commits.
+        for (const c of await secondParentSubtree(projectDir, commit, entry.base_sha)) {
+          covered.add(c);
+        }
+      } else {
+        await git(['revert', '--no-commit', commit]);
+      }
+    } catch (e) {
+      conflicted = true;
+      conflictDetail = (e as { stderr?: string })?.stderr ?? (e instanceof Error ? e.message : String(e));
+      break;
+    }
+  }
+
+  if (conflicted) {
+    // ON CONFLICT: leave a CLEAN tree FIRST (judge-defect #1), THEN halt.
+    await git(['revert', '--abort']).catch(() => {});
+    await git(['reset', 'HEAD']).catch(() => {});
+    await git(['restore', '.']).catch(() => {});
+    // Also drop any untracked residue the partial revert may have produced.
+    await git(['clean', '-fd']).catch(() => {});
+    return {
+      ...result,
+      status: 'halted',
+      haltReason: `git revert of phase ${phaseNumber} conflicts with a kept later phase — clean tree restored, no half-revert${conflictDetail ? ` [${conflictDetail.trim()}]` : ''}`,
+    };
+  }
+
+  // Guard suite over the revert delta (protectedTipBeforeRevert..HEAD): the
+  // revert may have dropped files a kept later phase relies on, so the same
+  // bulk-delete / STATE-restore / resurrection guards apply. The revert is still
+  // staged (--no-commit) so the guard suite sees it as the working delta once we
+  // commit; run it AFTER committing so HEAD reflects the revert.
+  let revertCommit: string;
+  try {
+    await git(['commit', '--no-verify', '-m', `revert(phase-${phaseNumber}): autonomous unwind`]);
+    revertCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+    await serializer.runGuardSuite(protectedTipBeforeRevert);
+    // The guard suite may have added its own restore commit; re-read HEAD.
+    revertCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+  } catch (err) {
+    // Commit failed (e.g. nothing to revert / empty) — clean up and halt rather
+    // than leave a partial state.
+    await git(['reset', '--hard', protectedTipBeforeRevert]).catch(() => {});
+    return {
+      ...result,
+      status: 'halted',
+      haltReason: `revert commit/guard failed for phase ${phaseNumber}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  result.revertCommit = revertCommit;
+  result.protectedSha = revertCommit;
+
+  // ── 2. QUARANTINE (move, NOT delete) the phase's summaries/verification/UAT ──
+  // Locate the phase directory under .planning/phases and move its lifecycle
+  // artifacts so disk_status reverts complete→planned and has_summary flips.
+  const quarantined = await quarantinePhaseArtifacts(projectDir, phaseNumber, workstream);
+  result.quarantined = quarantined;
+
+  // ── 3. ROADMAP: phase.uncomplete (MANDATORY — ROADMAP-complete > disk) ──
+  await phaseUncomplete([String(phaseNumber)], projectDir, workstream);
+
+  // ── 4. REQUIREMENTS: mark the phase's requirements incomplete ──
+  const reqIds = await readPhaseRequirements(projectDir, String(phaseNumber), workstream);
+  if (reqIds.length > 0) {
+    await requirementsMarkIncomplete(reqIds, projectDir, workstream);
+    result.requirementsMarkedIncomplete = reqIds;
+  }
+
+  // ── 5. STATE: restore from the phase-M checkpoint snapshot ──
+  // Preserves the cumulative Performance-Metrics counter + archived decisions a
+  // disk-rederive can't reconstruct. Missing/corrupt → HALT (never an
+  // inconsistent STATE).
+  const snapshotState = join(checkpointDirFor(projectDir, String(phaseNumber)), 'STATE.md');
+  let stateBody: string;
+  try {
+    stateBody = await readFile(snapshotState, 'utf-8');
+    if (!stateBody || stateBody.trim().length === 0) {
+      throw new Error('empty STATE.md snapshot');
+    }
+  } catch (err) {
+    return {
+      ...result,
+      status: 'halted',
+      haltReason: `phase ${phaseNumber} checkpoint STATE.md snapshot missing/corrupt — refusing to produce an inconsistent STATE: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  // Restore the snapshotted STATE.md body onto the working copy.
+  await copyFile(snapshotState, join(projectDir, '.planning', 'STATE.md'));
+
+  return result;
+}
+
+export interface CascadeRollbackTier2Input {
+  projectDir: string;
+  protectedBranch: string;
+  /** Cascade set in REVERSE promotion order (newest-promoted first). */
+  cascadeSet: string[];
+  manifest: PhaseManifest;
+  serializer: GuardSuiteRunner;
+  workstream?: string;
+}
+
+export interface CascadeRollbackTier2Result {
+  /** 'reverted' = whole cascade unwound cleanly; 'halted' = stopped on a
+   * conflict / missing snapshot with a CLEAN tree (no half-revert). Either way
+   * the autonomous driver HALTs (reverting promoted work is halt-worthy). */
+  status: RollbackTier2Status;
+  /** Per-phase results, in the order attempted (reverse promotion order). */
+  perPhase: Array<{ phase: string } & RollbackTier2Result>;
+  /** Phases whose revert commit actually landed on protected. */
+  revertedPhases: string[];
+  haltReason?: string;
+}
+
+/**
+ * Drive a Tier-2 cascade over the classifier's cascade set, in REVERSE
+ * promotion order, snapshotting the protected tip before each phase's revert so
+ * the guard suite diffs exactly that phase's revert delta. Stops at the FIRST
+ * phase that HALTs (a conflict / missing snapshot leaves a clean tree), so a
+ * later phase in the set is never half-reverted.
+ *
+ * Does NOT write ROLLBACK.json — the caller persists the Tier-2 ledger
+ * ({tier:2, cascade_set, status:'halted'}) once the cascade settles, because
+ * reverting promoted work unattended is itself a halt-worthy event under the
+ * conservative posture (the driver never auto-retries/advances after Tier-2).
+ */
+export async function cascadeRollbackTier2(
+  input: CascadeRollbackTier2Input,
+): Promise<CascadeRollbackTier2Result> {
+  const { projectDir, protectedBranch, cascadeSet, manifest, serializer, workstream } = input;
+  const git = (args: string[]) => execFileAsync('git', args, { cwd: projectDir });
+
+  const perPhase: Array<{ phase: string } & RollbackTier2Result> = [];
+  const revertedPhases: string[] = [];
+
+  for (const phase of cascadeSet) {
+    // Snapshot the protected tip BEFORE this phase's revert (the guard-suite
+    // baseTip — exactly this revert's single delta).
+    const protectedTipBeforeRevert = (await git(['rev-parse', protectedBranch])).stdout.trim();
+    const r = await rollbackTier2({
+      projectDir,
+      protectedBranch,
+      protectedTipBeforeRevert,
+      phaseNumber: phase,
+      manifest,
+      serializer,
+      workstream,
+    });
+    perPhase.push({ phase, ...r });
+    if (r.status === 'halted') {
+      return {
+        status: 'halted',
+        perPhase,
+        revertedPhases,
+        haltReason: `cascade halted at phase ${phase}: ${r.haltReason ?? 'unknown'}`,
+      };
+    }
+    revertedPhases.push(phase);
+  }
+
+  return { status: 'reverted', perPhase, revertedPhases };
+}
+
+/**
+ * Commit a pending `.planning/.phase-manifest.json` change so the working tree
+ * is clean before a `git revert`. The manifest is a derived ledger (not a
+ * source of truth), so checkpointing it into its own commit is benign and never
+ * loses information. No-op when nothing is staged. Best-effort throughout.
+ */
+async function stageAndCommitManifestIfDirty(
+  git: (args: string[]) => Promise<{ stdout: string }>,
+): Promise<void> {
+  try {
+    const { stdout } = await git(['status', '--porcelain', '--', '.planning/.phase-manifest.json']);
+    if (stdout.trim().length === 0) return;
+    await git(['add', '.planning/.phase-manifest.json']);
+    await git(['commit', '--no-verify', '-m', 'chore(rollback): checkpoint phase manifest before Tier-2 revert']).catch(() => {});
+  } catch {
+    /* non-fatal — the revert will surface any real dirtiness */
+  }
+}
+
+/** Parent shas of a commit (≥2 ⇒ a merge commit). */
+async function commitParents(projectDir: string, commit: string): Promise<string[]> {
+  const { stdout } = await execFileAsync(
+    'git',
+    ['rev-list', '--parents', '-n', '1', commit],
+    { cwd: projectDir },
+  );
+  // `<commit> <parent1> [<parent2> ...]` — drop the commit itself.
+  return stdout.trim().split(/\s+/).slice(1).filter(Boolean);
+}
+
+/**
+ * Commits brought in through a merge commit's SECOND parent but not present on
+ * the first-parent (mainline) side — i.e. the merged-in work a `-m 1` revert
+ * already undoes. Bounded below by `base` so we never walk past the phase's own
+ * fork point. Returns [] when the commit is not a merge or the walk fails.
+ */
+async function secondParentSubtree(
+  projectDir: string,
+  mergeCommit: string,
+  base: string,
+): Promise<string[]> {
+  try {
+    // `merge^2 --not merge^1 base` = commits reachable from the second parent
+    // that are NOT reachable from the first parent nor from base.
+    const { stdout } = await execFileAsync(
+      'git',
+      ['rev-list', `${mergeCommit}^2`, '--not', `${mergeCommit}^1`, base],
+      { cwd: projectDir },
+    );
+    return stdout.split('\n').map(l => l.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Move a reverted phase's lifecycle artifacts (`*-SUMMARY.md`, `SUMMARY.md`,
+ * `VERIFICATION.md`/`*-VERIFICATION.md`, `UAT.md`/`*-UAT.md`) out of the phase
+ * directory into `.planning/.rollback-quarantine/phase-M/`. MOVE, never delete —
+ * the work is recoverable for a human. The quarantine dir is already gitignored
+ * by chunk 1's ensureCheckpointGitignore. Returns the moved basenames.
+ */
+async function quarantinePhaseArtifacts(
+  projectDir: string,
+  phaseNumber: string,
+  workstream?: string,
+): Promise<string[]> {
+  // Resolve the phase directory under .planning[/<workstream>]/phases.
+  const phasesDir = planningPaths(projectDir, workstream).phases;
+  let dirs: string[];
+  try {
+    const entries = await readdir(phasesDir, { withFileTypes: true });
+    dirs = entries.filter(e => e.isDirectory()).map(e => e.name);
+  } catch {
+    return [];
+  }
+  const normalized = normalizePhaseName(String(phaseNumber));
+  const match = dirs.find(d => phaseTokenMatches(d, normalized));
+  if (!match) return [];
+
+  const phaseDir = join(phasesDir, match);
+  let files: string[];
+  try {
+    files = await readdir(phaseDir);
+  } catch {
+    return [];
+  }
+
+  const isArtifact = (f: string): boolean =>
+    f.endsWith('-SUMMARY.md') ||
+    f === 'SUMMARY.md' ||
+    f.endsWith('-VERIFICATION.md') ||
+    f === 'VERIFICATION.md' ||
+    f.endsWith('-UAT.md') ||
+    f === 'UAT.md';
+
+  const toMove = files.filter(isArtifact);
+  if (toMove.length === 0) return [];
+
+  const quarantineDir = quarantineDirFor(projectDir, phaseNumber);
+  await mkdir(quarantineDir, { recursive: true });
+
+  const moved: string[] = [];
+  for (const f of toMove) {
+    try {
+      await rename(join(phaseDir, f), join(quarantineDir, f));
+      moved.push(f);
+    } catch {
+      // best-effort per file; a failure to move one artifact must not abort the
+      // unwind (the ROADMAP uncomplete + STATE restore are the trusted signals).
+    }
+  }
+  return moved;
 }
 
 /**

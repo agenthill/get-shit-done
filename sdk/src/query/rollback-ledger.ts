@@ -27,6 +27,18 @@ export interface RollbackLedger {
   /** 'retrying' while attempts remain; 'halted' once the cap is hit. */
   status: RollbackLedgerStatus;
   /**
+   * Rollback tier this ledger records (chunk 3). Absent/1 = a Tier-1 retry
+   * ledger (chunk 2). 2 = a Tier-2 cascade unwound a promoted predecessor — a
+   * fail-closed HALT for a human (reverting promoted work unattended is
+   * halt-worthy). Additive so chunk-2 writers stay valid.
+   */
+  tier?: 1 | 2;
+  /**
+   * For a Tier-2 ledger: the promoted predecessor phases the cascade reverted,
+   * in the REVERSE promotion order they were reverted. Absent for Tier-1.
+   */
+  cascade_set?: string[];
+  /**
    * Reserved for chunk 4's per-step crash-resume done-flags. Absent today; the
    * shape is declared so chunk 4 extends rather than reshapes.
    */

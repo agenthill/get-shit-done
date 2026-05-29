@@ -112,17 +112,28 @@ export async function createPhaseCheckpoint(
 }
 
 /**
- * Ensure `.planning/.checkpoints/` and `.planning/.rollback-quarantine/` are
- * git-ignored at the repo root, so the merge guard suite's `git add -A` /
- * `git checkout` ops can never stage or clobber checkpoint snapshots. Idempotent
- * (appends only the entries that are not already present, byte-exact lines).
+ * Ensure `.planning/.checkpoints/`, `.planning/.rollback-quarantine/`, and
+ * `.planning/.phase-manifest.json` are git-ignored at the repo root, so the
+ * merge guard suite's `git add -A` / `git checkout` ops can never stage or
+ * clobber them. Idempotent (appends only the entries that are not already
+ * present, byte-exact lines).
+ *
+ * The manifest is a DERIVED ledger (chunk 3): if `git add -A` sweeps it into a
+ * phase's commit, a later Tier-2 `git revert` of that commit conflicts on the
+ * manifest (the inverse would rewind it to a stale state while a separate
+ * write holds the current one). Ignoring it keeps it out of phase content so
+ * reverts stay clean.
  *
  * The repo-root `.gitignore` is the SDK package's parent — the SDK ships as
  * `<root>/sdk`, but the engine operates on the consumer's `projectDir`, so the
  * ignore lives in the consumer repo root (`projectDir/.gitignore`).
  */
 export async function ensureCheckpointGitignore(projectDir: string): Promise<void> {
-  const entries = ['.planning/.checkpoints/', '.planning/.rollback-quarantine/'];
+  const entries = [
+    '.planning/.checkpoints/',
+    '.planning/.rollback-quarantine/',
+    '.planning/.phase-manifest.json',
+  ];
   const gitignorePath = join(projectDir, '.gitignore');
 
   let existing = '';
