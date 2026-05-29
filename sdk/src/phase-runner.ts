@@ -17,6 +17,8 @@ import type {
   ParsedPlan,
   PhasePlanIndex,
   PlanDisposition,
+  PhaseFailureContext,
+  PhaseRollbackContext,
 } from './types.js';
 import { PhaseStepType, PhaseType, GSDEventType } from './types.js';
 import type { GSDConfig } from './config.js';
@@ -47,6 +49,7 @@ import {
   ensureCheckpointGitignore,
   integrationBranchFor,
   doneTagFor,
+  checkpointDirFor,
 } from './query/phase-checkpoint.js';
 import { recordPhasePromotion } from './query/phase-manifest.js';
 import { execFile } from 'node:child_process';
@@ -254,6 +257,14 @@ export class PhaseRunner {
       }
     | null = null;
 
+  /**
+   * Prior-attempt failure context for the CURRENT run (ADR 0013 option 4, chunk
+   * 2). Set from options at the top of run(); read in executeSinglePlan to
+   * prepend a "PRIOR ATTEMPTS FAILED" block to the executor prompt so an
+   * informed retry adapts instead of re-running blind. Reset each run().
+   */
+  private priorFailureContext: PhaseFailureContext[] = [];
+
   constructor(deps: PhaseRunnerDeps) {
     this.projectDir = deps.projectDir;
     this.tools = deps.tools;
@@ -275,6 +286,10 @@ export class PhaseRunner {
     const startTime = Date.now();
     const steps: PhaseStepResult[] = [];
     const callbacks = options?.callbacks ?? {};
+    // Prior-attempt failure context for this run (ADR 0013 option 4, chunk 2):
+    // the cross-phase driver passes it on an informed retry; executeSinglePlan
+    // prepends it to the executor prompt. Reset per run.
+    this.priorFailureContext = options?.priorFailureContext ?? [];
 
     // ── Init: query phase state ──
     let phaseOp: PhaseOpInfo;
@@ -462,6 +477,11 @@ export class PhaseRunner {
     const verifyPassed = steps.every(s => s.step !== PhaseStepType.Verify || s.success);
     const executePassed = steps.every(s => s.step !== PhaseStepType.Execute || s.success);
     const phaseGreen = !halted && verifyPassed && executePassed;
+    // Rollback context captured when a phase settles non-green under the
+    // isolated engine (ADR 0013 option 4, chunk 2): the cross-phase driver
+    // reads it from the result to run Tier-1 rollback. Stays undefined on green
+    // and on the no-op (shared-cwd) path.
+    let rollbackContext: PhaseRollbackContext | undefined;
     if (this.phaseIntegration?.phaseNumber === phaseNumber) {
       if (phaseGreen) {
         try {
@@ -475,10 +495,18 @@ export class PhaseRunner {
           );
         }
       } else {
-        // Not green: protected stays at LAST_GOOD. Drop the active context so the
-        // next phase in the loop starts a fresh checkpoint (chunk 2 owns the
-        // integration-branch cleanup/rollback for the failed phase).
+        // Not green: protected stays at LAST_GOOD. Capture the checkpoint
+        // artifacts so the cross-phase driver can run Tier-1 rollback, THEN drop
+        // the active context so a subsequent run starts a fresh checkpoint.
         this.logger?.warn(`Phase ${phaseNumber} not green — protected left at LAST_GOOD (no promote)`);
+        const ctx = this.phaseIntegration;
+        rollbackContext = {
+          phaseNumber: ctx.phaseNumber,
+          protectedBranch: ctx.protectedBranch,
+          lastGoodSha: ctx.lastGoodSha,
+          snapshotDir: checkpointDirFor(this.projectDir, phaseNumber),
+          integrationBranch: ctx.integrationBranch,
+        };
         this.phaseIntegration = null;
       }
     }
@@ -519,6 +547,7 @@ export class PhaseRunner {
       success,
       totalCostUsd,
       totalDurationMs,
+      ...(rollbackContext && { rollbackContext }),
     };
   }
 
@@ -1300,6 +1329,27 @@ export class PhaseRunner {
     this.phaseIntegration = null;
   }
 
+  /**
+   * Render the "PRIOR ATTEMPTS FAILED" block prepended to the executor prompt on
+   * an informed retry (ADR 0013 option 4, chunk 2). Lists every accumulated
+   * prior-attempt failure (attempt #, signal, detail) so the executor adapts.
+   */
+  private renderPriorFailureBlock(): string {
+    const lines = this.priorFailureContext.map(
+      (f) => `- Attempt ${f.attempt} failed (${f.signal}): ${f.detail}`,
+    );
+    return [
+      '## PRIOR ATTEMPTS FAILED — address these before proceeding',
+      '',
+      'This phase has already failed and been rolled back. The protected branch',
+      'is back at its last-good state. Do NOT repeat the prior approach; the',
+      'failures below recur on a blind re-run. Diagnose and fix the root cause of',
+      'each before re-implementing:',
+      '',
+      ...lines,
+    ].join('\n');
+  }
+
   /** Synthesize a failed PlanResult for a plan blocked by a failed ancestor. */
   private synthesizeBlockedResult(planId: string, blockedBy: string[]): PlanResult {
     return {
@@ -1353,7 +1403,15 @@ export class PhaseRunner {
 
       const phaseType = PhaseType.Execute;
       const contextFiles = await this.contextEngine.resolveContextFiles(phaseType);
-      const prompt = await this.promptFactory.buildPrompt(phaseType, parsedPlan, contextFiles, phaseOp.phase_dir);
+      const builtPrompt = await this.promptFactory.buildPrompt(phaseType, parsedPlan, contextFiles, phaseOp.phase_dir);
+
+      // ADR 0013 option 4 (chunk 2): on an informed retry, PREPEND the
+      // accumulated prior-attempt failure context so the executor addresses the
+      // known failures before re-running. A blind re-run would fail identically;
+      // this block is the whole point of the auto-retry override.
+      const prompt = this.priorFailureContext.length > 0
+        ? `${this.renderPriorFailureBlock()}\n\n${builtPrompt}`
+        : builtPrompt;
 
       return await runPhaseStepSession(
         prompt,

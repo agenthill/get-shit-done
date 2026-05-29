@@ -23,8 +23,8 @@ import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
-import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo } from './types.js';
-import { GSDEventType } from './types.js';
+import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo, PhaseFailureContext } from './types.js';
+import { GSDEventType, PhaseStepType } from './types.js';
 import { parsePlan, parsePlanFile } from './plan-parser.js';
 import { loadConfig } from './config.js';
 import { GSDTools, resolveGsdToolsPath } from './gsd-tools.js';
@@ -37,6 +37,10 @@ import { ContextEngine } from './context-engine.js';
 import { PromptFactory } from './phase-prompt.js';
 import { detectRuntime } from './query/helpers.js';
 import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
+import { classifyAgentFailure } from './query/agent-failure-classifier.js';
+import { rollbackTier1 } from './query/rollback-engine.js';
+import { writeRollbackLedger } from './query/rollback-ledger.js';
+import { stateSignalWaiting, stateSignalResume } from './query/state-mutation.js';
 
 export { PlanningJournal } from './planning-journal.js';
 export type { PlanningEvent, PlanningEventActor, PlanningJournalAppendInput } from './planning-journal.js';
@@ -226,42 +230,40 @@ export class GSD {
     // Loop through phases, re-discovering after each completion
     let currentPhases = incompletePhases;
 
+    // ADR 0013 option 4 (chunk 2): cap on total attempts per phase before
+    // halting for a human. Absent/null → 5. Read once per milestone run.
+    const config = await loadConfig(this.projectDir, this.workstream);
+    const maxPhaseAttempts = config.git?.sdk_max_phase_attempts ?? 5;
+
     while (currentPhases.length > 0) {
       const phase = currentPhases[0];
 
-      try {
-        const result = await this.runPhase(phase.number, options);
-        phaseResults.push(result);
+      // Run the phase through the autonomous rollback + informed-retry driver:
+      // a GENUINE failure rolls the phase back (Tier-1) and re-runs it with the
+      // accumulated prior-failure context, up to maxPhaseAttempts, then HALTs;
+      // a transient/quota failure resumes the SAME phase via WAITING.json
+      // without consuming an attempt or rolling back; a green phase advances.
+      const outcome = await this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts);
+      phaseResults.push(outcome.result);
 
-        if (!result.success) {
-          success = false;
-          break;
-        }
-
-        // Notify callback if present; stop if requested
-        if (options?.onPhaseComplete) {
-          const verdict = await options.onPhaseComplete(result, phase);
-          if (verdict === 'stop') {
-            break;
-          }
-        }
-
-        // Re-discover phases to catch dynamically inserted ones
-        const updatedAnalysis = await tools.roadmapAnalyze();
-        currentPhases = this.filterAndSortPhases(updatedAnalysis.phases);
-      } catch (err) {
-        // Phase threw an unexpected error — record as failure and stop
-        phaseResults.push({
-          phaseNumber: phase.number,
-          phaseName: phase.phase_name,
-          steps: [],
-          success: false,
-          totalCostUsd: 0,
-          totalDurationMs: 0,
-        });
+      if (!outcome.result.success) {
+        // Either the phase threw / failed beyond recovery, or the driver halted
+        // after exhausting attempts. Stop the autonomous loop for a human.
         success = false;
         break;
       }
+
+      // Notify callback if present; stop if requested
+      if (options?.onPhaseComplete) {
+        const verdict = await options.onPhaseComplete(outcome.result, phase);
+        if (verdict === 'stop') {
+          break;
+        }
+      }
+
+      // Re-discover phases to catch dynamically inserted ones
+      const updatedAnalysis = await tools.roadmapAnalyze();
+      currentPhases = this.filterAndSortPhases(updatedAnalysis.phases);
     }
 
     const totalCostUsd = phaseResults.reduce((sum, r) => sum + r.totalCostUsd, 0);
@@ -284,6 +286,178 @@ export class GSD {
       totalCostUsd,
       totalDurationMs,
     };
+  }
+
+  /**
+   * Run a phase through the autonomous rollback + informed-retry driver (ADR
+   * 0013 option 4, chunk 2). Returns the final PhaseRunnerResult (success or the
+   * terminal failure that halted the loop) and whether the driver halted.
+   *
+   * Routing per attempt:
+   *   - Phase threw → treat as a GENUINE failure (signal 'throw').
+   *   - Phase succeeded (green) → return immediately; no rollback, no ledger.
+   *   - Phase failed but the failure classifies as TRANSIENT/quota → write a
+   *     WAITING.json signal and re-run the SAME phase WITHOUT consuming an
+   *     attempt or rolling back; clear the signal on the next pass.
+   *   - Phase failed GENUINELY (gate/verify) → rollback Tier-1, accumulate the
+   *     attempt's failure context, persist ROLLBACK.json, and either re-run with
+   *     the context injected (attempt < cap) or HALT (attempt == cap).
+   */
+  private async runPhaseWithRollbackRetry(
+    phase: RoadmapPhaseInfo,
+    options: MilestoneRunnerOptions | undefined,
+    maxPhaseAttempts: number,
+  ): Promise<{ result: PhaseRunnerResult; halted: boolean }> {
+    const failureContext: PhaseFailureContext[] = [];
+    let attempt = 1;
+    // Bound the loop hard: at most maxPhaseAttempts genuine attempts, plus a
+    // generous allowance for transient resumes (which do not consume attempts).
+    // The transient guard below caps consecutive transient resumes so a runtime
+    // stuck in a quota loop cannot spin forever.
+    let consecutiveTransient = 0;
+    const MAX_CONSECUTIVE_TRANSIENT = 50;
+
+    for (;;) {
+      let result: PhaseRunnerResult;
+      let threw = false;
+      try {
+        result = await this.runPhase(phase.number, {
+          ...options,
+          // Pass a SNAPSHOT copy, not the live array — the driver mutates
+          // failureContext across attempts; the executor must see only the
+          // failures known at THIS attempt's start.
+          ...(failureContext.length > 0 && { priorFailureContext: [...failureContext] }),
+        });
+      } catch (err) {
+        threw = true;
+        result = {
+          phaseNumber: phase.number,
+          phaseName: phase.phase_name,
+          steps: [],
+          success: false,
+          totalCostUsd: 0,
+          totalDurationMs: 0,
+        };
+        // Stamp the thrown error as the failure detail for classification below.
+        (result as PhaseRunnerResult & { _throwDetail?: string })._throwDetail =
+          err instanceof Error ? err.message : String(err);
+      }
+
+      // Green: clear any stale WAITING.json and return.
+      if (result.success) {
+        await stateSignalResume([], this.projectDir, this.workstream);
+        return { result, halted: false };
+      }
+
+      // Classify the failure: transient/quota vs genuine.
+      const { signal, detail } = this.classifyPhaseFailure(result, threw);
+      const classification = classifyAgentFailure(detail);
+
+      if (classification.class === 'quota-exceeded') {
+        // Transient: resume the SAME phase via the existing WAITING.json
+        // mechanism. Do NOT roll back and do NOT consume an attempt.
+        consecutiveTransient += 1;
+        if (consecutiveTransient > MAX_CONSECUTIVE_TRANSIENT) {
+          // Runtime stuck in a quota loop — halt rather than spin forever.
+          return { result, halted: true };
+        }
+        const waitingArgs = ['--type', 'quota_wait', '--phase', phase.number];
+        if (classification.retryAfterSeconds !== undefined) {
+          waitingArgs.push('--question', `Quota exceeded; retry after ${classification.retryAfterSeconds}s`);
+        }
+        await stateSignalWaiting(waitingArgs, this.projectDir, this.workstream);
+        // Loop again on the SAME phase without touching attempt/failureContext.
+        continue;
+      }
+
+      // Genuine failure: clear any transient signal, roll back Tier-1, record.
+      consecutiveTransient = 0;
+      await stateSignalResume([], this.projectDir, this.workstream);
+
+      if (result.rollbackContext) {
+        try {
+          await rollbackTier1({
+            projectDir: this.projectDir,
+            phaseNumber: result.rollbackContext.phaseNumber,
+            protectedBranch: result.rollbackContext.protectedBranch,
+            lastGoodSha: result.rollbackContext.lastGoodSha,
+            snapshotDir: result.rollbackContext.snapshotDir,
+            integrationBranch: result.rollbackContext.integrationBranch,
+          });
+        } catch (rbErr) {
+          // A rollback that cannot reach a clean LAST_GOOD is itself a halt
+          // condition (fail-closed): record it and stop rather than retry into a
+          // dirty tree. The rollback failure detail is preserved in the ledger.
+          const rbDetail = rbErr instanceof Error ? rbErr.message : String(rbErr);
+          await writeRollbackLedger(this.projectDir, {
+            failed_phase: phase.number,
+            attempt_count: attempt,
+            failure_context: [...failureContext, { attempt, signal, detail: `${detail} | rollback failed: ${rbDetail}` }],
+            status: 'halted',
+          });
+          return { result, halted: true };
+        }
+      }
+
+      // Accumulate this attempt's failure context.
+      failureContext.push({ attempt, signal, detail });
+
+      if (attempt >= maxPhaseAttempts) {
+        // Cap reached: persist halted ledger and stop. Do NOT advance / skip.
+        await writeRollbackLedger(this.projectDir, {
+          failed_phase: phase.number,
+          attempt_count: attempt,
+          failure_context: failureContext,
+          status: 'halted',
+        });
+        return { result, halted: true };
+      }
+
+      // Attempts remain: persist the retrying ledger and re-run with the
+      // accumulated context injected (the next loop iteration threads it in).
+      attempt += 1;
+      await writeRollbackLedger(this.projectDir, {
+        failed_phase: phase.number,
+        attempt_count: attempt,
+        failure_context: failureContext,
+        status: 'retrying',
+      });
+    }
+  }
+
+  /**
+   * Derive the failure signal + detail from a non-green PhaseRunnerResult (ADR
+   * 0013 option 4, chunk 2). The detail string is what gets classified
+   * (transient vs genuine) and recorded into ROLLBACK.json + the executor
+   * context on the next attempt.
+   */
+  private classifyPhaseFailure(
+    result: PhaseRunnerResult,
+    threw: boolean,
+  ): { signal: PhaseFailureContext['signal']; detail: string } {
+    if (threw) {
+      const detail = (result as PhaseRunnerResult & { _throwDetail?: string })._throwDetail
+        ?? 'phase threw an unexpected error';
+      return { signal: 'throw', detail };
+    }
+    // Prefer the execute step's failure (gate / plan error) over verify, since a
+    // failed execute is the gate signal; fall back to verify gaps.
+    const execStep = result.steps.find(s => s.step === PhaseStepType.Execute && !s.success);
+    if (execStep) {
+      const planErrs = (execStep.planResults ?? [])
+        .filter(p => !p.success)
+        .map(p => p.error?.messages?.join('; '))
+        .filter((m): m is string => !!m);
+      const detail = execStep.error
+        ?? (planErrs.length > 0 ? planErrs.join(' | ') : 'gate failed (test exit != 0 or plan execution failed)');
+      return { signal: 'gate', detail };
+    }
+    const verifyStep = result.steps.find(s => s.step === PhaseStepType.Verify && !s.success);
+    if (verifyStep) {
+      return { signal: 'verify', detail: verifyStep.error ?? 'verification found gaps' };
+    }
+    // No specific failed step found — generic detail.
+    return { signal: 'gate', detail: 'phase did not reach green (no specific failed step)' };
   }
 
   /**
