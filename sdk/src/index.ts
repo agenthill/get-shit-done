@@ -417,7 +417,12 @@ export class GSD {
       // output, verifier findings) where a quota-looking word can be the GENUINE
       // failure itself (a failing test about rate-limiting). For content, the
       // classifier additionally requires the sentinel to co-occur with HTTP/
-      // runtime context before reading it as transient.
+      // runtime context before reading it as transient — EXCEPT an unambiguous
+      // Claude-subscription quota phrasing ("usage limit reached", "limit will
+      // reset"), which the classifier trusts on the gate path directly (R3 C-1):
+      // a real EXECUTE quota kill does not throw — it returns a failed PlanResult
+      // (signal='gate') — and must RESUME via WAITING.json, not burn the retry
+      // budget re-hitting the same quota.
       const classification = classifyAgentFailure(detail, {
         fromRuntimeTermination: signal === 'throw',
       });

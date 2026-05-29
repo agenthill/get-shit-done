@@ -171,6 +171,46 @@ describe('classifyAgentFailure', () => {
       const result = classifyAgentFailure('Your monthly quota has been exhausted.');
       expect(result.class).toBe('quota-exceeded');
     });
+
+    it('R3 (C-1): the Claude-subscription kill text on the GATE path (no runtime marker) IS quota → resume', () => {
+      // Reproduces-then-kills C-1: a real EXECUTE quota kill returns a failed
+      // PlanResult (gate signal, fromRuntimeTermination=false) with the human
+      // subscription phrasing and NONE of the HTTP/runtime markers. Pre-R3 the
+      // content gate misread it as genuine → rollback + burn the retry budget.
+      const body = 'Claude AI usage limit reached. Your limit will reset at 4pm.';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('quota-exceeded');
+    });
+
+    it('R3 (C-1): a standalone "your limit will reset at" phrasing (no QUOTA_SENTINEL token) is still quota', () => {
+      const result = classifyAgentFailure('Paused — your limit will reset at midnight UTC.', {
+        fromRuntimeTermination: false,
+      });
+      expect(result.class).toBe('quota-exceeded');
+    });
+
+    it('R3 (ii): a gate transient carrying a quota sentinel + RUNTIME provenance (retry-after / x-ratelimit) still resumes', () => {
+      const body = 'rate limit hit; x-ratelimit-remaining: 0; retry-after: 45';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('quota-exceeded');
+      expect(result.retryAfterSeconds).toBe(45);
+    });
+
+    it('R3 (C-2): a genuine failing test merely naming "http"/"anthropic" (no narrow marker) is NOT misread as quota', () => {
+      // C-2: bare `http`/`anthropic` markers were over-broad — a genuine HTTP/
+      // rate-limit TEST emitting them would re-trigger the GROUP-C footgun. With
+      // the narrowed markers, this content stays GENUINE.
+      const httpTest = classifyAgentFailure(
+        'FAIL src/http-client.test.ts > rate limit backoff: expected 429 retry, got none',
+        { fromRuntimeTermination: false },
+      );
+      expect(httpTest.class).toBe('unknown-failure');
+      const anthropicTest = classifyAgentFailure(
+        'FAIL src/anthropic-adapter.test.ts > parses rate limit header: assertion failed',
+        { fromRuntimeTermination: false },
+      );
+      expect(anthropicTest.class).toBe('unknown-failure');
+    });
   });
 
   describe('precedence', () => {

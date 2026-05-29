@@ -54,6 +54,33 @@ const QUOTA_SENTINELS: ReadonlyArray<string> = [
 const CLASSIFY_HANDOFF_SENTINEL = 'classifyhandoffifneeded is not defined';
 
 /**
+ * SUBSCRIPTION-QUOTA phrasings (R3). A REAL quota/usage-limit pause during
+ * EXECUTE does NOT throw — the Agent SDK catches it and the phase returns a
+ * FAILED PlanResult, so the driver classifies it on the `gate` path
+ * (`fromRuntimeTermination=false`). The common Claude-subscription kill text
+ * ("Claude AI usage limit reached. Your limit will reset at 4pm.") carries NONE
+ * of the HTTP/runtime markers below, so the GROUP-C content gate would misread
+ * it as GENUINE → rollback + burn 5 informed-retry attempts re-hitting the same
+ * quota → HALT, instead of a WAITING.json resume (the C-1 HIGH regression).
+ *
+ * These phrasings are unambiguous human-subscription quota signals: a genuine
+ * failing test is vanishingly unlikely to emit "your limit will reset at" or
+ * "usage limit reached". They are therefore TRUSTED on the gate path WITHOUT
+ * requiring a co-occurring runtime marker — biasing toward RESUME, justified by
+ * the cost asymmetry (a real quota pause is common and WAITING.json exists to
+ * survive it; a rarer false-positive self-limits at MAX_CONSECUTIVE_TRANSIENT
+ * and corrupts nothing). When matched they resolve to quota-exceeded regardless
+ * of provenance.
+ */
+const SUBSCRIPTION_QUOTA_PHRASES: ReadonlyArray<string> = [
+  'usage limit reached',
+  'usage limit',
+  'limit will reset',
+  'limit reached',
+  'limit resets at',
+];
+
+/**
  * HTTP / runtime-transport context tokens. When the body to classify is NOT a
  * runtime-termination cause (i.e. it is gate/verify CONTENT — test output, a
  * build log, a verifier finding), a bare quota sentinel like "429" or "rate
@@ -62,9 +89,16 @@ const CLASSIFY_HANDOFF_SENTINEL = 'classifyhandoffifneeded is not defined';
  * quota event (the GROUP-C footgun — a genuine failure burned up to 50 identical
  * re-runs). For content bodies the sentinel must CO-OCCUR with one of these
  * transport markers to be read as quota.
+ *
+ * R3/C-2: bare `http` and bare `anthropic` were over-broad — a genuine failing
+ * HTTP/rate-limit TEST emitting "http" or naming "anthropic" would re-trigger
+ * the very footgun GROUP-C closed. Narrowed to `http status`/`http error`, and
+ * `anthropic` dropped (the structured markers below still catch a real API
+ * quota body, e.g. `overloaded_error`, `usage_limit_reached`, `x-ratelimit`).
  */
 const RUNTIME_CONTEXT_MARKERS: ReadonlyArray<string> = [
-  'http',
+  'http status',
+  'http error',
   'status code',
   'status:',
   'retry-after',
@@ -72,7 +106,6 @@ const RUNTIME_CONTEXT_MARKERS: ReadonlyArray<string> = [
   'x-ratelimit',
   'ratelimit-',
   'api error',
-  'anthropic',
   'overloaded_error',
   'resource_exhausted',
   'usage_limit_reached',
@@ -81,6 +114,10 @@ const RUNTIME_CONTEXT_MARKERS: ReadonlyArray<string> = [
 
 function hasRuntimeContext(normalized: string): boolean {
   return RUNTIME_CONTEXT_MARKERS.some((m) => normalized.includes(m));
+}
+
+function hasSubscriptionQuotaPhrase(normalized: string): boolean {
+  return SUBSCRIPTION_QUOTA_PHRASES.some((p) => normalized.includes(p));
 }
 
 function parseRetryAfter(body: string): number | undefined {
@@ -147,7 +184,15 @@ export function classifyAgentFailure(
   // it co-occurs with HTTP/runtime transport context. When `body` is the agent
   // runtime's own termination cause (`fromRuntimeTermination`, the DEFAULT), the
   // sentinel is trusted directly — that body IS the quota-kill signal.
-  const trustContentSentinel = options.fromRuntimeTermination !== false;
+  //
+  // R3 (C-1): a SUBSCRIPTION-QUOTA phrasing ("usage limit reached", "limit will
+  // reset") is so unambiguously a quota pause that it is trusted on the CONTENT
+  // path too — a real EXECUTE quota kill returns a failed PlanResult (gate
+  // signal, not throw), and that body must RESUME via WAITING.json, not be
+  // misread as genuine and burn the retry budget. Biasing to resume (the safe
+  // direction given the cost asymmetry).
+  const trustContentSentinel =
+    options.fromRuntimeTermination !== false || hasSubscriptionQuotaPhrase(normalized);
   for (const sentinel of QUOTA_SENTINELS) {
     if (normalized.includes(sentinel)) {
       if (!trustContentSentinel && !hasRuntimeContext(normalized)) {
@@ -161,6 +206,17 @@ export function classifyAgentFailure(
         ? { class: 'quota-exceeded', sentinel }
         : { class: 'quota-exceeded', sentinel, retryAfterSeconds };
     }
+  }
+
+  // R3 (C-1): a standalone subscription-quota phrasing that matched none of the
+  // QUOTA_SENTINELS above (e.g. just "your limit will reset at 4pm" with no
+  // "usage limit"/"quota"/"429" token) is still a quota pause → resume.
+  const subscriptionPhrase = SUBSCRIPTION_QUOTA_PHRASES.find((p) => normalized.includes(p));
+  if (subscriptionPhrase) {
+    const retryAfterSeconds = parseRetryAfter(body);
+    return retryAfterSeconds === undefined
+      ? { class: 'quota-exceeded', sentinel: subscriptionPhrase }
+      : { class: 'quota-exceeded', sentinel: subscriptionPhrase, retryAfterSeconds };
   }
 
   if (normalized.includes(CLASSIFY_HANDOFF_SENTINEL)) {
