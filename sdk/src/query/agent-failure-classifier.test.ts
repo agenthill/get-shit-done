@@ -144,6 +144,35 @@ describe('classifyAgentFailure', () => {
     });
   });
 
+  describe('GROUP-C — content vs runtime-termination provenance', () => {
+    it('a quota-looking word in gate/verify CONTENT (no HTTP/runtime context) is NOT trusted as quota → genuine', () => {
+      // A failing test whose name/message mentions rate-limiting is a GENUINE
+      // failure, not a transient quota event. Pre-fix this was misclassified
+      // transient and burned up to 50 identical re-runs.
+      const body = 'FAIL src/rate-limit.test.ts > enforces rate limit: expected 429 but got 200';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('unknown-failure'); // GENUINE, not quota
+    });
+
+    it('the SAME runtime-termination cause IS trusted as quota (the genuine resume path is preserved)', () => {
+      const body = 'FAIL src/rate-limit.test.ts > enforces rate limit: expected 429 but got 200';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: true });
+      expect(result.class).toBe('quota-exceeded');
+    });
+
+    it('a content quota sentinel WITH HTTP/runtime context IS still trusted as quota (a real API 429 during a gate)', () => {
+      const body = 'gate failed: HTTP 429 Too Many Requests from api.anthropic.com; retry-after: 30';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('quota-exceeded');
+      expect(result.retryAfterSeconds).toBe(30);
+    });
+
+    it('default (no options) trusts the body as a runtime-termination cause (#3095 query contract preserved)', () => {
+      const result = classifyAgentFailure('Your monthly quota has been exhausted.');
+      expect(result.class).toBe('quota-exceeded');
+    });
+  });
+
   describe('precedence', () => {
     it('quota sentinel wins over classify-handoff sentinel when both present', () => {
       // The runtime bug is a post-completion handler crash; if the underlying
