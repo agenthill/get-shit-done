@@ -161,6 +161,13 @@ const INTERNAL_COMPONENT_SLUGS = new Set([
   // filesystem path component in docs/adr/0013-dynamic-workflow-parallelization.md;
   // the regex captures "/gsd-map-codebase-fanout" from the path.
   'map-codebase-fanout',
+
+  // gsd-plan-check-fanout — dynamic-workflow filename
+  // (dynamic-workflows/gsd-plan-check-fanout.js), NOT a registered slash
+  // command (no commands/gsd/plan-check-fanout.md). Docs reference it as a
+  // filesystem path component in docs/adr/0013-dynamic-workflow-parallelization.md;
+  // the regex captures "/gsd-plan-check-fanout" from the path.
+  'plan-check-fanout',
 ]);
 
 /**

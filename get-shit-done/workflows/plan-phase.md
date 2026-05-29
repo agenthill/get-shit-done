@@ -1,5 +1,5 @@
 <purpose>
-Create executable phase prompts (PLAN.md files) for a roadmap phase with integrated research and verification. Default flow: Research (if needed) -> Plan -> Verify -> Done. Orchestrates gsd-phase-researcher, gsd-planner, and gsd-plan-checker agents with a revision loop (max 3 iterations).
+Create executable phase prompts (PLAN.md files) for a roadmap phase with integrated research and verification. Default flow: Research (if needed) -> Plan -> Verify -> Done. Orchestrates gsd-phase-researcher, gsd-planner, and gsd-plan-checker agents with a revision loop (max 3 iterations). The CHECK stage fans the plan-checker dimensions out across one read-only branch per PLAN.md plus one cross-plan branch (gsd-plan-check-fanout) when the Workflow tool is available — orchestrator aggregates the verdict as single writer and drives the revision loop — or falls through to a single whole-set gsd-plan-checker agent otherwise. Plan AUTHORING stays serial on the Agent tool (it writes PLAN.md files).
 </purpose>
 
 <required_reading>
@@ -1197,7 +1197,7 @@ Use AskUserQuestion for each gap (or batch if multiple gaps).
 **If "Split":** Use `/gsd:phase --insert` for overflow items, then replan.
 **If "Defer":** Record in CONTEXT.md `## Deferred Ideas` with developer's confirmation. Proceed to step 10.
 
-## 10. Spawn gsd-plan-checker Agent
+## 10. Check Plans (gsd-plan-checker)
 
 Display banner:
 ```
@@ -1207,6 +1207,96 @@ Display banner:
 
 ◆ Spawning plan checker...
 ```
+
+### 10a. Orchestrator pre-flight (single writer, has git)
+
+The Workflow tool has no git/HEAD/clock and cannot run `git diff`, so the
+orchestrator resolves everything stateful here and passes it via `args`. Run this
+on **every** check (initial check, each revision-loop re-check from step 12, and
+the `--bounce` re-check from step 12.5):
+
+```bash
+# Full plan set — always passed as all_plan_paths.
+ALL_PLAN_PATHS=$(ls "${PHASE_DIR}"/*-PLAN.md 2>/dev/null)
+
+# Changed-plan set for the args.plans branch list:
+#   - iteration 1 (initial check): all *-PLAN.md
+#   - re-check (revision loop / bounce): only plans whose content changed since the
+#     pre-revision tree, computed by the orchestrator via `git diff --name-only`;
+#     fall back to the full set if the diff is empty or git is unavailable.
+if [ "${ITERATION:-1}" -le 1 ] || [ -z "${PRE_REVISION_SHA:-}" ]; then
+  CHANGED_PLANS="$ALL_PLAN_PATHS"
+else
+  CHANGED_PLANS=$(git diff --name-only "${PRE_REVISION_SHA}" -- "${PHASE_DIR}"/*-PLAN.md 2>/dev/null)
+  [ -z "$CHANGED_PLANS" ] && CHANGED_PLANS="$ALL_PLAN_PATHS"
+fi
+
+HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+```
+
+Build the `plans` array as `[{id, path}]` (id = the plan's `{phase}-{nn}` stem, the
+filename minus the `-PLAN.md` suffix) from `CHANGED_PLANS`, and `all_plan_paths` from
+`ALL_PLAN_PATHS`. (Before each revision in step 12, record `PRE_REVISION_SHA=$(git rev-parse HEAD)`
+so the next re-check's diff is scoped to what the planner actually changed.)
+
+### 10b. Runtime gate (mirrors code-review.md's `fan_out_review`)
+
+Detect whether the **Workflow** tool is available (Claude Code runtime). The
+fan-out moves the gsd-plan-checker dimensions onto a deterministic dynamic
+workflow (`gsd-plan-check-fanout`), which only runs under the Workflow tool. If
+the Workflow tool is unavailable (Codex, Gemini CLI, Antigravity, or any
+non-Claude runtime), fall through to the single-agent path below — identical to
+today's whole-set checker behavior.
+
+→ **If the Workflow tool IS available:** run `fan_out_check` (step 10c).
+→ **If the Workflow tool is NOT available:** skip 10c and run
+  `single_agent_check_fallback` (step 10d) instead.
+
+### 10c. fan_out_check (Workflow tool available)
+
+The plan-check fan-out runs read-only — every branch reads the plans + artifacts
+and RETURNS findings (no CHECK.md, no edits to PLAN.md / STATE.md / ROADMAP.md);
+the orchestrator stays the single writer and drives the revision loop. The
+branches are: one per changed PLAN.md (per-plan dimensions) + one cross-plan
+branch over the full set (whole-phase dimensions). Collapses the serial whole-set
+check from sum → max(slowest-plan-branch, cross-plan).
+
+Invoke the workflow with the resolved pre-flight values (`roadmap_path` etc. are
+null-safe — pass "" / omit when the file does not exist):
+
+```
+Workflow({name:'gsd-plan-check-fanout', args:{
+  phase_number: ${phase_number},
+  padded_phase: ${PADDED_PHASE},
+  phase_dir: ${PHASE_DIR},
+  plans: PLANS,                       // [{id, path}] — changed plans (iter 1 = all)
+  all_plan_paths: ALL_PLAN_PATHS,     // always the full set
+  phase_goal: ${phase_goal},
+  phase_req_ids: ${phase_req_ids},
+  roadmap_path: ${ROADMAP_PATH},
+  requirements_path: ${REQUIREMENTS_PATH},
+  context_path: ${CONTEXT_PATH},
+  research_path: ${RESEARCH_PATH},
+  patterns_path: ${PATTERNS_PATH},
+  head_sha: ${HEAD_SHA},
+  response_language: ${response_language},
+  iteration: ${ITERATION:-1}
+}})
+```
+
+> **ORCHESTRATOR RULE — CODEX RUNTIME**: After invoking the Workflow above, stop working on this task immediately. Do not read more files, edit code, or run tests related to this task while the subagent fan-out is active. Wait for the workflow to return its result. This prevents duplicate work, conflicting edits, and wasted context. Only resume when the result is available.
+
+The workflow returns `{status, blocker_count, warning_count, findings, per_plan, cross_plan}`. Map it to the existing return-handling (step 11):
+- `status === 'passed'` → treat as **VERIFICATION PASSED**; proceed to the post-check requirements gate (step 13).
+- `status === 'issues_found'` → treat as **ISSUES FOUND**; drive the revision loop (step 12) using `blocker_count` / `warning_count` / `findings`.
+- `status === 'error'` (all branches errored) **or** a Workflow error / timeout / exception → treat exactly like the empty/truncated checker return: fall to the filesystem fallback (step 11a). Do NOT fabricate a pass.
+
+### 10d. single_agent_check_fallback (Workflow tool NOT available, e.g. Codex, Gemini CLI, Antigravity)
+
+When the Workflow tool is unavailable, fall through to the single whole-set
+gsd-plan-checker agent — today's behavior preserved verbatim, runtime-gated like
+code-review.md's `single_agent_review_fallback`. The pre-flight values from 10a
+are reused.
 
 Checker prompt:
 
@@ -1250,6 +1340,8 @@ Agent(
 
 ## 11. Handle Checker Return
 
+Whether the verdict came from the `fan_out_check` workflow (step 10c — `{status, blocker_count, warning_count, findings, ...}`) or the single-agent fallback (step 10d — the `## VERIFICATION PASSED` / `## ISSUES FOUND` markers), the same handling applies. The fan-out's `status` maps to the markers per step 10c; for the single-agent path, parse the markers as below.
+
 - **`## VERIFICATION PASSED`:** Display confirmation, proceed to step 13.
 - **`## ISSUES FOUND`:** Display issues, check iteration count, proceed to step 12.
 - **Empty / truncated / no recognized marker:** → Filesystem fallback (step 11a).
@@ -1275,7 +1367,7 @@ If thinking_partner disabled: skip this block entirely.
 
 ## 11a. Filesystem Fallback (Checker)
 
-**Triggered when:** Checker Agent() returns but the return contains neither `## VERIFICATION PASSED` nor `## ISSUES FOUND`.
+**Triggered when:** the single-agent checker (step 10d) returns but the return contains neither `## VERIFICATION PASSED` nor `## ISSUES FOUND`, **or** the `fan_out_check` workflow (step 10c) errors / times out / returns `status:'error'`. Both degrade to this same empty-return path — never fabricate a pass.
 
 ```bash
 DISK_PLANS=$(ls "${PHASE_DIR}"/*-PLAN.md 2>/dev/null | wc -l | tr -d ' ')
@@ -1291,7 +1383,7 @@ Windows stdio hang pattern — the subagent finished but the return never arrive
 
 Offer 3 options:
 1. **Accept verification** — treat as `## VERIFICATION PASSED` and continue to step 13
-2. **Retry checker** — re-spawn the checker with the same prompt (return to step 10)
+2. **Retry checker** — re-run the check (return to step 10; the runtime gate re-selects `fan_out_check` or the single-agent fallback)
 3. **Stop** — exit; user can re-run `/gsd:plan-phase {N}` to resume
 
 **If `DISK_PLANS` is 0:** No plans on disk — something is seriously wrong. Display error and stop.
@@ -1328,6 +1420,11 @@ Display: `Revision iteration {N}/3 -- {blocker_count} blockers, {warning_count} 
 
 Set `prev_issue_count = issue_count`.
 
+Record the pre-revision tree so the next re-check can scope its `plans` to what the planner actually changes:
+```bash
+PRE_REVISION_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+```
+
 Revision prompt:
 
 ```markdown
@@ -1363,7 +1460,7 @@ Agent(
 
 > **ORCHESTRATOR RULE — CODEX RUNTIME**: After calling Agent() above, stop working on this task immediately. Do not read more files, edit code, or run tests related to this task while the subagent is active. Wait for the subagent to return its result. This prevents duplicate work, conflicting edits, and wasted context. Only resume when the subagent result is available.
 
-After planner returns -> spawn checker again (step 10), increment iteration_count.
+After planner returns -> re-run the check (step 10 — the pre-flight recomputes the changed-plan set via `git diff` against `PRE_REVISION_SHA`, and the runtime gate re-selects `fan_out_check` or the single-agent fallback), increment iteration_count.
 
 **If iteration_count >= 3:**
 
@@ -1425,7 +1522,7 @@ After the script returns, check that the bounced file still has valid YAML front
 
 **After all plans are bounced:**
 
-5. **Re-run plan checker on bounced plans:** Spawn gsd-plan-checker (same as step 10) on all modified plans. If a bounced plan fails the checker, restore original from its pre-bounce.md backup:
+5. **Re-run plan checker on bounced plans:** Re-run the check (same as step 10 — `fan_out_check` when the Workflow tool is available, else the single-agent fallback) on all modified plans; set `PRE_REVISION_SHA` to the pre-bounce HEAD so the pre-flight scopes `plans` to the bounced files. If a bounced plan fails the checker, restore original from its pre-bounce.md backup:
 ```
 ⚠ Bounced plan ${PLAN_FILE} failed checker validation — restoring original from pre-bounce backup.
 ```
@@ -1782,7 +1879,9 @@ If freezes persist, try `--skip-research` to reduce the agent chain from 3 to 2 
 - [ ] Existing plans checked
 - [ ] gsd-planner spawned with CONTEXT.md + RESEARCH.md
 - [ ] Plans created (PLANNING COMPLETE or CHECKPOINT handled)
-- [ ] gsd-plan-checker spawned with CONTEXT.md
+- [ ] Plans checked (fan_out_check when Workflow tool available, else single-agent fallback) with CONTEXT.md
+- [ ] When Workflow tool available: check fans out to gsd-plan-check-fanout (one read-only branch per changed PLAN.md + one cross-plan branch); orchestrator aggregates the verdict and drives the revision loop (single-writer)
+- [ ] When Workflow tool unavailable: falls through to the single whole-set gsd-plan-checker agent (today's behavior, runtime-gated like code-review.md)
 - [ ] Verification passed OR user override OR max iterations with user decision
 - [ ] User sees status between agent spawns
 - [ ] User knows next steps

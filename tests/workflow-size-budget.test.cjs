@@ -38,7 +38,11 @@ const WORKFLOWS_DIR = path.join(__dirname, '..', 'get-shit-done', 'workflows');
 // per the discuss-phase/modes/ precedent and revert this back to 1700.
 // Bumped from 1800 → 1810 in #3707 to absorb the startup orphan-sweep
 // block added to execute-phase.md (+2 lines: one comment + one bash command).
-const XL_BUDGET = 1810;
+// Bumped from 1810 → 1900 for the ADR 0013 plan-check fan-out rollout: the CHECK
+// stage (step 10) rewired into an orchestrator pre-flight + runtime-gated
+// fan_out_check (gsd-plan-check-fanout) + verbatim single_agent_check_fallback,
+// mirroring code-review.md's fan_out_review/single_agent_review_fallback split.
+const XL_BUDGET = 1900;
 const LARGE_BUDGET = 1500;
 const DEFAULT_BUDGET = 1000;
 
