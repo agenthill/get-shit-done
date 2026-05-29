@@ -304,7 +304,11 @@ describe('worktree create() failure is fatal under the isolated engine', () => {
       baseSha: '',
       isolated: true,
     });
-    mockSession.mockImplementation(async () => okResult());
+    let execRan = false;
+    mockSession.mockImplementation(async (_p, step) => {
+      if (step === PhaseStepType.Execute) execRan = true;
+      return okResult();
+    });
 
     const { deps } = makeDeps([planInfo({ id: 'A' })], { executionEngineFactory: factory });
     const result = await new PhaseRunner(deps).run('1');
@@ -312,8 +316,10 @@ describe('worktree create() failure is fatal under the isolated engine', () => {
     const exec = result.steps.find(s => s.step === PhaseStepType.Execute)!;
     expect(exec.success).toBe(false);
     expect(exec.planResults![0].success).toBe(false);
-    // The executor never ran — no silent shared-cwd degrade.
-    expect(mockSession).toHaveBeenCalledTimes(0);
+    // The plan executor never ran on the shared tree — no silent shared-cwd degrade.
+    // (Non-Execute pipeline steps still run their sessions; only the Execute-step
+    // executor must be suppressed by the isolated create()-fatal guard.)
+    expect(execRan).toBe(false);
   });
 
   it('the NO-OP engine (isolated absent) still degrades to shared cwd on create() failure', async () => {
