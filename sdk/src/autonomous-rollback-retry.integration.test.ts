@@ -302,6 +302,58 @@ describe('(GROUP-C) a GENUINE gate failure whose detail contains "rate limit"/"4
   });
 });
 
+describe('(R3 C-1) a Claude-subscription quota kill on the GATE path resumes via WAITING.json', () => {
+  it('a gate-signal failure naming "usage limit reached / limit will reset" → quota → WAITING.json resume, NO rollback, NO attempt consumed', async () => {
+    // Reproduces-then-kills C-1 (gate-path quota kill misread as genuine): a REAL
+    // quota/usage-limit kill during EXECUTE does NOT throw — the SDK catches it
+    // and runPhase returns a FAILED PlanResult → signal='gate' → the GROUP-C
+    // content gate (which needs an HTTP/runtime marker) would misread the human
+    // Claude-subscription text as GENUINE → Tier-1 rollback + burn the 5 retry
+    // attempts re-hitting the same quota → HALT (NOT a WAITING.json resume). R3
+    // trusts the unambiguous subscription phrasing on the gate path → resume.
+    const { dir, lastGoodSha, rollbackContext } = await setupFailedPhaseRepo('1');
+    try {
+      const gsd = new GSD({ projectDir: dir });
+      vi.spyOn(gsd, 'createTools').mockReturnValue({
+        roadmapAnalyze: vi
+          .fn()
+          .mockResolvedValueOnce(phaseInfo('1'))
+          .mockResolvedValue(emptyRoadmap()),
+      } as never);
+
+      let call = 0;
+      vi.spyOn(gsd, 'runPhase').mockImplementation((async () => {
+        call += 1;
+        if (call === 1) {
+          // The common Claude-subscription kill text, surfaced as a GATE failure
+          // (no throw, no HTTP/runtime marker).
+          return failResult('1', rollbackContext, 'Claude AI usage limit reached. Your limit will reset at 4pm.');
+        }
+        return greenResult('1');
+      }) as never);
+
+      const result = await gsd.run('build the thing');
+
+      // Resumed (no attempt consumed) and then advanced green on the second call.
+      expect(result.success).toBe(true);
+      expect(call).toBe(2);
+
+      // NO rollback on the quota kill: integration branch untouched, protected at
+      // LAST_GOOD.
+      expect(await refExists(dir, integrationBranchFor('1'))).toBe(true);
+      const mainSha = (await gitIn(dir)(['rev-parse', 'main'])).stdout.trim();
+      expect(mainSha).toBe(lastGoodSha);
+
+      // No retry ledger (quota does not consume an attempt / roll back).
+      expect(existsSync(join(dir, '.planning', 'ROLLBACK.json'))).toBe(false);
+      // WAITING.json cleared on the green resume.
+      expect(existsSync(join(dir, '.planning', 'WAITING.json'))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('(c) green phase advances normally — no rollback, no ROLLBACK.json', () => {
   it('a phase that succeeds advances without any rollback or ledger', async () => {
     const { dir } = await setupFailedPhaseRepo('1');
