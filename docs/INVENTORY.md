@@ -361,7 +361,7 @@ The `gsd-planner` agent is decomposed into a core agent plus reference modules t
 
 ---
 
-## CLI Modules (74 shipped)
+## CLI Modules (75 shipped)
 
 Full listing: `get-shit-done/bin/lib/*.cjs`.
 
@@ -378,6 +378,7 @@ Full listing: `get-shit-done/bin/lib/*.cjs`.
 | `command-aliases.generated.cjs` | Generated CJS alias/subcommand metadata for manifest-backed family routers |
 | `command-routing-hub.cjs` | Pure-result dispatch hub that centralizes mode decision (SDK vs CJS), error taxonomy, and no-throw contract for all command-family routers (#3788) |
 | `commands.cjs` | Misc CLI commands (slug, timestamp, todos, scaffolding, stats) |
+| `compose-review.cjs` | Deterministic, dependency-free REVIEW.md composer for the code-review dimension fan-out; exports composeReview(findings, meta) and composeReviewToFile(opts); orchestrator-side single writer that emits a byte-compatible REVIEW.md (frontmatter status/files_reviewed_list/counts + CR-/WR-/IN- finding IDs). |
 | `config-schema.cjs` | Single source of truth for `VALID_CONFIG_KEYS` and dynamic key patterns; imported by both the validator and the config-schema-docs parity test |
 | `config.cjs` | `config.json` read/write, section initialization; imports validator from `config-schema.cjs` |
 | `configuration.generated.cjs` | Generated Configuration Module — canonical config loading, legacy-key normalization, defaults merge, and explicit on-disk migration; source of truth for both SDK and CJS consumers |

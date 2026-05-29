@@ -40,7 +40,7 @@ function finding(extra) {
 
 // present_results / commit_review: frontmatter is the FIRST `---\n...\n---` block.
 function extractFrontmatter(content) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\n---/);
   return match ? match[1] : null;
 }
 
