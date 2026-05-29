@@ -11,7 +11,7 @@
  * Single-writer: only the orchestrator's driver writes this, sequentially.
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { PhaseFailureContext } from '../types.js';
 
@@ -71,26 +71,73 @@ export function rollbackLedgerPath(projectDir: string): string {
   return join(projectDir, '.planning', 'ROLLBACK.json');
 }
 
-/** Read the ledger, or null when absent/malformed (it is a derived signal). */
-export async function readRollbackLedger(projectDir: string): Promise<RollbackLedger | null> {
-  try {
-    const raw = await readFile(rollbackLedgerPath(projectDir), 'utf-8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as RollbackLedger;
-    }
-    return null;
-  } catch {
-    return null;
+/**
+ * Thrown by {@link readRollbackLedger} when `ROLLBACK.json` is PRESENT but cannot
+ * be parsed into a ledger object (truncated / corrupt JSON, or a non-object
+ * top-level value). The GROUP-E fix: this case MUST be distinguishable from an
+ * ABSENT ledger (which returns `null`). A non-atomic write that crashed
+ * mid-flight can leave a half-written file; resuming on it must HALT (a possibly
+ * half-unwound tree), never silently treat it as "no rollback in progress" and
+ * auto-advance.
+ */
+export class CorruptRollbackLedgerError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly cause: unknown,
+  ) {
+    super(
+      `ROLLBACK.json at ${path} is present but unparseable — refusing to treat a corrupt rollback ledger as absent: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+    this.name = 'CorruptRollbackLedgerError';
   }
 }
 
-/** Write the ledger (pretty-printed, trailing newline). */
+/**
+ * Read the ledger. Returns `null` ONLY when the file is ABSENT (ENOENT). A file
+ * that is PRESENT but unparseable THROWS {@link CorruptRollbackLedgerError} —
+ * the caller must treat that as a HALT, not as "no ledger" (GROUP-E fix).
+ */
+export async function readRollbackLedger(projectDir: string): Promise<RollbackLedger | null> {
+  const path = rollbackLedgerPath(projectDir);
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    // A non-ENOENT read error (EACCES, EISDIR, …) is an inability to read a
+    // ledger that may exist — fail closed rather than guess "absent".
+    throw new CorruptRollbackLedgerError(path, err);
+  }
+  // Present file: a parse failure or a non-object top-level value is CORRUPT.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new CorruptRollbackLedgerError(path, err);
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return parsed as RollbackLedger;
+  }
+  throw new CorruptRollbackLedgerError(path, new Error('top-level value is not a ledger object'));
+}
+
+/**
+ * Write the ledger ATOMICALLY (GROUP-E fix): write the full payload to a
+ * `ROLLBACK.json.tmp` sibling, then `rename` it over `ROLLBACK.json`. `rename`
+ * within a directory is atomic on POSIX + Windows, so a crash mid-write can
+ * never leave a half-written `ROLLBACK.json` for the resume path to misread as
+ * corrupt-but-present. `persistStepFlag` calls this after every Tier-2 step —
+ * exactly when a crash is likely — so atomicity is load-bearing here.
+ */
 export async function writeRollbackLedger(
   projectDir: string,
   ledger: RollbackLedger,
 ): Promise<void> {
   const path = rollbackLedgerPath(projectDir);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(ledger, null, 2)}\n`);
+  const tmp = `${path}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(ledger, null, 2)}\n`);
+  await rename(tmp, path);
 }
