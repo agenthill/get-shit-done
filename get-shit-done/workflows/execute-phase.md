@@ -413,7 +413,26 @@ CROSS_AI_TIMEOUT=$(gsd-sdk query config-get workflow.cross_ai_timeout 2>/dev/nul
 </step>
 
 <step name="execute_waves">
-Execute each selected wave in sequence. Within a wave: parallel if `PARALLELIZATION=true`, sequential if `false`.
+Execute the phase's plans over their **true `depends_on` DAG** (ADR 0013, D1/D2/D4), not a coarse wave-level barrier. Each plan is gated on its **direct predecessors** (its `depends_on` edges plus any `files_modified` serialization-edge peers) — not on a whole-wave barrier — so independent chains and a chain's successor proceed the instant their own predecessors integrate. Within the ready set: parallel if `PARALLELIZATION=true`, sequential if `false`.
+
+**Pre-flight — build the per-plan run-spec (replaces relying solely on the `waves{}` map):**
+
+```bash
+RUNSPEC=$(gsd-sdk query dag-runspec "${PHASE_NUMBER}")
+```
+
+Parse JSON for: `plans[]` (each with `id`, `depends_on` — direct predecessor ids, `wave`, `files_modified`, `has_summary`, `autonomous`, `model`), `serialization_edges` (pairs `[idA, idB]` of file-colliding plans not already `depends_on`-ordered — invariant 9), `incomplete`, `skipped_complete`, `parallelization`, `runtime`. A `depends_on` cycle aborts the query non-zero (invariant 8) — stop and report rather than dispatch.
+
+Compute, for each incomplete plan, its **predecessor set** = `depends_on` ∪ { the other id of every `serialization_edges` pair it appears in }. Plans in `skipped_complete` (`has_summary: true`) are filtered out of the dispatch set (invariant 10) but **remain satisfied predecessors** — their commits are already on the protected branch, so a dependent of a skipped plan needs no rebase for that edge and that predecessor counts as already-integrated.
+
+**Sequential fallback (unchanged contract):** if `PARALLELIZATION=false`, or the runtime lacks Agent-tool `isolation="worktree"` support (`USE_WORKTREES_FOR_PLAN=false` for a plan, project-level `USE_WORKTREES=false`, or `RUNTIME=codex` — already FATAL-gated in `initialize`), dispatch in **topological order one plan at a time** on the main working tree exactly as today's serial path describes below; the DAG only determines the order. The codex FATAL gate and the worktree-branch-check contract are unchanged.
+
+**Ready-set loop (the dispatch driver):** repeat until every incomplete plan is dispatched —
+1. Compute the **ready set** = every not-yet-dispatched incomplete plan whose entire predecessor set is already **integrated** (root plans — empty predecessor set — and `skipped_complete` predecessors count as integrated immediately).
+2. Dispatch the whole ready set (parallel: multiple `Agent()` in one message — see step 3; sequential fallback: one plan at a time in topo order).
+3. As each plan returns, record its `{branch, head_sha, worktree_path}` so its dependents' gates can open; a plan is **integrated** only after the orchestrator merges its delta in the post step. Independent chains and a chain's successor enter the ready set as soon as their predecessors finish — there is no whole-wave barrier between them.
+
+A plan's heartbeats below still use its `wave` from the run-spec as `{N}` (the topological level) so partial-transcript tooling keeps its `wave {N}/{M}` grep target; `{M}` is the max `wave` across incomplete plans. The level is a **reporting** coordinate only — gating is per-plan on the predecessor set, never on a level barrier.
 
 **Stream-idle-timeout prevention — checkpoint heartbeats (#2410):**
 
@@ -435,12 +454,12 @@ increases monotonically across waves. `{status}` is `complete` (success),
 [checkpoint] phase {PHASE_NUMBER} wave {N}/{M} complete, {P}/{Q} plans done ({wave_success}/{wave_plan_count} ok)
 ```
 
-**For each wave:**
+**For each ready-set round** (the set of plans whose predecessors are all integrated — see the ready-set loop above; this replaces the strict per-wave iteration but the per-round steps are otherwise unchanged):
 
-1. **Intra-wave files_modified overlap check (BEFORE spawning):**
+1. **Intra-round files_modified overlap check (BEFORE spawning):**
 
-   Before spawning any agents for this wave, inspect the `files_modified` list of all plans
-   in the wave. Check every pair of plans in the wave — if any two plans share even one file
+   The run-spec's `serialization_edges` already order file-colliding plans, so any two plans in the same ready set are collision-free by construction. This check is retained as a defense-in-depth net: before spawning any agents for this round, inspect the `files_modified` list of all plans
+   in the ready set. Check every pair of plans in the round — if any two plans share even one file
    in their `files_modified` lists, those plans have an implicit dependency and MUST NOT run
    in parallel.
 
@@ -516,9 +535,8 @@ increases monotonically across waves. `{status}` is `complete` (success),
 
    **Worktree mode** (`USE_WORKTREES_FOR_PLAN` is not `false` — evaluated per-plan in step 2.5):
 
-   Before spawning, capture the current HEAD:
+   Before spawning, set each plan's `EXPECTED_BASE` from its **direct predecessors** (the fork-off-predecessor protocol, ADR 0013 D3):
    ```bash
-   EXPECTED_BASE=$(git rev-parse HEAD)
    DISPATCH_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
    EXPECTED_BRANCH=$(git rev-parse --abbrev-ref HEAD)
    if [ "${USE_WORKTREES_FOR_PLAN:-true}" != "false" ] && [ -z "${WAVE_WORKTREE_MANIFEST:-}" ]; then
@@ -528,14 +546,17 @@ increases monotonically across waves. `{status}` is `complete` (success),
    fi
    ```
 
-   **Sequential dispatch for parallel execution (waves with 2+ agents):**
-   Dispatch each `Agent()` call **one at a time with `run_in_background: true`**. Do NOT
-   send all Agent calls in a single message: simultaneous `git worktree add` calls race
-   on `.git/config.lock`. Agents still run in parallel once their worktrees are created.
+   **`EXPECTED_BASE` per plan (fork-off-predecessor):**
+   - **Root plan** (empty predecessor set — no `depends_on`, no serialization-edge peer): `EXPECTED_BASE` = the orchestrator branch HEAD (`git rev-parse HEAD`) — today's behavior.
+   - **Single predecessor:** `EXPECTED_BASE` = that predecessor's `head_sha` (recorded when it returned). The executor's existing `git reset --hard {EXPECTED_BASE}` step (in `<worktree_branch_check>`) lands its worktree on the predecessor's tip, so it transitively contains the predecessor's commits (validated — sibling worktrees share one object store, ADR §Validation findings).
+   - **Multiple predecessors (diamond):** set `EXPECTED_BASE` to the first predecessor's `head_sha`, then instruct the executor to `git merge` the remaining predecessor branches into its own `worktree-agent-*` branch (legal — it stays in its own namespace; no merge to the protected branch). Pass the additional predecessor branch names in the prompt's `<worktree_branch_check>` so the merge runs right after the `reset --hard`.
+
+   **Multi-in-one-message dispatch for parallel execution (ready sets with 2+ agents):**
+   Dispatch **every plan in the ready set as `Agent()` calls in a SINGLE message** with `isolation="worktree"` and `run_in_background: true`. The Agent tool serializes worktree creation internally, so the old one-`Agent()`-per-message stagger that dodged the `.git/config.lock` race is **removed** (ADR 0013 D4). Each plan is gated only on its own predecessors, so a chain's successor is dispatched in a later round the instant its predecessor returns — not at a level barrier.
 
    ```text
-   # CORRECT: one Agent() per message with run_in_background: true
-   # WRONG: multiple Agent() calls in one message -> .git/config.lock contention
+   # CORRECT: all ready-set Agent() calls in ONE message, isolation="worktree", run_in_background: true
+   # (the Agent tool serializes worktree creation internally — no .git/config.lock race)
    ```
 
    ```text
@@ -577,6 +598,14 @@ increases monotonically across waves. `{status}` is `complete` (success),
          git reset --hard {EXPECTED_BASE}
          [ "$(git rev-parse HEAD)" != "{EXPECTED_BASE}" ] && { echo "ERROR: could not correct worktree base"; exit 1; }
        fi
+       # Multi-predecessor (diamond) plans only: after reset to the first predecessor's
+       # tip, merge the remaining predecessor branches into THIS worktree-agent-* branch
+       # (legal — stays in our own namespace; never merges to a protected ref). The
+       # orchestrator templates {EXTRA_PREDECESSOR_BRANCHES} (space-separated) only when
+       # the plan has 2+ predecessors; otherwise this line is omitted.
+       for PB in {EXTRA_PREDECESSOR_BRANCHES}; do
+         git merge --no-edit "$PB" || { echo "FATAL: predecessor merge of $PB conflicted in worktree"; exit 1; }
+       done
        ```
        Per-commit HEAD/cwd-drift/path-guard: `agents/gsd-executor.md` steps 0/0a/0b + `references/worktree-path-safety.md` (in <execution_context>).
        </worktree_branch_check>
@@ -728,9 +757,13 @@ increases monotonically across waves. `{status}` is `complete` (success),
    ```
    If hooks fail: report the failure and ask "Fix hook issues now?" or "Continue to next wave?"
 
-5.5. **Worktree cleanup (when `isolation="worktree"` was used):**
+5.5. **Per-plan topological integration + worktree cleanup (when `isolation="worktree"` was used):**
 
-   **Standard wave contract:** Each wave's worktrees merge to main via the templated path below before the next wave's worktrees fork. The cleanup loop runs once per wave at the end of the wave lifecycle. Worktrees created in wave N must be fully removed before wave N+1 forks new ones.
+   **Integration order:** merge each completed plan's **own commit delta** onto the protected branch in **topological order** (`integration_order` — predecessors before dependents; `skipped_complete` plans are already on the branch and skipped). Because each plan's worktree branch already contains its predecessors' commits (it forked off the predecessor tip), a dependent merged after its ancestor is a fast-forward-or-trivial merge whose delta is a **single plan** — exactly today's per-wave semantics, applied per plan. The serial-merge guard loop below runs **per plan** over the manifest (one worktree branch at a time) and is **preserved verbatim**: every guard (deletion-diff, >5-file bulk-delete revert, STATE/ROADMAP restore, resurrected-file detection — invariant 6) sees a single-plan delta exactly as before.
+
+   **Worktree lifecycle:** a plan's worktree/branch is **not** removed until all of its successors have forked off its tip and it has been integrated — descendants and the integration loop read from it. Once a plan is integrated and has no un-forked successors, its worktree is removed via the manifest-scoped cleanup below.
+
+   **Standard contract:** worktrees merge to main via the templated path below in topological order. The cleanup loop runs once per integration pass at the end of the round/level lifecycle.
 
    **Cross-wave dependency deviation (supported execution mode):** When the orchestrator legitimately deviates from the standard wave model — for example, a phase with cross-wave plan dependencies that requires custom inter-worktree base-update merges (e.g., `merge: bring 09-01 + 09-02 into 09-03 base`) — the cleanup loop below is NOT automatically re-entered for those custom merges. The deviation path produces correct final history but bypasses this loop, leaving `worktree-agent-*` directories in place. Use the **cleanup-tail snippet** below to remove any residual worktrees after such a deviation.
 
@@ -902,12 +935,11 @@ increases monotonically across waves. `{status}` is `complete` (success),
 
    **If no worktrees found at runtime:** Skip silently — agents may have been spawned without worktree isolation, or the orchestrator already cleaned them up.
 
-5.6. **Post-merge build & test gate:**
+5.6. **Post-merge build & test gate (BATCHED per topological level):**
 
-   After merging all worktrees in a wave (parallel mode), or after the last plan completes
-   (serial mode), run a build and then the project's test suite to catch cross-plan
+   Run the build+test gate **batched at topological-level boundaries**, NOT per plan-merge (ADR 0013 D3 — per-plan gating runs P serialized test cycles instead of one-per-level and would be slower than today under a test-dominated suite). After integrating every plan whose `wave` (topological level) is the current level — across all chains that reached that level — run a build and then the project's test suite once for the level, to catch cross-plan
    integration issues that individual worktree self-checks cannot detect (e.g., conflicting
-   type definitions, removed exports, import changes, link errors).
+   type definitions, removed exports, import changes, link errors). In the sequential fallback the gate runs once after the last plan completes (today's serial behavior).
 
    This addresses the Generator self-evaluation blind spot identified in Anthropic's
    harness engineering research: agents reliably report Self-Check: PASSED even when
@@ -915,9 +947,9 @@ increases monotonically across waves. `{status}` is `complete` (success),
 
    Read and execute `get-shit-done/workflows/execute-phase/steps/post-merge-gate.md`.
 
-5.7. **Post-wave shared artifact update (when at least one plan used worktrees, skip if tests failed):**
+5.7. **Post-level shared artifact update (when at least one plan used worktrees, skip if tests failed):**
 
-   When **any** executor agent in this wave ran with `isolation="worktree"`, that agent skipped STATE.md and ROADMAP.md updates to avoid last-merge-wins overwrites. The orchestrator is the single writer for these files. After worktrees are merged back, update shared artifacts once for every completed plan in the wave (worktree-mode plans **and** sequential plans that ran on the main tree but deferred to the orchestrator for tracking writes).
+   When **any** executor agent at this level ran with `isolation="worktree"`, that agent skipped STATE.md and ROADMAP.md updates to avoid last-merge-wins overwrites. The orchestrator is the single writer for these files. After worktrees are merged back and the batched per-level gate passed, update shared artifacts once for every completed plan at this level (worktree-mode plans **and** sequential plans that ran on the main tree but deferred to the orchestrator for tracking writes). `STATE.md`/`ROADMAP.md` are written only for plans on the protected branch with `TEST_EXIT==0` (invariant 3).
 
    **Only update tracking when tests passed (TEST_EXIT=0).**
    If tests failed or timed out, skip the tracking update — plans should
@@ -1035,14 +1067,14 @@ increases monotonically across waves. `{status}` is `complete` (success),
    **Step 7.3 — `class == "unknown-failure"`:**
    Report failed plan and ask Continue/Stop; continuing may cascade into dependent plan failures.
 
-7b. **Pre-wave dependency check (waves 2+ only):**
-    Before wave N+1, run `gsd-sdk query verify.key-links {phase_dir}/{plan}-PLAN.md` for each upcoming plan.
-    If any PRIOR-wave artifact link fails, present:
+7b. **Pre-dispatch dependency check (non-root plans only):**
+    Before dispatching a plan whose predecessor set is non-empty, run `gsd-sdk query verify.key-links {phase_dir}/{plan}-PLAN.md` for that plan.
+    If any PREDECESSOR artifact link fails, present:
     - `## Cross-Plan Wiring Gap` with plan/link/from/pattern rows
     - Options: investigate+fix before continue, or continue with cascade risk
-    Skip key-links that reference files in the CURRENT (upcoming) wave.
-8. **Execute checkpoint plans between waves** — see `<checkpoint_handling>`.
-9. **Proceed to next wave.**
+    Skip key-links that reference files produced by plans not yet integrated (i.e. peers in the same ready set).
+8. **Execute checkpoint plans** — see `<checkpoint_handling>`. A non-`autonomous` plan surfaces its checkpoint when its ready-set round resolves; dispatch its continuation before opening its dependents' gates.
+9. **Recompute the ready set and continue the loop** until every incomplete plan is dispatched and integrated.
 </step>
 <step name="checkpoint_handling">
 Plans with `autonomous: false` require user interaction.
@@ -1212,6 +1244,57 @@ Selected wave finished successfully. This phase still has incomplete plans, so p
 **If no incomplete plans remain after the selected wave finishes:**
 - continue with the normal phase-level verification and completion flow below
 - this means the selected wave happened to be the last remaining work in the phase
+</step>
+
+<step name="post_execution_fanout">
+**Read-only post-execution fan-out (ADR 0013, D1/D2/D4).** The post-execution gates — static goal verification, behavioral tests, code review, regression tests, schema-drift and codebase-drift detection — are all **read-only and independent**, so they run **concurrently** as a dynamic workflow instead of the serial chain. This orchestrator step is the interactive SHELL around that workflow: it fires the workflow, consumes the returned verdict, then runs the EXISTING interactive gates (which the workflow cannot — it has no `AskUserQuestion`).
+
+**Runtime gate (read this first).** The read-only fan-out requires **Claude Code with the Workflow tool**. The workflow script spawns only agents and composes `parallel()` — it has no fs/git/bash/clock of its own, does no file mutation, and uses **no worktree isolation** (the analyses run read-only against the already-integrated tree; the orchestrator owns every `STATE.md`/`ROADMAP.md` write and every user prompt). **If the Workflow tool is unavailable** (non-Claude runtime, or `Workflow` is not a registered tool), SKIP this step entirely and fall through to today's **serial gate chain** below (`code_review_gate` → `close_parent_artifacts` → `regression_gate` → `schema_drift_gate` → `codebase_drift_gate` → `verify_phase_goal`), which is preserved verbatim as the fallback.
+
+**1. Invoke the fan-out workflow** (only when the `Workflow` tool is available):
+
+```
+Workflow(
+  name="gsd-verify-fanout",
+  args={
+    "phase_number": "${PHASE_NUMBER}",
+    "phase_dir": "${PHASE_DIR}",
+    "phase_goal": "{goal from ROADMAP.md}",
+    "phase_req_ids": "${phase_req_ids}",
+    "test_command": "{resolved workflow.test_command or empty}",
+    "regression_files": "{REGRESSION_FILES discovered from prior VERIFICATION.md, or empty}",
+    "prior_phase": "{most recent prior phase number, or empty}",
+    "response_language": "{response_language or empty}"
+  }
+)
+```
+
+The workflow returns a single verdict object:
+```
+{ status: 'passed' | 'gaps_found' | 'human_needed',
+  gaps: [...], human_verification: [...],
+  per_gate: [{ gate, status, findings }] }
+```
+
+**2. Consume the verdict — run the EXISTING interactive gates (unchanged routing):**
+
+   **Always surface the per-gate summary** (code review is advisory; print the `code-review` gate findings exactly as `code_review_gate` would, and emit `close_parent_artifacts` for decimal/polish phases — that step is non-interactive and still runs after the fan-out).
+
+   **Preserve schema-drift's BLOCKING behavior.** Inspect the `schema-drift` entry in `per_gate`. If its `needs_user_decision.kind == "blocking"` (and `GSD_SKIP_SCHEMA_CHECK` is not `true`), route to the `schema_drift_gate` interactive flow VERBATIM — its three options (run push / skip with `GSD_SKIP_SCHEMA_CHECK=true` / abort) and its block-before-completion semantics are unchanged. Do NOT mark the phase complete while schema drift is blocking.
+
+   **Then branch on `verdict.status`** using the SAME routing as `verify_phase_goal`'s status table:
+
+   | `verdict.status` | Action |
+   |--------|--------|
+   | `passed` | → `update_roadmap` (gated on this passed verdict) |
+   | `human_needed` | Persist + present `human_verification[]` exactly as `verify_phase_goal`'s **If human_needed** branch (write `{phase_dir}/{phase_num}-HUMAN-UAT.md`, present items, "approved" → continue). Keep the phase pending until approved. |
+   | `gaps_found` | Present the gap summary from `verdict.gaps[]` and offer `/gsd:plan-phase {phase} --gaps ${GSD_WS}` exactly as `verify_phase_goal`'s **If gaps_found** branch. |
+
+   The codebase-drift gate is non-blocking by contract — surface its findings (warn / auto-remap per `codebase_drift_gate`) but never fail the phase on it. Regression and behavioral-test failures land in `verdict.gaps` and route through the `gaps_found` branch.
+
+**3. Gate completion.** `update_roadmap` runs only on a **passed verdict** (or a `human_needed` verdict the user explicitly **approved**, matching today's "approved → proceed to update_roadmap"). On `gaps_found`, do NOT advance — the gap-closure cycle owns the next step.
+
+**4. After consuming the verdict, SKIP the serial gate steps** (`code_review_gate`, `regression_gate`, `schema_drift_gate`, `codebase_drift_gate`, `verify_phase_goal`) — the fan-out already ran their read-only analyses concurrently and this shell ran their interactive parts. `close_parent_artifacts` still runs (it is not part of the read-only fan-out). Proceed to `update_roadmap` per step 3.
 </step>
 
 <step name="code_review_gate" required="true">
