@@ -179,6 +179,14 @@ export interface ExecutionEngineFactory {
     serializer: MergeSerializer;
     /** Base commit roots fork off (current protected HEAD). '' for the no-op path. */
     baseSha: string;
+    /**
+     * True for the REAL git-backed engine (per-plan worktree isolation enforced).
+     * When true, a `worktrees.create()` failure is FATAL — the plan is marked
+     * failed rather than silently degrading to shared cwd (which would bypass
+     * invariant 3 and run concurrent shared-tree mutation). Absent/false for the
+     * no-op (shared-cwd) engine, whose create() never throws.
+     */
+    isolated?: boolean;
   };
 }
 
@@ -878,6 +886,10 @@ export class PhaseRunner {
           worktrees: new SharedCwdWorktreeManager(this.projectDir) as WorktreeManager,
           serializer: new NoopMergeSerializer() as MergeSerializer,
           baseSha: '',
+          // No-op engine: create() never throws, so create()-failure is not fatal
+          // (a degrade to shared cwd is the today-behaviour). Explicit `false` keeps
+          // both union arms structurally aligned for `engine.isolated`.
+          isolated: false,
         };
 
     const phaseLevel = Number.parseInt(phaseNumber, 10);
@@ -987,6 +999,15 @@ export class PhaseRunner {
           cwd = wt.cwd || this.projectDir;
           branch = wt.branch;
         } catch (err) {
+          // Under the REAL (isolated) engine a create() failure is FATAL: silently
+          // continuing in shared cwd would run concurrent shared-tree mutation and
+          // bypass the inv-3 test gate (the executor's commit would not land on an
+          // isolated branch, so the dependent could miss it — invariant 4). Propagate
+          // so the plan is marked failed. The no-op engine's create() never throws,
+          // so this only fires for the git-backed path.
+          if (engine.isolated) {
+            throw err instanceof Error ? err : new Error(String(err));
+          }
           this.logger?.warn(
             `Worktree create failed for plan ${node.id}, running in shared cwd: ${err instanceof Error ? err.message : String(err)}`,
           );

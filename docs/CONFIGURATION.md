@@ -553,6 +553,8 @@ All four fields are **optional and additive** — STATE.md files without them ke
 | `git.phase_branch_template` | string | `gsd/phase-{phase}-{slug}` | Branch name template for phase strategy |
 | `git.milestone_branch_template` | string | `gsd/{milestone}-{slug}` | Branch name template for milestone strategy |
 | `git.quick_branch_template` | string or null | `null` | Optional branch name template for `/gsd-quick` tasks |
+| `git.sdk_worktree_execution` | boolean | `false` | **ADR 0013 option 3 (SDK headless only, Claude runtime).** When `true`, the SDK phase runner runs each plan in its own git worktree with a single-writer merge serializer and a real build+test gate (invariant 3 enforced). Gated by a fail-closed worktree-capability pre-flight that throws — never silently degrades to shared-cwd — when git worktree isolation is unavailable. Default `false` preserves today's in-process shared-cwd path |
+| `git.sdk_test_command` | string or null | `null` | Test command for the SDK build+test gate when `git.sdk_worktree_execution` is on. When `null`, falls back to `npm test` if a `package.json` with a `test` script exists, else the gate passes as a no-op. Run via execFile in the post-merge protected checkout; a timeout returns exit 124 (inconclusive ≠ pass) |
 
 ### Strategy Comparison
 

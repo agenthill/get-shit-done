@@ -19,7 +19,9 @@
     "base_branch": null,
     "phase_branch_template": "gsd/phase-{phase}-{slug}",
     "milestone_branch_template": "gsd/{milestone}-{slug}",
-    "quick_branch_template": null
+    "quick_branch_template": null,
+    "sdk_worktree_execution": false,
+    "sdk_test_command": null
   },
   "workflow": {
     "research": true,
