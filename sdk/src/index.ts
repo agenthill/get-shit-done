@@ -22,6 +22,10 @@
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo, PhaseFailureContext } from './types.js';
 import { GSDEventType, PhaseStepType } from './types.js';
@@ -38,7 +42,7 @@ import { PromptFactory } from './phase-prompt.js';
 import { detectRuntime } from './query/helpers.js';
 import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
 import { classifyAgentFailure } from './query/agent-failure-classifier.js';
-import { rollbackTier1, cascadeRollbackTier2 } from './query/rollback-engine.js';
+import { rollbackTier1, cascadeRollbackTier2, resumeIncompleteRollback } from './query/rollback-engine.js';
 import { writeRollbackLedger } from './query/rollback-ledger.js';
 import { readPhaseManifest } from './query/phase-manifest.js';
 import { classifyCascade } from './query/tier2-cascade-classifier.js';
@@ -238,6 +242,30 @@ export class GSD {
     // halting for a human. Absent/null → 5. Read once per milestone run.
     const config = await loadConfig(this.projectDir, this.workstream);
     const maxPhaseAttempts = config.git?.sdk_max_phase_attempts ?? 5;
+
+    // ADR 0013 option 4 (chunk 4): crash-resume. If a prior run crashed mid
+    // Tier-2 unwind, ROLLBACK.json carries an incomplete per-step journal.
+    // Replay the REMAINING steps idempotently BEFORE selecting/running the next
+    // phase (the journal's skip-done logic finishes them; it never re-reverts),
+    // then settle to halted. A complete/absent journal → no-op. Reconstruct
+    // protectedBranch + serializer + manifest the same way maybeCascadeTier2
+    // does. Best-effort: a resume that itself errors must not abort the loop.
+    try {
+      const resumeManifest = await readPhaseManifest(this.projectDir);
+      if (Object.keys(resumeManifest).length > 0) {
+        const protectedBranch = await this.resolveProtectedBranch(config);
+        const serializer = new GitMergeSerializer(this.projectDir, protectedBranch, async () => 0);
+        await resumeIncompleteRollback({
+          projectDir: this.projectDir,
+          protectedBranch,
+          serializer,
+          manifest: resumeManifest,
+          ...(this.workstream && { workstream: this.workstream }),
+        });
+      }
+    } catch {
+      /* resume is best-effort; a failure here is surfaced via ROLLBACK.json */
+    }
 
     while (currentPhases.length > 0) {
       const phase = currentPhases[0];
@@ -603,6 +631,31 @@ export class GSD {
       cascade_set: cls.cascadeSet,
     });
     return true;
+  }
+
+  /**
+   * Resolve the protected branch for crash-resume (chunk 4), mirroring
+   * build-execution-engine.resolveProtectedBranch: honor `git.base_branch`, else
+   * try `main`, then `master`, then the current branch. Kept private/local so the
+   * resume path does not depend on building the (probe-gated) execution engine.
+   */
+  private async resolveProtectedBranch(config: Awaited<ReturnType<typeof loadConfig>>): Promise<string> {
+    const configured = config.git?.base_branch;
+    if (typeof configured === 'string' && configured.trim().length > 0) {
+      return configured.trim();
+    }
+    const exists = async (ref: string): Promise<boolean> => {
+      try {
+        await execFileAsync('git', ['rev-parse', '--verify', ref], { cwd: this.projectDir });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (await exists('main')) return 'main';
+    if (await exists('master')) return 'master';
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: this.projectDir });
+    return stdout.trim();
   }
 
   /**

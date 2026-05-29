@@ -39,10 +39,31 @@ export interface RollbackLedger {
    */
   cascade_set?: string[];
   /**
-   * Reserved for chunk 4's per-step crash-resume done-flags. Absent today; the
-   * shape is declared so chunk 4 extends rather than reshapes.
+   * Per-step crash-resume journal (ADR 0013 option 4, chunk 4). Keyed by the
+   * REVERTED phase number; each value is the done-flags for that phase's Tier-2
+   * unwind, persisted IMMEDIATELY after each step succeeds so a crash mid-Tier-2
+   * leaves flags 1..N set and the resume entry point replays only steps N+1.. .
+   * Scoped to Tier-2 only — Tier-1 is naturally idempotent (protected is provably
+   * at LAST_GOOD; checkout/branch -D/tag -d/copyFile all replay cleanly) so it is
+   * NOT journaled. Absent for a Tier-1 ledger or a chunk-2/3 writer (additive).
    */
-  steps?: Record<string, unknown>;
+  steps?: Record<string, RollbackStepFlags>;
+}
+
+/**
+ * Per-phase Tier-2 step completion flags (chunk 4). Each flag flips true once
+ * that step has SUCCEEDED on protected/disk; a true flag means the step is
+ * already applied and the resume must SKIP it (each step is independently
+ * skip-safe — see rollbackTier2). The five steps mirror rollbackTier2's forced
+ * restore order: git revert, quarantine move, ROADMAP uncomplete, REQUIREMENTS
+ * mark-incomplete, STATE restore.
+ */
+export interface RollbackStepFlags {
+  git_done: boolean;
+  quarantine_done: boolean;
+  roadmap_done: boolean;
+  requirements_done: boolean;
+  state_done: boolean;
 }
 
 /** `.planning/ROLLBACK.json` for a project. */
