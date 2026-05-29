@@ -38,7 +38,7 @@ import type { PhaseManifest } from './phase-manifest.js';
 import { phaseUncomplete, requirementsMarkIncomplete } from './phase-lifecycle.js';
 import { readPhaseRequirements } from './phase-depends-on.js';
 import { normalizePhaseName, phaseTokenMatches, planningPaths } from './helpers.js';
-import { readRollbackLedger, writeRollbackLedger } from './rollback-ledger.js';
+import { readRollbackLedger, writeRollbackLedger, CorruptRollbackLedgerError } from './rollback-ledger.js';
 import type { RollbackLedger, RollbackStepFlags } from './rollback-ledger.js';
 
 const execFileAsync = promisify(execFile);
@@ -230,11 +230,13 @@ function quarantineDirFor(projectDir: string, phaseNumber: string): string {
  *
  *   1. GIT: `git revert --no-commit` over the phase's manifest commits
  *      (history-preserving — NEVER reset-hard on protected, reverse order so a
- *      later commit reverts before the earlier it built on), run the guard suite
- *      over the revert delta (`protectedTipBeforeRevert..HEAD`), then commit ONE
- *      `revert(phase-M): autonomous unwind`. ON CONFLICT with a kept later
- *      phase: `git revert --abort` + `git reset HEAD` + `git restore .` FIRST
- *      (leave a clean tree), THEN return status:'halted' (judge-defect #1).
+ *      later commit reverts before the earlier it built on), then commit ONE
+ *      `revert(phase-M): autonomous unwind`. The forward-merge guard suite is
+ *      NOT run over the revert delta — its bulk-delete-restore + resurrection-
+ *      strip branches would UNDO the revert (GROUP-A fix). ON CONFLICT with a
+ *      kept later phase: `git revert --abort` + `git reset HEAD` + `git restore
+ *      .` FIRST (leave a clean tree), THEN return status:'halted'
+ *      (judge-defect #1).
  *   2. QUARANTINE (move, NOT delete): the phase's `*-SUMMARY.md` /
  *      `VERIFICATION.md` / `UAT.md` move to `.planning/.rollback-quarantine/
  *      phase-M/` so disk_status reverts complete→planned and `has_summary` flips.
@@ -255,11 +257,13 @@ export async function rollbackTier2(input: RollbackTier2Input): Promise<Rollback
     protectedTipBeforeRevert,
     phaseNumber,
     manifest,
-    serializer,
     workstream,
     journal,
     faultAfterStep,
   } = input;
+  // `serializer` is accepted on the input for API stability + future use but is
+  // NOT consumed: a Tier-2 revert deliberately does not run the forward-merge
+  // guard suite (see the revert-commit step below — GROUP-A fix).
   const git = (args: string[]) => execFileAsync('git', args, { cwd: projectDir });
 
   const result: RollbackTier2Result = {
@@ -290,9 +294,21 @@ export async function rollbackTier2(input: RollbackTier2Input): Promise<Rollback
   // ── 1. GIT revert (history-preserving) ──
   // SKIP when git_done: the revert commit is already on protected; re-reverting
   // would double-revert. Adopt the current HEAD as the (already-applied) revert.
-  if (flags.git_done) {
+  const revertSubject = `revert(phase-${phaseNumber}): autonomous unwind`;
+  // GROUP-F fix: the journal's git_done flag is persisted AFTER the revert
+  // commit lands. A crash in the window [revert committed, git_done persisted]
+  // leaves the revert DURABLY on protected with git_done=false, so a naive
+  // resume would re-revert (double-revert / empty-commit error). Before
+  // attempting the revert, detect that it is ALREADY applied — HEAD's subject is
+  // already this phase's revert subject — and ADOPT it (persist git_done) rather
+  // than re-revert. This closes the crash window the flag alone cannot.
+  const headSubjectAlreadyRevert = await headSubjectMatches(git, revertSubject);
+  if (flags.git_done || headSubjectAlreadyRevert) {
     result.revertCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim();
     result.protectedSha = result.revertCommit;
+    // Adopt the already-applied revert into the journal so a later resume (and
+    // the second-resume no-op) sees git_done set.
+    if (!flags.git_done) await persist('git_done');
   } else {
     // Be on protected before reverting (the revert commit lands here). protected
     // is at protectedTipBeforeRevert.
@@ -323,9 +339,14 @@ export async function rollbackTier2(input: RollbackTier2Input): Promise<Rollback
     let conflictDetail = '';
     for (const commit of commits) {
       if (covered.has(commit)) continue;
-      const parents = await commitParents(projectDir, commit);
-      const isMerge = parents.length > 1;
       try {
+        // `commitParents` reads `git rev-list` on the manifest sha and THROWS on a
+        // bad / GC'd / rebased commit. It MUST be inside the try (GROUP-B fix): a
+        // throw here while an earlier iteration already staged a `--no-commit`
+        // revert would otherwise escape uncaught and leave a dirty half-reverted
+        // tree. Routing it through `conflicted` runs the clean-tree-then-halt path.
+        const parents = await commitParents(projectDir, commit);
+        const isMerge = parents.length > 1;
         if (isMerge) {
           await git(['revert', '--no-commit', '--mainline', '1', commit]);
           // Mark the second-parent subtree (the merged work) as covered so we do
@@ -357,17 +378,23 @@ export async function rollbackTier2(input: RollbackTier2Input): Promise<Rollback
       };
     }
 
-    // Guard suite over the revert delta (protectedTipBeforeRevert..HEAD): the
-    // revert may have dropped files a kept later phase relies on, so the same
-    // bulk-delete / STATE-restore / resurrection guards apply. The revert is still
-    // staged (--no-commit) so the guard suite sees it as the working delta once we
-    // commit; run it AFTER committing so HEAD reflects the revert.
+    // Commit the accumulated inverse as ONE `revert(phase-M): autonomous unwind`.
+    //
+    // We deliberately do NOT run the FORWARD-MERGE guard suite over the revert
+    // delta. That guard (applyGuardSuite) exists to protect a forward MERGE: its
+    // bulk-delete branch RESTORES every file the delta deleted from baseTip, and
+    // its resurrection branch `git rm`s files the delta re-added. Over a REVERT
+    // delta — where baseTip (protectedTipBeforeRevert) still HAS the reverted
+    // phase's files — those two branches do the EXACT INVERSE of the revert:
+    // they re-create the >5 files the revert removed and strip the files the
+    // revert restored, silently NEUTRALIZING the unwind while the ledger/ROADMAP/
+    // STATE all report it reverted (the GROUP-A defect). The `git revert
+    // --no-commit` loop above already detects a collision with kept-later work (a
+    // later commit touching a reverted file makes the revert conflict → the
+    // conflict→clean+halt path fires), so the guard adds no revert-safety here.
     let revertCommit: string;
     try {
-      await git(['commit', '--no-verify', '-m', `revert(phase-${phaseNumber}): autonomous unwind`]);
-      revertCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim();
-      await serializer.runGuardSuite(protectedTipBeforeRevert);
-      // The guard suite may have added its own restore commit; re-read HEAD.
+      await git(['commit', '--no-verify', '-m', revertSubject]);
       revertCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim();
     } catch (err) {
       // Commit failed (e.g. nothing to revert / empty) — clean up and halt rather
@@ -576,10 +603,21 @@ export interface ResumeIncompleteRollbackInput {
 export interface ResumeIncompleteRollbackResult {
   /** True when an incomplete Tier-2 journal was found and replayed. */
   resumed: boolean;
+  /**
+   * True when the driver MUST HALT (success=false, do not advance) — set either
+   * because an incomplete journal was replayed (`resumed`) OR because the ledger
+   * is PRESENT-but-CORRUPT (GROUP-E fix: a truncated ROLLBACK.json means a
+   * possibly half-unwound tree; advancing would corrupt protected). The absent
+   * (null) ledger case leaves this false so a normal run proceeds. Always
+   * `>= resumed`.
+   */
+  halt: boolean;
   /** The phase whose journal was replayed (when resumed). */
   phase?: string;
   /** The Tier-2 result of the replay (when resumed). */
   result?: RollbackTier2Result;
+  /** Set when `halt` is due to a corrupt (not resumed) ledger. */
+  corruptReason?: string;
 }
 
 /**
@@ -598,13 +636,27 @@ export async function resumeIncompleteRollback(
   input: ResumeIncompleteRollbackInput,
 ): Promise<ResumeIncompleteRollbackResult> {
   const { projectDir, protectedBranch, serializer, manifest, workstream } = input;
-  const ledger = await readRollbackLedger(projectDir);
+
+  // GROUP-E fix: a PRESENT-but-CORRUPT ROLLBACK.json (truncated by a crash
+  // mid-write) is NOT "no rollback in progress". readRollbackLedger throws a
+  // CorruptRollbackLedgerError for it (vs returning null for ABSENT). A corrupt
+  // ledger means a possibly half-unwound tree — HALT, never advance. An ABSENT
+  // ledger (null) proceeds normally.
+  let ledger: RollbackLedger | null;
+  try {
+    ledger = await readRollbackLedger(projectDir);
+  } catch (err) {
+    if (err instanceof CorruptRollbackLedgerError) {
+      return { resumed: false, halt: true, corruptReason: err.message };
+    }
+    throw err;
+  }
   const steps = ledger?.steps;
-  if (!ledger || !steps) return { resumed: false };
+  if (!ledger || !steps) return { resumed: false, halt: false };
 
   // Find the first phase whose journal is incomplete (not all five flags set).
   const incomplete = Object.entries(steps).find(([, f]) => !allStepsDone(f));
-  if (!incomplete) return { resumed: false };
+  if (!incomplete) return { resumed: false, halt: false };
   const [phase] = incomplete;
 
   const git = (args: string[]) => execFileAsync('git', args, { cwd: projectDir });
@@ -636,7 +688,7 @@ export async function resumeIncompleteRollback(
     });
   }
 
-  return { resumed: true, phase, result };
+  return { resumed: true, halt: true, phase, result };
 }
 
 /** True when every Tier-2 step flag for a phase is set. */
@@ -666,6 +718,23 @@ async function stageAndCommitManifestIfDirty(
     await git(['commit', '--no-verify', '-m', 'chore(rollback): checkpoint phase manifest before Tier-2 revert']).catch(() => {});
   } catch {
     /* non-fatal — the revert will surface any real dirtiness */
+  }
+}
+
+/**
+ * True when HEAD's commit subject equals `subject` (GROUP-F already-applied
+ * revert detection). Reads `git log -1 --format=%s`. Returns false on any git
+ * error (an unreadable HEAD is not a confident "already reverted").
+ */
+async function headSubjectMatches(
+  git: (args: string[]) => Promise<{ stdout: string }>,
+  subject: string,
+): Promise<boolean> {
+  try {
+    const { stdout } = await git(['log', '-1', '--format=%s']);
+    return stdout.trim() === subject;
+  } catch {
+    return false;
   }
 }
 

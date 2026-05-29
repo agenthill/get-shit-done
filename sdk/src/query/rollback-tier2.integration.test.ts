@@ -221,6 +221,187 @@ describe('Tier-2 cascade — attributable predecessor reverted, independent phas
     }
   });
 
+  it('GROUP-A falsifier: a reverted phase that ADDED >5 files actually REMOVES all of them (the forward-merge guard must NOT undo the revert)', async () => {
+    // Reproduces-then-kills bulk-delete-guard-undoes-tier2-revert: phase 2 adds
+    // 7 files (> the bulk-delete threshold of 5). Pre-fix, rollbackTier2 ran the
+    // FORWARD-MERGE guard suite over the revert delta — its bulk-delete branch
+    // (>5 deletions) RESTORED all 7 files from baseTip (which still has them),
+    // silently NEUTRALIZING the revert while the ledger/ROADMAP claimed reverted.
+    // Post-fix: the guard is not run over a revert delta, so all 7 files are
+    // actually GONE.
+    const dir = await mkdtemp(join(tmpdir(), 'gsd-t2a-'));
+    try {
+      const git = gitIn(dir);
+      await git(['init', '-q', '-b', 'main']);
+      await git(['config', 'user.email', 't@t.t']);
+      await git(['config', 'user.name', 'T']);
+      await git(['config', 'commit.gpgsign', 'false']);
+
+      await mkdir(join(dir, '.planning', 'phases', '02-build'), { recursive: true });
+      await writeFile(
+        join(dir, '.planning', 'ROADMAP.md'),
+        [
+          '## Milestone v1',
+          '',
+          '### Phase 2: Build',
+          '**Requirements:** REQ-02',
+          '**Depends on:** None',
+          '',
+          '- [x] Phase 2: Build (completed 2026-01-02)',
+          '',
+        ].join('\n'),
+      );
+      await writeFile(join(dir, '.planning', 'REQUIREMENTS.md'), '- [x] **REQ-02** build\n');
+      await writeFile(join(dir, '.planning', 'STATE.md'), 'status: phase_complete\nphase: 2 COMPLETE\n');
+      await writeFile(join(dir, '.planning', 'phases', '02-build', '02-SUMMARY.md'), '# phase 2 done\n');
+      await ensureCheckpointGitignore(dir);
+      await git(['add', '-A']);
+      await git(['commit', '-q', '--no-verify', '-m', 'base']);
+
+      const manifest: PhaseManifest = {};
+      // Promote phase 2 adding feat1..feat7 (7 files > bulk-delete threshold 5).
+      const cp2 = await createPhaseCheckpoint({ projectDir: dir, phaseNumber: '2', protectedBranch: 'main' });
+      await git(['checkout', '-q', '-B', 'gsd-phase-2-int', cp2.lastGoodSha]);
+      const featFiles = ['feat1.ts', 'feat2.ts', 'feat3.ts', 'feat4.ts', 'feat5.ts', 'feat6.ts', 'feat7.ts'];
+      for (const f of featFiles) await writeFile(join(dir, f), `export const ${f.replace('.ts', '')} = 1;\n`);
+      await git(['add', '-A']);
+      await git(['commit', '-q', '--no-verify', '-m', 'phase 2 work']);
+      await git(['checkout', '-q', 'main']);
+      await git(['merge', '--no-ff', '--no-edit', 'gsd-phase-2-int']);
+      const head2 = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+      manifest['2'] = await recordPhasePromotion({
+        projectDir: dir, phaseNumber: '2', baseTag: cp2.baseTag, baseSha: cp2.lastGoodSha,
+        headSha: head2, promotedAt: '2026-01-02T00:01:00.000Z', dependsOn: [],
+      });
+
+      // All 7 files exist on protected before the revert.
+      for (const f of featFiles) expect(await pathExists(join(dir, f))).toBe(true);
+
+      const serializer = new GitMergeSerializer(dir, 'main', async () => 0);
+      const casc = await cascadeRollbackTier2({
+        projectDir: dir, protectedBranch: 'main', cascadeSet: ['2'], manifest, serializer,
+      });
+
+      expect(casc.status).toBe('reverted');
+      expect(casc.revertedPhases).toEqual(['2']);
+      const subjects = await logSubjects(dir, 'main');
+      expect(subjects).toContain('revert(phase-2): autonomous unwind');
+
+      // THE LOAD-BEARING ASSERTION: every added file is ACTUALLY GONE from
+      // protected — the revert is real, not neutralized by a bulk-delete restore.
+      for (const f of featFiles) {
+        expect(await pathExists(join(dir, f)), `${f} must be removed by the revert`).toBe(false);
+      }
+      // And no guard "restore N file(s)" commit re-added them.
+      expect(subjects).not.toContain('guard: restore 7 file(s) (bulk-delete/state/resurrection guard)');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('GROUP-A falsifier: a reverted phase that DELETED a pre-existing file RESTORES it and it STAYS restored (resurrection guard must not strip it)', async () => {
+    // Reproduces-then-kills resurrection-guard-strips-reverted-restore: phase 2
+    // DELETES a pre-existing file `legacy.ts`. Reverting phase 2 re-ADDS legacy.ts.
+    // Pre-fix, the forward-merge guard's resurrection branch saw legacy.ts as an
+    // addition over a baseTip whose history shows a prior deletion → `git rm`'d
+    // it, STRIPPING the revert's restore. Post-fix: the guard is not run, so
+    // legacy.ts stays restored.
+    const dir = await mkdtemp(join(tmpdir(), 'gsd-t2d-'));
+    try {
+      const git = gitIn(dir);
+      await git(['init', '-q', '-b', 'main']);
+      await git(['config', 'user.email', 't@t.t']);
+      await git(['config', 'user.name', 'T']);
+      await git(['config', 'commit.gpgsign', 'false']);
+
+      await mkdir(join(dir, '.planning', 'phases', '02-build'), { recursive: true });
+      await writeFile(
+        join(dir, '.planning', 'ROADMAP.md'),
+        ['## Milestone v1', '', '### Phase 2: Build', '**Requirements:** REQ-02', '**Depends on:** None', '', '- [x] Phase 2: Build (completed 2026-01-02)', ''].join('\n'),
+      );
+      await writeFile(join(dir, '.planning', 'REQUIREMENTS.md'), '- [x] **REQ-02** build\n');
+      await writeFile(join(dir, '.planning', 'STATE.md'), 'status: phase_complete\nphase: 2 COMPLETE\n');
+      await writeFile(join(dir, '.planning', 'phases', '02-build', '02-SUMMARY.md'), '# phase 2 done\n');
+      // Pre-existing file that phase 2 will delete.
+      await writeFile(join(dir, 'legacy.ts'), 'export const legacy = true;\n');
+      await ensureCheckpointGitignore(dir);
+      await git(['add', '-A']);
+      await git(['commit', '-q', '--no-verify', '-m', 'base']);
+
+      const manifest: PhaseManifest = {};
+      const cp2 = await createPhaseCheckpoint({ projectDir: dir, phaseNumber: '2', protectedBranch: 'main' });
+      await git(['checkout', '-q', '-B', 'gsd-phase-2-int', cp2.lastGoodSha]);
+      await git(['rm', '-q', 'legacy.ts']); // phase 2 DELETES the pre-existing file
+      await writeFile(join(dir, 'newthing.ts'), 'export const n = 1;\n');
+      await git(['add', '-A']);
+      await git(['commit', '-q', '--no-verify', '-m', 'phase 2 work']);
+      await git(['checkout', '-q', 'main']);
+      await git(['merge', '--no-ff', '--no-edit', 'gsd-phase-2-int']);
+      const head2 = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+      manifest['2'] = await recordPhasePromotion({
+        projectDir: dir, phaseNumber: '2', baseTag: cp2.baseTag, baseSha: cp2.lastGoodSha,
+        headSha: head2, promotedAt: '2026-01-02T00:01:00.000Z', dependsOn: [],
+      });
+
+      // After phase 2 promoted, legacy.ts is gone, newthing.ts present.
+      expect(await pathExists(join(dir, 'legacy.ts'))).toBe(false);
+      expect(await pathExists(join(dir, 'newthing.ts'))).toBe(true);
+
+      const serializer = new GitMergeSerializer(dir, 'main', async () => 0);
+      const casc = await cascadeRollbackTier2({
+        projectDir: dir, protectedBranch: 'main', cascadeSet: ['2'], manifest, serializer,
+      });
+      expect(casc.status).toBe('reverted');
+
+      // THE LOAD-BEARING ASSERTION: the revert restored legacy.ts and it STAYS —
+      // the resurrection guard did not strip it back out.
+      expect(await pathExists(join(dir, 'legacy.ts')), 'legacy.ts must be restored by the revert and stay').toBe(true);
+      expect(await readFile(join(dir, 'legacy.ts'), 'utf-8')).toContain('legacy = true');
+      // And phase 2's added file is gone.
+      expect(await pathExists(join(dir, 'newthing.ts'))).toBe(false);
+      // (The .planning/*.md docs are restored on the working tree by the
+      // quarantine/ROADMAP/REQ/STATE steps and are intentionally left uncommitted
+      // there — so the tree is NOT asserted clean after a full successful unwind.)
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('GROUP-B falsifier: a manifest commit that is an invalid/nonexistent sha → HALTED with a CLEAN tree (commitParents throw routed, no dirty half-revert)', async () => {
+    // Reproduces-then-kills commitparents-throw-leaves-dirty-tree: the manifest's
+    // `commits` carries a bogus sha. Pre-fix, commitParents() ran OUTSIDE the try
+    // and threw → the exception escaped uncaught and (if a prior iteration staged
+    // a --no-commit revert) left a dirty half-reverted tree. Post-fix: the throw
+    // is routed through the conflict→clean+halt path → status:'halted', clean tree.
+    const { dir, manifest } = await setupTwoPromotedPhases();
+    try {
+      const git = gitIn(dir);
+      const serializer = new GitMergeSerializer(dir, 'main', async () => 0);
+      const protectedBefore = (await git(['rev-parse', 'main'])).stdout.trim();
+
+      // Corrupt phase 2's manifest commits: prepend a real commit (so an earlier
+      // iteration stages a --no-commit revert) then a bogus sha (so commitParents
+      // throws on the NEXT iteration with a dirty index already staged).
+      const realCommit = manifest['2']!.commits[manifest['2']!.commits.length - 1]!;
+      const bogus = '0123456789abcdef0123456789abcdef01234567';
+      const corruptManifest: PhaseManifest = {
+        ...manifest,
+        '2': { ...manifest['2']!, commits: [realCommit, bogus] }, // reversed → bogus reverted "first"
+      };
+
+      const casc = await cascadeRollbackTier2({
+        projectDir: dir, protectedBranch: 'main', cascadeSet: ['2'], manifest: corruptManifest, serializer,
+      });
+
+      // HALTED (not thrown) with a CLEAN tree and protected unchanged.
+      expect(casc.status).toBe('halted');
+      expect(await isClean(dir)).toBe(true);
+      expect((await git(['rev-parse', 'main'])).stdout.trim()).toBe(protectedBefore);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('CONFLICT variant: a revert conflicting with a kept later change leaves a CLEAN tree + halts (no half-revert)', async () => {
     const { dir, manifest } = await setupTwoPromotedPhases();
     try {
