@@ -1628,6 +1628,21 @@ describe('lifecycle handlers in registry', () => {
       expect(handler, `${cmd} should be registered`).toBeDefined();
     }
   });
+
+  it('registers the chunk-2 inverse mutations (dot + space aliases)', async () => {
+    const { createRegistry } = await import('./index.js');
+    const registry = createRegistry();
+
+    const commands = [
+      'phase.uncomplete', 'phase uncomplete',
+      'requirements.mark-incomplete', 'requirements mark-incomplete',
+    ];
+
+    for (const cmd of commands) {
+      const handler = registry.getHandler(cmd);
+      expect(handler, `${cmd} should be registered`).toBeDefined();
+    }
+  });
 });
 
 // ─── CR-3267 regression: error-propagation in listDirectories ─────────────
