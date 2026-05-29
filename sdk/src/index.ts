@@ -249,53 +249,73 @@ export class GSD {
     // phase (the journal's skip-done logic finishes them; it never re-reverts),
     // then settle to halted. A complete/absent journal → no-op. Reconstruct
     // protectedBranch + serializer + manifest the same way maybeCascadeTier2
-    // does. Best-effort: a resume that itself errors must not abort the loop.
+    // does.
+    let haltedByResume = false;
     try {
       const resumeManifest = await readPhaseManifest(this.projectDir);
       if (Object.keys(resumeManifest).length > 0) {
         const protectedBranch = await this.resolveProtectedBranch(config);
         const serializer = new GitMergeSerializer(this.projectDir, protectedBranch, async () => 0);
-        await resumeIncompleteRollback({
+        const resume = await resumeIncompleteRollback({
           projectDir: this.projectDir,
           protectedBranch,
           serializer,
           manifest: resumeManifest,
           ...(this.workstream && { workstream: this.workstream }),
         });
+        // A Tier-2 unwind was completed on restart → the autonomous driver
+        // NEVER auto-advances after Tier-2; halt for a human (consistent with
+        // the clean maybeCascadeTier2 halt path, which makes
+        // runPhaseWithRollbackRetry return halted and breaks the loop with
+        // success=false). ROLLBACK.json records {tier:2, status:'halted'} and
+        // its manifest still lists the now-reverted predecessor's commits, so
+        // advancing would mis-re-cascade it.
+        haltedByResume = resume.resumed;
       }
     } catch {
-      /* resume is best-effort; a failure here is surfaced via ROLLBACK.json */
+      // An errored resume could not safely complete the unwind; the driver must
+      // not run new phases on a half-unwound tree — treat an errored resume as a
+      // halt too (the same conservative posture, surfaced via ROLLBACK.json).
+      // The resume only does git surgery when an incomplete journal exists, so
+      // halting on its error is the safe choice.
+      haltedByResume = true;
     }
 
-    while (currentPhases.length > 0) {
-      const phase = currentPhases[0];
+    if (haltedByResume) {
+      // Never auto-advance after a (crash-resumed) Tier-2 cascade: skip the
+      // phase loop entirely. MilestoneComplete derives success below → false.
+      success = false;
+    } else {
+      while (currentPhases.length > 0) {
+        const phase = currentPhases[0];
 
-      // Run the phase through the autonomous rollback + informed-retry driver:
-      // a GENUINE failure rolls the phase back (Tier-1) and re-runs it with the
-      // accumulated prior-failure context, up to maxPhaseAttempts, then HALTs;
-      // a transient/quota failure resumes the SAME phase via WAITING.json
-      // without consuming an attempt or rolling back; a green phase advances.
-      const outcome = await this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts);
-      phaseResults.push(outcome.result);
+        // Run the phase through the autonomous rollback + informed-retry driver:
+        // a GENUINE failure rolls the phase back (Tier-1) and re-runs it with the
+        // accumulated prior-failure context, up to maxPhaseAttempts, then HALTs;
+        // a transient/quota failure resumes the SAME phase via WAITING.json
+        // without consuming an attempt or rolling back; a green phase advances.
+        const outcome = await this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts);
+        phaseResults.push(outcome.result);
 
-      if (!outcome.result.success) {
-        // Either the phase threw / failed beyond recovery, or the driver halted
-        // after exhausting attempts. Stop the autonomous loop for a human.
-        success = false;
-        break;
-      }
-
-      // Notify callback if present; stop if requested
-      if (options?.onPhaseComplete) {
-        const verdict = await options.onPhaseComplete(outcome.result, phase);
-        if (verdict === 'stop') {
+        if (!outcome.result.success) {
+          // Either the phase threw / failed beyond recovery, or the driver halted
+          // after exhausting attempts. Stop the autonomous loop for a human.
+          success = false;
           break;
         }
-      }
 
-      // Re-discover phases to catch dynamically inserted ones
-      const updatedAnalysis = await tools.roadmapAnalyze();
-      currentPhases = this.filterAndSortPhases(updatedAnalysis.phases);
+        // Notify callback if present; stop if requested
+        if (options?.onPhaseComplete) {
+          const verdict = await options.onPhaseComplete(outcome.result, phase);
+          if (verdict === 'stop') {
+            break;
+          }
+        }
+
+        // Re-discover phases to catch dynamically inserted ones
+        const updatedAnalysis = await tools.roadmapAnalyze();
+        currentPhases = this.filterAndSortPhases(updatedAnalysis.phases);
+      }
     }
 
     const totalCostUsd = phaseResults.reduce((sum, r) => sum + r.totalCostUsd, 0);
