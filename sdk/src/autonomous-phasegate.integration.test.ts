@@ -259,6 +259,89 @@ describe('(B) promote moves protected only on green', () => {
   });
 });
 
+// ─── (D) Promote-time merge conflict must NOT report success (GROUP-G) ────────
+
+describe('(D) GROUP-G: a promote-time merge conflict fails the phase (no false success)', () => {
+  beforeEach(() => mockSession.mockReset());
+
+  it('a protected-side change colliding with the integration branch → success=false, protected unchanged, integration branch survives', async () => {
+    // Reproduces-then-kills promote-throw-reported-as-success: ctx.manager.promote()
+    // does `git merge --no-ff` with no internal try/catch; a conflict throws.
+    // Pre-fix it was caught + logged while the phase STILL reported success=true →
+    // the driver advanced with protected NEVER moved, work stranded, ROADMAP
+    // complete. Post-fix the caught promote failure fails the phase.
+    const { dir, baseSha } = await initRepo();
+    try {
+      // The executor commits a change to collide.txt on the integration worktree,
+      // AND commits a DIFFERENT change to the same file on protected (main) — so
+      // promote's `merge --no-ff integration` onto main conflicts.
+      mockSession.mockImplementation(async (_p, step, _c, opts: any, _es, ctx: any) => {
+        if (step !== PhaseStepType.Execute) return okResult();
+        const wt = opts.cwd as string;
+        await writeFile(join(wt, 'collide.txt'), 'integration-side change\n');
+        const gwt = gitIn(wt);
+        await gwt(['add', '-A']);
+        await gwt(['commit', '-q', '--no-verify', '-m', ctx.planName as string]);
+        // Concurrent conflicting change on protected (main), made via a SEPARATE
+        // linked worktree so the main repo dir's checkout (the integration branch
+        // the spine is accumulating onto) is NOT disturbed. main now diverges from
+        // the integration branch on the SAME file → promote's `merge --no-ff`
+        // conflicts.
+        const gmain = gitIn(dir);
+        const mainWt = join(tmpdir(), `gsd-pg-mainwt-${Date.now()}`);
+        await gmain(['worktree', 'add', '-q', '--force', mainWt, 'main']);
+        await writeFile(join(mainWt, 'collide.txt'), 'protected-side conflicting change\n');
+        const gmwt = gitIn(mainWt);
+        await gmwt(['add', '-A']);
+        await gmwt(['commit', '-q', '--no-verify', '-m', 'protected conflicting edit']);
+        await gmain(['worktree', 'remove', '--force', mainWt]).catch(() => {});
+        return okResult();
+      });
+      // Gate green so the phase reaches the promote step.
+      const config = makeConfig({ git: { ...CONFIG_DEFAULTS.git, sdk_test_command: 'node -e process.exit(0)' } } as Partial<GSDConfig>);
+      const factory = await buildGitExecutionEngineFactory(config, dir);
+
+      const protectedBeforePromote = async () => (await gitIn(dir)(['rev-parse', 'main'])).stdout.trim();
+
+      const { deps } = makeDeps([planInfo({ id: 'A' })], { projectDir: dir, config, executionEngineFactory: factory });
+      const result = await new PhaseRunner(deps).run('1');
+
+      // THE property: the promote failed → the phase is NOT success.
+      expect(result.success).toBe(false);
+      // A failed promote step is recorded with a promote-on-green error.
+      const promoteFail = result.steps.find(s => !s.success && (s.error ?? '').includes('promote-on-green failed'));
+      expect(promoteFail, 'a promote-on-green failure step must be recorded').toBeDefined();
+      // rollbackContext captured so the driver can run Tier-1 / surface the failure.
+      expect(result.rollbackContext).toBeDefined();
+      expect(result.rollbackContext!.integrationBranch).toBe('gsd-phase-1-int');
+
+      // Protected is the (conflicting) protected-side commit — the integration
+      // work did NOT land on it (no merge commit, no plan marker 'A').
+      const mainSubjects = await logSubjects(dir, 'main');
+      expect(mainSubjects).not.toContain('A');
+      expect(mainSubjects[0]).toBe('protected conflicting edit');
+      // No phantom merge of the integration branch.
+      expect(mainSubjects).not.toContain("Merge branch 'gsd-phase-1-int'");
+
+      // The integration branch SURVIVES for recovery (its work is recoverable).
+      expect(await refExists(dir, 'gsd-phase-1-int')).toBe(true);
+      const intSubjects = await logSubjects(dir, 'gsd-phase-1-int');
+      expect(intSubjects).toContain('A');
+
+      // No done tag / manifest entry for an un-promoted phase.
+      expect(await refExists(dir, 'gsd/phase-1-done')).toBe(false);
+      const manifest = await readPhaseManifest(dir);
+      expect(manifest['1']).toBeUndefined();
+
+      // Anchor baseSha + helper to the repo (the phase never reached LAST_GOOD promote).
+      expect(baseSha.length).toBeGreaterThan(0);
+      expect((await protectedBeforePromote()).length).toBeGreaterThan(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── (C) Gate-off parity (PR #8 behaviour preserved) ─────────────────────────
 
 describe('(C) gate-off parity — no integration branch / tags / checkpoint dir', () => {

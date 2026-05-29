@@ -485,15 +485,56 @@ export class PhaseRunner {
     let rollbackContext: PhaseRollbackContext | undefined;
     if (this.phaseIntegration?.phaseNumber === phaseNumber) {
       if (phaseGreen) {
+        // Snapshot the context + LAST_GOOD before promote so a failed promote can
+        // capture rollback context and assert protected actually moved.
+        const ctx = this.phaseIntegration;
+        let promoteFailed = false;
+        let promoteFailDetail = '';
         try {
           await this.promotePhaseOnGreen(phaseNumber);
+          // GROUP-G fix: ctx.manager.promote() does `git merge --no-ff` with no
+          // internal try/catch — a merge conflict throws and used to be caught +
+          // logged while the phase STILL reported success=true, advancing the
+          // driver with protected NEVER moved and work stranded on the integration
+          // branch. After a "successful" promote, ASSERT protected actually moved
+          // off LAST_GOOD; if it did not, the promote silently no-op'd and the
+          // phase is NOT green.
+          const protectedSha = (
+            await execFileAsync('git', ['rev-parse', ctx.protectedBranch], { cwd: this.projectDir })
+          ).stdout.trim();
+          if (protectedSha === ctx.lastGoodSha) {
+            promoteFailed = true;
+            promoteFailDetail = `promote did not move protected ${ctx.protectedBranch} off LAST_GOOD ${ctx.lastGoodSha}`;
+          }
         } catch (err) {
-          // A promote failure must NOT corrupt the lifecycle result; protected is
-          // either fully promoted or untouched (atomic merge). Log and leave the
-          // integration branch in place for chunk 2's recovery.
+          // A promote failure (e.g. a `merge --no-ff` conflict) must NOT be
+          // reported as a green phase. Protected is left at LAST_GOOD (atomic
+          // merge — either fully promoted or untouched).
+          promoteFailed = true;
+          promoteFailDetail = err instanceof Error ? err.message : String(err);
+        }
+        if (promoteFailed) {
           this.logger?.warn(
-            `Phase ${phaseNumber} promote-on-green failed (protected left untouched): ${err instanceof Error ? err.message : String(err)}`,
+            `Phase ${phaseNumber} promote-on-green failed (protected left at LAST_GOOD): ${promoteFailDetail}`,
           );
+          // Fail the phase: add a failed step so success=false (the driver does
+          // not advance). Capture rollback context (the driver runs Tier-1 to
+          // tear down the integration branch + restore docs) and KEEP
+          // this.phaseIntegration so the integration branch survives for recovery
+          // until the driver acts.
+          steps.push({
+            step: PhaseStepType.Execute,
+            success: false,
+            durationMs: 0,
+            error: `promote-on-green failed: ${promoteFailDetail}`,
+          });
+          rollbackContext = {
+            phaseNumber: ctx.phaseNumber,
+            protectedBranch: ctx.protectedBranch,
+            lastGoodSha: ctx.lastGoodSha,
+            snapshotDir: checkpointDirFor(this.projectDir, phaseNumber),
+            integrationBranch: ctx.integrationBranch,
+          };
         }
       } else {
         // Not green: protected stays at LAST_GOOD. Capture the checkpoint
@@ -513,12 +554,19 @@ export class PhaseRunner {
     }
 
     // ── Step 6: Advance ──
-    // Only advance if verify passed — never mark a phase complete when gaps were found.
-    if (!halted && verifyPassed) {
+    // Only advance if verify passed — never mark a phase complete when gaps were
+    // found. Also skip when a rollbackContext was captured (the phase settled
+    // non-green OR a promote-on-green failure left protected at LAST_GOOD,
+    // GROUP-G fix): advancing would mark the ROADMAP complete for work that never
+    // reached protected. (rollbackContext is only set under the isolated engine;
+    // the no-op shared-cwd path leaves it undefined and advances as before.)
+    if (!halted && verifyPassed && !rollbackContext) {
       const advanceResult = await this.runAdvanceStep(phaseNumber, sessionOpts, callbacks);
       steps.push(advanceResult);
     } else if (!halted && !verifyPassed) {
       this.logger?.warn(`Skipping advance for phase ${phaseNumber}: verification found gaps`);
+    } else if (!halted && rollbackContext) {
+      this.logger?.warn(`Skipping advance for phase ${phaseNumber}: promote-on-green failed (protected at LAST_GOOD)`);
     }
 
     const totalDurationMs = Date.now() - startTime;
@@ -1322,23 +1370,51 @@ export class PhaseRunner {
       dependsOn = [];
     }
 
-    await recordPhasePromotion({
-      projectDir: this.projectDir,
-      phaseNumber,
-      baseTag: ctx.baseTag,
-      baseSha: ctx.lastGoodSha,
-      headSha,
-      // Orchestrator stamps the clock (the manifest writer has none).
-      promotedAt: new Date().toISOString(),
-      dependsOn,
-    });
+    // GROUP-H fix: the merge has ALREADY moved protected. The manifest entry is
+    // the cascade's SOURCE OF TRUTH — a Tier-2 cascade can never attribute to a
+    // phase absent from the manifest. So the manifest write is LOAD-BEARING: if
+    // it throws (now that protected has advanced), the phase is on protected but
+    // unattributable, which is a recovery-needed inconsistency — THROW so the
+    // caller (run() Step 5.5) does NOT report a clean success (GROUP-G catch then
+    // fails the phase / captures rollback context). The tag is a SEPARATE,
+    // best-effort concern: a tag-write failure must not lose the manifest entry.
+    try {
+      await recordPhasePromotion({
+        projectDir: this.projectDir,
+        phaseNumber,
+        baseTag: ctx.baseTag,
+        baseSha: ctx.lastGoodSha,
+        headSha,
+        // Orchestrator stamps the clock (the manifest writer has none).
+        promotedAt: new Date().toISOString(),
+        dependsOn,
+      });
+    } catch (err) {
+      throw new PhaseRunnerError(
+        `Phase ${phaseNumber} promoted onto ${ctx.protectedBranch} (@ ${headSha}) but the manifest write FAILED — ` +
+          `the phase is on protected yet unattributable to a Tier-2 cascade. Recovery required: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        phaseNumber,
+        PhaseStepType.Advance,
+        err instanceof Error ? err : undefined,
+      );
+    }
 
     // Tag the promoted protected HEAD. Force so a re-promote (resume) re-pins.
-    await execFileAsync(
-      'git',
-      ['tag', '-f', '-a', doneTagFor(phaseNumber), '-m', `gsd phase ${phaseNumber} promoted @ ${headSha}`, headSha],
-      { cwd: this.projectDir },
-    );
+    // Best-effort + separate from the manifest: the manifest entry (above) is the
+    // cascade's source of truth; a tag-write failure must not orphan it or fail
+    // the phase. Log and continue.
+    try {
+      await execFileAsync(
+        'git',
+        ['tag', '-f', '-a', doneTagFor(phaseNumber), '-m', `gsd phase ${phaseNumber} promoted @ ${headSha}`, headSha],
+        { cwd: this.projectDir },
+      );
+    } catch (err) {
+      this.logger?.warn(
+        `Phase ${phaseNumber} done-tag write failed (manifest entry recorded; promotion stands): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
 
     this.phaseIntegration = null;
   }
