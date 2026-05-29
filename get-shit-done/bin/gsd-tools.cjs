@@ -35,6 +35,7 @@
  *   summary-extract <path> [--fields]  Extract structured data from SUMMARY.md
  *   state-snapshot                     Structured parse of STATE.md
  *   phase-plan-index <phase>           Index plans with waves and status
+ *   dag-runspec <phase>                Per-plan depends_on DAG run-spec (execution engines)
  *   websearch <query>                  Search web via Brave API (if configured)
  *     [--limit N] [--freshness day|week|month]
  *
@@ -444,7 +445,7 @@ async function main() {
   const TOP_LEVEL_USAGE = 'Usage: gsd-tools <command> [args] [--raw] [--pick <field>] [--cwd <path>] [--ws <name>] [--json-errors]\n' +
     'Commands: agent-skills, audit-open, audit-uat, check-commit, commit, commit-to-subrepo, ' +
     'config-ensure-section, config-get, config-new-project, config-path, config-set, migrate-config, ' +
-    'current-timestamp, detect-custom-files, docs-init, extract-messages, find-phase, ' +
+    'current-timestamp, dag-runspec, detect-custom-files, docs-init, extract-messages, find-phase, ' +
     'from-gsd2, frontmatter, gap-analysis, generate-claude-md, generate-claude-profile, ' +
     'generate-dev-preferences, generate-slug, graphify, history-digest, init, intel, ' +
     'learnings, list-todos, milestone, phase, phase-plan-index, phases, profile-questionnaire, ' +
@@ -1060,6 +1061,11 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
 
     case 'phase-plan-index': {
       phase.cmdPhasePlanIndex(cwd, args[1], raw);
+      break;
+    }
+
+    case 'dag-runspec': {
+      phase.cmdDagRunspec(cwd, args[1], raw);
       break;
     }
 
