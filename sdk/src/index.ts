@@ -32,8 +32,11 @@ import { runPlanSession } from './session-runner.js';
 import { buildExecutorPrompt, parseAgentTools } from './prompt-builder.js';
 import { GSDEventStream } from './event-stream.js';
 import { PhaseRunner } from './phase-runner.js';
+import type { ExecutionEngineFactory } from './phase-runner.js';
 import { ContextEngine } from './context-engine.js';
 import { PromptFactory } from './phase-prompt.js';
+import { detectRuntime } from './query/helpers.js';
+import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
 
 export { PlanningJournal } from './planning-journal.js';
 export type { PlanningEvent, PlanningEventActor, PlanningJournalAppendInput } from './planning-journal.js';
@@ -167,6 +170,19 @@ export class GSD {
       config.workflow.skip_discuss = false;
     }
 
+    // ADR 0013 option 3: opt-in, Claude-runtime-only git-backed execution engine.
+    // Off/absent (or non-Claude runtime, inv-12) → no factory key → the runner
+    // takes the unchanged shared-cwd no-op path. Building the factory runs the
+    // FAIL-CLOSED worktree-capability probe and resolves the real build+test gate
+    // BEFORE any plan dispatch; a probe failure throws here and aborts the phase.
+    const useEngine =
+      config.git?.sdk_worktree_execution === true &&
+      detectRuntime({ runtime: config.runtime }) === 'claude';
+    let executionEngineFactory: ExecutionEngineFactory | undefined;
+    if (useEngine) {
+      executionEngineFactory = await buildGitExecutionEngineFactory(config, this.projectDir);
+    }
+
     const runner = new PhaseRunner({
       projectDir: this.projectDir,
       tools,
@@ -174,6 +190,7 @@ export class GSD {
       contextEngine,
       eventStream: this.eventStream,
       config,
+      ...(executionEngineFactory && { executionEngineFactory }),
     });
 
     return runner.run(phaseNumber, options);
