@@ -245,6 +245,65 @@ describe('Autonomous crash-resume HALT — never auto-advance after a resumed Ti
     }
   });
 
+  it('E-2: a CLEAN Tier-2 halted ledger (status:halted, tier:2, NO steps journal) → GSD.run HALTS without running any phase', async () => {
+    // Reproduces-then-kills E-2 (settled-Tier-2-halt auto-advanced): a CLEAN
+    // Tier-2 cascade settles ROLLBACK.json to {status:'halted', tier:2,
+    // cascade_set} with NO `steps` journal (nothing to crash-resume).
+    // resumeIncompleteRollback only acts on an INCOMPLETE steps journal, so on a
+    // fresh GSD.run that ledger yielded halt:false and the phase loop AUTO-
+    // ADVANCED past the Tier-2 halt — violating "never auto-advance after Tier-2".
+    // Post-fix the settled-halt gate HALTs regardless of the steps journal.
+    const { dir } = await setupTwoPromotedPhases();
+    try {
+      // A clean Tier-2 halted ledger with NO steps journal.
+      await writeFile(
+        join(dir, '.planning', 'ROLLBACK.json'),
+        JSON.stringify({ failed_phase: '3', attempt_count: 1, failure_context: [], status: 'halted', tier: 2, cascade_set: ['2'] }),
+      );
+
+      const gsd = new GSD({ projectDir: dir });
+      vi.spyOn(gsd, 'createTools').mockReturnValue({
+        roadmapAnalyze: vi.fn().mockResolvedValue(phase3Info()),
+      } as never);
+      const runPhaseSpy = vi.spyOn(gsd, 'runPhase').mockImplementation((async () => {
+        throw new Error('runPhase must NOT be invoked when a Tier-2 halt is settled');
+      }) as never);
+
+      const result = await gsd.run('ship it');
+
+      expect(result.success).toBe(false);
+      expect(runPhaseSpy).not.toHaveBeenCalled();
+      expect(result.phases).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('E-2: an ABSENT ROLLBACK.json → GSD.run proceeds normally (the phase executor runs)', async () => {
+    // The other side of the E-2 gate: an absent ledger is NOT a halt — the driver
+    // must proceed and run the phase loop (this is the common no-rollback path).
+    const { dir } = await setupTwoPromotedPhases();
+    try {
+      // No ROLLBACK.json written (absent).
+      const gsd = new GSD({ projectDir: dir });
+      vi.spyOn(gsd, 'createTools').mockReturnValue({
+        // Return empty after the first call so the loop terminates quickly.
+        roadmapAnalyze: vi.fn().mockResolvedValueOnce(phase3Info()).mockResolvedValue({ phases: [] }),
+      } as never);
+      const runPhaseSpy = vi.spyOn(gsd, 'runPhase').mockImplementation((async () => ({
+        phaseNumber: '3', phaseName: 'Ship', steps: [], success: true, totalCostUsd: 0, totalDurationMs: 1,
+      })) as never);
+
+      const result = await gsd.run('ship it');
+
+      // Proceeded: the phase executor WAS invoked (the absent ledger is no halt).
+      expect(runPhaseSpy).toHaveBeenCalled();
+      expect(result.success).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('GROUP-E: a present-but-CORRUPT ROLLBACK.json → GSD.run HALTS without running any phase (distinct from absent)', async () => {
     // Reproduces-then-kills corrupt-ledger-silent-noop-resume: a truncated
     // ROLLBACK.json (a crash mid non-atomic write) used to read as null → resume

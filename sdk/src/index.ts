@@ -258,8 +258,27 @@ export class GSD {
       // resume-replay below only runs with a manifest, but the corruption HALT
       // is independent of it). readRollbackLedger throws on corrupt, returns null
       // on absent. An absent/valid ledger proceeds.
-      await readRollbackLedger(this.projectDir);
+      const existingLedger = await readRollbackLedger(this.projectDir);
 
+      // E-2 fix: a CLEAN Tier-2 cascade settles ROLLBACK.json to
+      // `{status:'halted', tier:2, cascade_set:[...]}` with NO `steps` journal
+      // (the cascade completed in one pass, nothing to crash-resume).
+      // resumeIncompleteRollback only acts on an INCOMPLETE steps journal, so on a
+      // fresh GSD.run that ledger yields halt:false and the phase loop would
+      // AUTO-ADVANCE past a Tier-2 halt — violating "never auto-advance after
+      // Tier-2". Gate on the SETTLED HALT directly: a present ledger whose
+      // status is 'halted' (or tier===2) HALTS regardless of the steps journal.
+      // An ABSENT ledger (null) proceeds; a 'retrying' ledger is NOT a halt (the
+      // crash-resume replay / informed-retry path below handles it).
+      if (existingLedger && (existingLedger.status === 'halted' || existingLedger.tier === 2)) {
+        haltedByResume = true;
+      }
+
+      // Still run the crash-resume replay when a manifest exists: an INCOMPLETE
+      // steps journal (a crash mid-cascade) must be finished idempotently even if
+      // the settled-halt gate above already fired (a 'halted' ledger could in
+      // principle co-exist with an unfinished journal). The replay's skip-done
+      // logic only finishes remaining steps; a complete/absent journal → no-op.
       const resumeManifest = await readPhaseManifest(this.projectDir);
       if (Object.keys(resumeManifest).length > 0) {
         const protectedBranch = await this.resolveProtectedBranch(config);
@@ -277,8 +296,9 @@ export class GSD {
         // because ROLLBACK.json is PRESENT-but-CORRUPT (GROUP-E fix: a truncated
         // ledger means a possibly half-unwound tree — advancing would corrupt
         // protected; a corrupt ledger is no longer silently read as absent and
-        // skipped). An ABSENT ledger leaves `halt` false → normal run.
-        haltedByResume = resume.halt;
+        // skipped). An ABSENT ledger leaves `halt` false → normal run. OR with the
+        // E-2 settled-halt gate above (a clean no-journal Tier-2 halt).
+        haltedByResume = haltedByResume || resume.halt;
       }
     } catch {
       // An errored resume could not safely complete the unwind; the driver must
