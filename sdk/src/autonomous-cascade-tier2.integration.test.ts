@@ -13,6 +13,9 @@
  *   (c) no-cascade-confident: NO promoted predecessor in the failing phase's
  *       depends_on closure → fall through to chunk-2's informed retry (Tier-1
  *       only), NO Tier-2 ledger tier.
+ *   (d) no-cascade-confident under a sequential Depends on: Phase 2 when the
+ *       break is in phase 3's OWN file phase 2 never touched → informed retry
+ *       (Tier-1 only), NO Tier-2 ledger (R1 headline behavior).
  */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
@@ -305,6 +308,65 @@ describe('Tier-2 loop wiring — (c) no-cascade-confident falls through to infor
       expect(subjects).not.toContain('revert(phase-2): autonomous unwind');
 
       // ROLLBACK.json halted at the cap, but Tier-1 (not Tier-2): no tier:2.
+      const ledger = JSON.parse(await readFile(join(dir, '.planning', 'ROLLBACK.json'), 'utf-8'));
+      expect(ledger.status).toBe('halted');
+      expect(ledger.tier).toBeUndefined();
+      expect(ledger.attempt_count).toBe(5);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Tier-2 loop wiring — (d) own-file failure under Depends on: Phase 2 keeps informed-retry', () => {
+  it('phase 3 depends_on 2 but breaks in its OWN new file phase 2 never touched → Tier-1 + informed retry, NO tier:2 ledger', async () => {
+    // R1 headline behavior restored: phase 3 KEEPS the sequential `Depends on:
+    // Phase 2` shape (a promoted candidate exists in the closure), but the break
+    // is in phase 3's OWN brand-new file phase 2 never touched. Within the
+    // file-overlap heuristic this is a confident no-cascade, so the driver takes
+    // the user's CHOSEN DEFAULT: informed-retry (auto-rollback + retry to the
+    // cap, then HALT), Tier-1 only — NOT a Tier-2 cascade ledger. (A prior round
+    // flipped this to a cannot-classify HALT on attempt 1, defeating the retry.)
+    const { dir, lastGoodSha, rollbackContext } = await setupRepoWithPromotedPredecessors();
+    try {
+      // ROADMAP left UNCHANGED: phase 3 Depends on: Phase 2 (the sequential shape).
+      const gsd = new GSD({ projectDir: dir });
+      vi.spyOn(gsd, 'createTools').mockReturnValue({
+        roadmapAnalyze: vi.fn().mockResolvedValue(phase3Info()),
+      } as never);
+
+      const seenPrior: Array<PhaseRunnerOptions['priorFailureContext']> = [];
+      let attemptNo = 0;
+      vi.spyOn(gsd, 'runPhase').mockImplementation((async (_n: string, opts?: PhaseRunnerOptions) => {
+        attemptNo += 1;
+        seenPrior.push(opts?.priorFailureContext);
+        // Re-stage phase 3's integration branch (the prior attempt's Tier-1 tore
+        // it down; the real runPhase would re-create it).
+        const git = gitIn(dir);
+        await createPhaseCheckpoint({ projectDir: dir, phaseNumber: '3', protectedBranch: 'main' });
+        await git(['checkout', '-q', '-B', integrationBranchFor('3'), lastGoodSha]);
+        await writeFile(join(dir, 'phase3.ts'), `try ${attemptNo}\n`);
+        await git(['add', '-A']); await git(['commit', '-q', '--no-verify', '-m', `phase 3 work ${attemptNo}`]);
+        await git(['checkout', '-q', 'main']);
+        // Break is in phase 3's OWN new file phase 2 never touched. A promoted
+        // predecessor (phase 2) IS a candidate, but it is not file-attributable
+        // → no-cascade-confident → informed retry.
+        return failResult(rollbackContext, 'gate failed: error in phase3-new-module.ts', 'gate');
+      }) as never);
+
+      const result = await gsd.run('ship it');
+      expect(result.success).toBe(false);
+
+      // Fell through to informed retry: 5 attempts, prior context injected.
+      expect(attemptNo).toBe(5);
+      expect(seenPrior[0]).toBeUndefined();
+      expect(seenPrior[4]).toBeTruthy();
+
+      // NO cascade revert; phase 2 untouched on protected.
+      const subjects = await logSubjects(dir, 'main');
+      expect(subjects).not.toContain('revert(phase-2): autonomous unwind');
+
+      // ROLLBACK.json halted at the cap, but Tier-1 (not Tier-2): NO tier:2.
       const ledger = JSON.parse(await readFile(join(dir, '.planning', 'ROLLBACK.json'), 'utf-8'));
       expect(ledger.status).toBe('halted');
       expect(ledger.tier).toBeUndefined();

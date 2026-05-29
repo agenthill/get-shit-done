@@ -132,13 +132,16 @@ async function commitTouchedPaths(projectDir: string, commit: string): Promise<s
  *   5. For each linked promoted predecessor, match the failure's implicated
  *      files against the UNION of that predecessor's commits' touched paths
  *      (diff-tree) robustly — exact repo-relative equality, an absolute
- *      implicated path relativized against projectDir, or basename/suffix match
- *      (GROUP-D #2983 fix: real failure details carry absolute stack-trace paths
- *      and bare basenames that never EXACTLY equal a repo-relative path). A git
- *      failure diffing any candidate's commit → cannot-classify. A CERTAIN empty
- *      implicated set → no-cascade. A present-but-UNMATCHABLE implicated set
- *      while a candidate exists → cannot-classify (an inability to attribute is
- *      not a confident negative — the #2983 rule).
+ *      implicated path relativized against projectDir, or a directory-anchored
+ *      suffix match (GROUP-D #2983 fix: real failure details carry absolute
+ *      stack-trace paths and `dir/file` tokens that never EXACTLY equal a
+ *      repo-relative path). A bare basename with NO directory component is
+ *      genuinely ambiguous (recurs across packages) and is NOT attributed (R2).
+ *      A git failure diffing any candidate's commit → cannot-classify. A CERTAIN
+ *      empty implicated set → no-cascade. Implicated files present but matching
+ *      NO candidate under the matcher → no-cascade-confident (a confident
+ *      negative within the heuristic's scope; phase N then takes its CHOSEN
+ *      DEFAULT informed-retry — R1).
  *   6. SINGLE-PREDECESSOR CAP (ADR 0013 option 4, chunk 4): exactly ONE
  *      attributable predecessor → revert-confident (cascade set of one, reverse
  *      promotion order). TWO OR MORE attributable predecessors → cannot-classify
@@ -258,9 +261,10 @@ export async function classifyCascade(
   // Normalize implicated tokens to forward slashes. Real failure details carry
   // paths in shapes that never EXACTLY equal a predecessor's repo-relative
   // diff-tree path (GROUP-D #2983 footgun): absolute stack-trace paths
-  // ("/home/u/proj/lib/a.js"), bare basenames ("foo.ts"), and `./`-prefixed
-  // tokens. Matching must be robust to all of them, or an attributable cascade
-  // is silently downgraded to no-cascade.
+  // ("/home/u/proj/lib/a.js") and `./`-prefixed or `dir/file` tokens. The
+  // matcher below handles those robustly; a BARE basename with no directory is
+  // deliberately NOT attributed (R2 — it recurs across packages, false-positive
+  // risk outweighs the catch).
   const implicated = implicatedFiles.map(f => f.replace(/\\/g, '/').replace(/^\.\//, ''));
   // No implicated files at all → nothing to attribute → no-cascade (NOT
   // cannot-classify: an EMPTY implicated set is a confident negative, the way
@@ -278,10 +282,18 @@ export async function classifyCascade(
   /**
    * True when an implicated token matches a predecessor's repo-relative touched
    * path by ANY of: (a) exact equality; (b) the implicated token relativized
-   * against projectDir equals the touched path; (c) basename/suffix match — the
-   * touched path ends with `/<implicated>` or their basenames are equal. (a)/(b)
-   * are exact; (c) is a deliberate widening so a bare basename or absolute path
-   * still attributes. */
+   * against projectDir equals the touched path; (c) a DIRECTORY-ANCHORED suffix
+   * — the touched path ends with `/<implicated>` (so `auth/index.ts` matches
+   * `src/auth/index.ts`, and an absolute path's tail matches). (a)/(b) are
+   * exact; (c) attributes a path-shaped token regardless of leading directories.
+   *
+   * R2: a BARE basename with no directory component (`index.ts`, `utils.ts`,
+   * `mod.rs`, `__init__.py`) is DELIBERATELY NOT matched — those recur across
+   * packages, and extractImplicatedFiles emits them, so a bare-basename rule
+   * would false-attribute a failure in phase N's own `src/billing/index.ts` to a
+   * predecessor's `src/auth/index.ts` → an unneeded revert + HALT of an innocent
+   * predecessor (REG-3). A bare basename is genuinely ambiguous → it falls to
+   * no-cascade → the failing phase's informed-retry, the safe direction. */
   const matches = (impl: string, touched: string): boolean => {
     if (impl === touched) return true;
     // (b) Relativize an absolute implicated path against projectDir.
@@ -289,11 +301,14 @@ export async function classifyCascade(
       const rel = impl.slice(projectDirNorm.length + 1);
       if (rel === touched) return true;
     }
-    // (c) basename / suffix match.
-    if (touched.endsWith(`/${impl}`)) return true;
-    const implBase = impl.slice(impl.lastIndexOf('/') + 1);
-    const touchedBase = touched.slice(touched.lastIndexOf('/') + 1);
-    if (implBase.length > 0 && implBase === touchedBase) return true;
+    // (c) Directory-anchored suffix: `dir/file` (or an absolute path's tail)
+    // ending the touched path. GUARDED on impl containing a `/`: a bare basename
+    // (no directory component) is intentionally NOT matched here, because
+    // `'src/auth/index.ts'.endsWith('/index.ts')` would attribute any package's
+    // index.ts to any predecessor that owns a same-named file — the REG-3
+    // false-attribution. Requiring a directory component anchors the suffix to a
+    // real path tail.
+    if (impl.includes('/') && touched.endsWith(`/${impl}`)) return true;
     return false;
   };
 
@@ -330,20 +345,29 @@ export async function classifyCascade(
   }
 
   if (attributable.length === 0) {
-    // GROUP-D #2983 footgun: implicated files ARE present (past the empty-set
-    // check above) and a depends_on-linked promoted CANDIDATE exists, yet NONE
-    // of the implicated tokens matched ANY predecessor's touched paths by ANY
-    // rule (exact / relativized-absolute / basename-suffix). That is an
-    // INABILITY to attribute — a present-but-unmatchable set while a candidate
-    // exists — NOT a confident no-cascade. Fail closed to cannot-classify rather
-    // than silently skip a cascade the failure might genuinely require. (The
-    // confident no-cascade verdicts live upstream: NO candidate at all (step 3),
-    // or a CERTAIN-empty implicated set (step 5 top).)
+    // Implicated files ARE present (past the empty-set check above) and a
+    // depends_on-linked promoted candidate exists, yet none of the implicated
+    // tokens overlaps any predecessor's touched paths under the robust matcher
+    // (exact / relativized-absolute / directory-anchored-suffix). Within the
+    // file-overlap heuristic's DECLARED scope, "implicated files present but
+    // none overlaps any candidate" is a CONFIDENT negative, not an inability:
+    // the matcher (R2) attributes any genuinely-shared file robustly, so a
+    // clean miss means the predecessor's files are not implicated. Semantic
+    // breaks (a predecessor's API change that breaks a non-shared file) are a
+    // documented, accepted residual of a file-overlap heuristic — they are not
+    // detectable here regardless. Returning no-cascade-confident routes phase N
+    // to the user's CHOSEN DEFAULT: informed-retry (auto-rollback + retry up to
+    // 5, then HALT) — equally safe and preserves the feature. (R1 reverts a
+    // prior over-correction to cannot-classify that HALTed every sequential
+    // `Depends on: Phase N-1` phase on attempt 1, defeating informed-retry.)
+    //
+    // The GENUINE cannot-classify cases stay upstream: implicatedFilesUncertain
+    // (step 4), corrupt/duplicate manifest, cyclic graph, and an undiffable
+    // predecessor commit (the catch in the attribution loop).
     return {
-      verdict: 'cannot-classify',
+      verdict: 'no-cascade-confident',
       cascadeSet: [],
-      reason:
-        'implicated files are present and a depends_on-linked promoted predecessor exists, but no implicated path matched any predecessor\'s touched paths — cannot attribute, refusing to guess',
+      reason: 'depends_on-linked predecessor(s) exist but none is file-attributable to the failure',
     };
   }
 

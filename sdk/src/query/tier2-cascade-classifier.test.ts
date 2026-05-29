@@ -129,11 +129,15 @@ describe('classifyCascade — ATTRIBUTABLE-ONLY else HALT', () => {
     }
   });
 
-  it('cannot-classify (GROUP-D): implicated files PRESENT but unmatchable to ANY predecessor while a candidate exists → HALT, never silent no-cascade', async () => {
-    // Phase 3 depends_on 2 (a promoted candidate). The implicated file is a
-    // brand-new file phase 2 never touched — an inability to attribute, not a
-    // confident negative. Pre-GROUP-D this silently downgraded to no-cascade
-    // (the #2983 footgun: a genuine cascade skipped). Post-fix it HALTs.
+  it('no-cascade-confident: phase 3 depends_on 2, break in brand-new phase3-new.ts phase 2 never touched', async () => {
+    // Phase 3 depends_on 2 (a promoted candidate), but the break is in phase 3's
+    // OWN brand-new file phase 2 never touched. Within the file-overlap
+    // heuristic's declared scope this is a CONFIDENT negative (no predecessor
+    // file is implicated), so the verdict is no-cascade-confident: phase N takes
+    // its CHOSEN DEFAULT informed-retry (auto-rollback + retry to 5, then HALT),
+    // not a guessed cascade. R1: a prior round flipped this to cannot-classify,
+    // which HALTed every sequential `Depends on: Phase N-1` phase on attempt 1
+    // and defeated informed-retry. Semantic breaks are a documented residual.
     const { dir, manifest } = await repoWithPhases([
       { phase: '1', files: ['a.ts'], dependsOn: [] },
       { phase: '2', files: ['b.ts'], dependsOn: ['1'] },
@@ -146,24 +150,23 @@ describe('classifyCascade — ATTRIBUTABLE-ONLY else HALT', () => {
         // Break is in a brand-new file phase 2 never touched.
         implicatedFiles: ['phase3-new.ts'],
       });
-      expect(res.verdict).toBe('cannot-classify');
+      expect(res.verdict).toBe('no-cascade-confident');
       expect(res.cascadeSet).toEqual([]);
-      expect(res.reason).toMatch(/no implicated path matched/i);
+      expect(res.reason).toMatch(/none is file-attributable/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  it('GROUP-D: implicated files given as ABSOLUTE paths and BARE basenames of a predecessor\'s file → revert-confident (robust match)', async () => {
-    // Reproduces-then-kills implicated-files-format-mismatch-silent-no-cascade:
-    // real failure details carry absolute stack-trace paths and bare basenames
-    // that never EXACTLY equal a repo-relative diff-tree path. Pre-fix these
-    // produced zero attribution → no-cascade-confident, silently skipping a
-    // needed cascade. Post-fix the matcher relativizes absolutes + matches
-    // basenames → revert-confident.
+  it('GROUP-D matcher: ABSOLUTE path and DIRECTORY-ANCHORED suffix of a predecessor\'s file → revert-confident (robust match)', async () => {
+    // Real failure details carry absolute stack-trace paths and `dir/file`
+    // tokens that never EXACTLY equal a repo-relative diff-tree path. Without
+    // the robust matcher these produce zero attribution → no-cascade-confident,
+    // silently skipping a needed cascade. The matcher relativizes absolutes +
+    // anchors `dir/file` suffixes → revert-confident.
     const { dir, manifest } = await repoWithPhases([
       { phase: '1', files: ['lib/a.ts'], dependsOn: [] },
-      { phase: '2', files: ['src/feature.ts'], dependsOn: ['1'] },
+      { phase: '2', files: ['src/auth/feature.ts'], dependsOn: ['1'] },
     ]);
     try {
       // Absolute path form (a stack-trace line) for the phase-2 file.
@@ -171,20 +174,69 @@ describe('classifyCascade — ATTRIBUTABLE-ONLY else HALT', () => {
         projectDir: dir,
         failingPhase: '3',
         manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry },
-        implicatedFiles: [`${dir}/src/feature.ts`],
+        implicatedFiles: [`${dir}/src/auth/feature.ts`],
       });
       expect(absRes.verdict).toBe('revert-confident');
       expect(absRes.cascadeSet).toEqual(['2']);
 
-      // Bare-basename form ("feature.ts" with no directory).
-      const baseRes = await classifyCascade({
+      // Directory-anchored suffix form ("auth/feature.ts" — has a `/`).
+      const sufRes = await classifyCascade({
         projectDir: dir,
         failingPhase: '3',
         manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry },
-        implicatedFiles: ['feature.ts'],
+        implicatedFiles: ['auth/feature.ts'],
       });
-      expect(baseRes.verdict).toBe('revert-confident');
-      expect(baseRes.cascadeSet).toEqual(['2']);
+      expect(sufRes.verdict).toBe('revert-confident');
+      expect(sufRes.cascadeSet).toEqual(['2']);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('R2: a BARE basename (index.ts) is NOT false-attributed to a predecessor owning a same-named file in another dir', async () => {
+    // Reproduces-then-kills REG-3 (bare-basename false attribution): a prior
+    // round added a `implBase === touchedBase` matcher sub-rule. Bare basenames
+    // (index.ts, utils.ts, mod.rs) recur across packages, and
+    // extractImplicatedFiles emits them — so a failure in phase 3's OWN
+    // src/billing/index.ts would basename-match a promoted predecessor's
+    // src/auth/index.ts → a FALSE revert-confident + an unneeded revert/HALT of
+    // an innocent predecessor. R2 drops the bare-basename rule: a basename with
+    // no directory is ambiguous → no-cascade → the failing phase's informed
+    // retry (the safe direction). A DIRECTORY-anchored form still attributes.
+    const { dir, manifest } = await repoWithPhases([
+      { phase: '1', files: ['lib/a.ts'], dependsOn: [] },
+      { phase: '2', files: ['src/auth/index.ts'], dependsOn: ['1'] },
+    ]);
+    try {
+      // Bare basename of phase 3's OWN file — must NOT attribute to phase 2.
+      const bareRes = await classifyCascade({
+        projectDir: dir,
+        failingPhase: '3',
+        manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry },
+        implicatedFiles: ['index.ts'],
+      });
+      expect(bareRes.verdict).toBe('no-cascade-confident');
+      expect(bareRes.cascadeSet).toEqual([]);
+
+      // The directory-anchored suffix of the SAME predecessor file DOES attribute.
+      const anchoredRes = await classifyCascade({
+        projectDir: dir,
+        failingPhase: '3',
+        manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry },
+        implicatedFiles: ['auth/index.ts'],
+      });
+      expect(anchoredRes.verdict).toBe('revert-confident');
+      expect(anchoredRes.cascadeSet).toEqual(['2']);
+
+      // The full repo-relative / absolute path also attributes.
+      const absRes = await classifyCascade({
+        projectDir: dir,
+        failingPhase: '3',
+        manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry },
+        implicatedFiles: [`${dir}/src/auth/index.ts`],
+      });
+      expect(absRes.verdict).toBe('revert-confident');
+      expect(absRes.cascadeSet).toEqual(['2']);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
