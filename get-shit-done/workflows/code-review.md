@@ -1,5 +1,5 @@
 <purpose>
-Review source files changed during a phase for bugs, security issues, and code quality problems. Computes file scope (--files override > SUMMARY.md > git diff fallback), checks config gate, spawns gsd-code-reviewer agent, commits REVIEW.md, and presents results to user. When --fix is passed, delegates to code-review-fix.md after review to auto-apply findings via gsd-code-fixer.
+Review source files changed during a phase for bugs, security issues, and code quality problems. Computes file scope (--files override > SUMMARY.md > git diff fallback), checks config gate, fans the review out across three read-only dimensions (gsd-code-review-fanout) when the Workflow tool is available — composing REVIEW.md deterministically via compose-review.cjs as single writer — or falls through to a single gsd-code-reviewer agent otherwise, commits REVIEW.md, and presents results to user. When --fix is passed, delegates to code-review-fix.md after review to auto-apply findings via gsd-code-fixer.
 </purpose>
 
 <required_reading>
@@ -390,13 +390,14 @@ FALLOW_JSON_PATH=""
 ```
 </step>
 
-<step name="spawn_reviewer">
-Compute the review output path:
+<step name="fan_out_review">
+Compute the review output path and shared context used by BOTH the fan-out path
+and the single-agent fallback:
 ```bash
 REVIEW_PATH="${PHASE_DIR}/${PADDED_PHASE}-REVIEW.md"
 ```
 
-Compute DIFF_BASE for agent context (in case agent needs it):
+Compute DIFF_BASE for agent context (in case the agent needs it):
 ```bash
 PHASE_COMMITS=$(git log --oneline --all --grep="${PADDED_PHASE}" --format="%H" 2>/dev/null)
 if [ -n "$PHASE_COMMITS" ]; then
@@ -405,6 +406,107 @@ else
   DIFF_BASE=""
 fi
 ```
+
+**Runtime gate (mirrors map-codebase.md's Agent-vs-sequential detection):**
+Detect whether the **Workflow** tool is available (Claude Code runtime). The
+fan-out moves the three review dimensions onto a deterministic dynamic workflow
+(`gsd-code-review-fanout`), which only runs under the Workflow tool. If the
+Workflow tool is unavailable (Codex, Gemini CLI, Antigravity, or any non-Claude
+runtime), fall through to the single-agent path below — identical to today's
+behavior.
+
+→ **If the Workflow tool IS available:** run `fan_out_review` (this step).
+→ **If the Workflow tool is NOT available:** skip this step and run
+  `single_agent_review_fallback` instead.
+
+---
+
+**Fan-out path (Workflow tool available):**
+
+The dimension fan-out (bugs/logic, security, code-quality) runs read-only — the
+agents return findings and write nothing; the orchestrator owns the single
+REVIEW.md write via `compose-review.cjs` (single-writer invariant). This
+collapses the per-dimension cost from sum → max(3 dimensions).
+
+1. Read the structural findings JSON (fallow) into a string, or "" when absent:
+```bash
+STRUCTURAL_FINDINGS=""
+if [ -n "$FALLOW_JSON_PATH" ] && [ -f "$FALLOW_JSON_PATH" ]; then
+  STRUCTURAL_FINDINGS=$(cat "$FALLOW_JSON_PATH")
+fi
+```
+
+2. Invoke the fan-out workflow with the resolved scope, depth, and structural
+   findings. `files` is the full REVIEW_FILES set (no file-sharding — each
+   dimension agent sees the full set, so deep depth is preserved):
+
+```
+Workflow({name:'gsd-code-review-fanout', args:{
+  phase_number: ${PHASE_NUMBER},
+  padded_phase: ${PADDED_PHASE},
+  phase_dir: ${PHASE_DIR},
+  depth: ${REVIEW_DEPTH},
+  files: REVIEW_FILES,
+  review_path: ${REVIEW_PATH},
+  structural_findings: <STRUCTURAL_FINDINGS or "">,
+  diff_base: ${DIFF_BASE}
+}})
+```
+
+> **ORCHESTRATOR RULE — CODEX RUNTIME**: After invoking the Workflow above, stop working on this task immediately. Do not read more files, edit code, or run tests related to this task while the subagent fan-out is active. Wait for the workflow to return its result. This prevents duplicate work, conflicting edits, and wasted context. Only resume when the result is available.
+
+3. The workflow returns `{status, findings, per_dimension}`. Write it to a
+   temporary findings file, then compose REVIEW.md deterministically via
+   `compose-review.cjs` (the orchestrator is the single writer):
+
+```bash
+FINDINGS_TMP="${PHASE_DIR}/.code-review-findings.json"
+# Write the workflow's returned object (the structured verdict) to FINDINGS_TMP
+# using the Write tool, then compose REVIEW.md from it:
+REVIEW_PATH="${REVIEW_PATH}" \
+FINDINGS_TMP="${FINDINGS_TMP}" \
+PADDED_PHASE="${PADDED_PHASE}" \
+PHASE_NUMBER="${PHASE_NUMBER}" \
+REVIEW_DEPTH="${REVIEW_DEPTH}" \
+FALLOW_JSON_PATH="${FALLOW_JSON_PATH}" \
+node -e "
+  const { composeReviewToFile } = require('./get-shit-done/bin/lib/compose-review.cjs');
+  const files = process.argv.slice(1);
+  composeReviewToFile({
+    findingsPath: process.env.FINDINGS_TMP,
+    reviewPath: process.env.REVIEW_PATH,
+    phase: process.env.PADDED_PHASE,
+    padded_phase: process.env.PADDED_PHASE,
+    depth: process.env.REVIEW_DEPTH,
+    filesReviewed: files,
+    structuralFindingsPath: process.env.FALLOW_JSON_PATH || '',
+  });
+" -- "${REVIEW_FILES[@]}"
+
+# Remove the temporary findings file — REVIEW.md is the durable artifact.
+rm -f "${FINDINGS_TMP}"
+```
+
+**Fan-out failure handling:**
+
+If the Workflow invocation fails (workflow error, timeout, or exception) OR the
+returned `status` is `error` (all three dimensions errored), or REVIEW.md was
+not produced by the compose step:
+```
+Error: Code review fan-out failed: ${error_message}
+
+No REVIEW.md created. You can retry with /gsd:code-review ${PHASE_ARG} or check agent logs.
+```
+
+Do NOT proceed to commit_review step. Do NOT create a partial or empty REVIEW.md. Exit workflow.
+</step>
+
+<step name="single_agent_review_fallback" condition="Workflow tool is NOT available (e.g. Codex, Gemini CLI, Antigravity)">
+When the Workflow tool is unavailable, fall through to the single-agent review —
+one `gsd-code-reviewer` agent that authors REVIEW.md itself. This is today's
+behavior preserved verbatim, runtime-gated like map-codebase.md's
+`sequential_mapping`. REVIEW_PATH and DIFF_BASE were computed in
+`fan_out_review` above; reuse them.
 
 Build files_to_read block for agent:
 ```bash
@@ -647,8 +749,10 @@ If `--files` validation fails unexpectedly on macOS, install coreutils or use ab
 - [ ] Deleted files filtered from scope
 - [ ] Files deduplicated and sorted
 - [ ] Empty scope results in skip (no agent spawn)
-- [ ] Agent spawned with explicit file list, depth, review_path, diff_base
-- [ ] Agent failure handled without partial commits
+- [ ] When Workflow tool available: review fans out to gsd-code-review-fanout (3 read-only dimensions over the full file set); orchestrator composes REVIEW.md via compose-review.cjs (single-writer)
+- [ ] When Workflow tool unavailable: falls through to single gsd-code-reviewer agent that authors REVIEW.md (today's behavior, runtime-gated like map-codebase.md)
+- [ ] Composed REVIEW.md is byte-compatible with the gsd-code-reviewer write_review contract (frontmatter status/files_reviewed_list/counts; CR-/WR-/IN- finding IDs) so present_results + --fix/--auto are unaffected
+- [ ] Fan-out / agent failure handled without partial commits
 - [ ] REVIEW.md committed if created
 - [ ] When --fix: dispatch_fix step delegates to code-review-fix.md with --all/--auto forwarded
 - [ ] Results presented inline with next step suggestion (review-only path)
