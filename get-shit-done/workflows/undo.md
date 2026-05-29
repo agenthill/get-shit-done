@@ -88,6 +88,8 @@ If the file does not exist, or `manifest.phases?.[TARGET_PHASE]` is missing:
     ```
   - Use matching commits as COMMITS
 
+> **Autonomous-run artifacts (ADR 0013 option 4):** when the SDK autonomous loop (`GSD.run`) drives phases, it produces additional rollback bookkeeping a manual undo may encounter or want to inspect: `gsd/phase-<N>-base` / `gsd/phase-<N>-done` tags, `gsd-phase-<N>-int` integration branches, the promotion ledger `.planning/.phase-manifest.json` (the FLAT `phaseNumber → {base_sha, head_sha, commits[], depends_on[]}` shape the SDK writes; the `.phases` wrapper above is the interactive-undo lookup convention — a missing entry falls through to the git-log search), the per-phase checkpoints under `.planning/.checkpoints/`, reverted summaries quarantined under `.planning/.rollback-quarantine/`, and the retry/crash-resume ledger `.planning/ROLLBACK.json`. These are gitignored derived state — leave them in place; the autonomous loop reconciles them on its next run. A manual `/gsd:undo` need not touch them.
+
 ---
 
 **MODE=plan:**
