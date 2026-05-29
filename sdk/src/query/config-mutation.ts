@@ -595,7 +595,15 @@ export const configNewProject: QueryHandler = async (args, projectDir, workstrea
   // Nested git keys omitted by CJS init. `git.base_branch` triggers
   // origin/HEAD auto-detect when absent — materializing `null` here would
   // suppress that and break ship-ready preflight (#3079).
-  const GIT_KEYS_OMITTED_FROM_INIT = new Set(['base_branch']);
+  // `sdk_worktree_execution` / `sdk_test_command` (ADR 0013 option 3) are
+  // opt-in SDK-engine knobs absent from CJS `buildNewProjectConfig`; omitting
+  // them keeps SDK init output byte-identical to CJS and leaves the gate off
+  // by default (absent → falsy → no-op path).
+  const GIT_KEYS_OMITTED_FROM_INIT = new Set([
+    'base_branch',
+    'sdk_worktree_execution',
+    'sdk_test_command',
+  ]);
 
   const filteredTopLevel: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(sanitizedManifest)) {

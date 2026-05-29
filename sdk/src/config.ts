@@ -21,6 +21,24 @@ export interface GitConfig {
   phase_branch_template: string;
   milestone_branch_template: string;
   quick_branch_template: string | null;
+  /**
+   * ADR 0013 option 3. When true (and the runtime is Claude), the SDK phase
+   * runner injects the real git-backed execution engine: per-plan worktree
+   * isolation + a single-writer merge serializer + a real build+test gate
+   * (invariant 3). Default false preserves today's in-process, shared-cwd,
+   * always-pass no-op path byte-for-byte. Gated by a fail-closed worktree
+   * capability pre-flight that THROWS (never silently falls back) when git
+   * worktree isolation is unavailable.
+   */
+  sdk_worktree_execution?: boolean;
+  /**
+   * ADR 0013 option 3. Test command for the real build+test gate when
+   * `sdk_worktree_execution` is on. When null/absent, falls back to `npm test`
+   * if a package.json with a `test` script exists, else the gate is a no-op
+   * pass. Run via execFile in the post-merge protected checkout; a timeout
+   * returns exit 124 (inconclusive ≠ pass).
+   */
+  sdk_test_command?: string | null;
 }
 
 export interface WorkflowConfig {
