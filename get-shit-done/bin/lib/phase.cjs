@@ -4,7 +4,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { escapeRegex, loadConfig, normalizePhaseName, phaseMarkdownRegexSource, comparePhaseNum, findPhaseInternal, getArchivedPhaseDirs, generateSlugInternal, getMilestonePhaseFilter, stripShippedMilestones, extractCurrentMilestone, replaceInCurrentMilestone, toPosixPath, output, error, readSubdirectories, phaseTokenMatches, ERROR_REASON } = require('./core.cjs');
+const { escapeRegex, loadConfig, normalizePhaseName, phaseMarkdownRegexSource, comparePhaseNum, findPhaseInternal, getArchivedPhaseDirs, generateSlugInternal, getMilestonePhaseFilter, stripShippedMilestones, extractCurrentMilestone, replaceInCurrentMilestone, toPosixPath, output, error, readSubdirectories, phaseTokenMatches, resolveModelInternal, ERROR_REASON } = require('./core.cjs');
 const { platformWriteSync, platformReadSync, platformEnsureDir } = require('./shell-command-projection.cjs');
 const { planningDir, withPlanningLock } = require('./planning-workspace.cjs');
 const { extractFrontmatter } = require('./frontmatter.cjs');
@@ -563,6 +563,314 @@ function cmdPhasePlanIndex(cwd, phase, raw) {
   };
   if (planNamingWarning) result.warning = planNamingWarning;
   if (warnings.length > 0) result.warnings = warnings;
+
+  output(result, raw);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// dag-runspec — shared per-plan depends_on DAG for the execution engines.
+//
+// `phase-plan-index` (above) computes the Kahn topological *level* per plan and
+// then discards the edge set, emitting only the integer `wave`. The dynamic-
+// workflow execution engines (ADR 0013, D3/D4) need the TRUE per-plan edges —
+// each plan gated on its DIRECT predecessors, not a coarse wave barrier. This
+// builder reuses the exact same plan parse + Kahn pass but KEEPS the direct
+// edge set, and additionally derives the `files_modified` serialization edges
+// (invariant 9) over all plans.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse every canonical PLAN in a phase and run the same depends_on Kahn pass
+ * used by phase-plan-index, but retain the direct edge set and the canonical-
+ * prefix resolution map. On a depends_on cycle this calls error() (process
+ * exit 1) exactly as phase-plan-index does (invariant 8).
+ *
+ * @returns {null|{
+ *   normalized: string,
+ *   phaseDir: string,
+ *   planNamingWarning: string|null,
+ *   rawPlans: object[],
+ *   planMap: Map<string, object>,
+ *   canonicalToId: Map<string, string>,
+ *   level: Map<string, number>,
+ *   directDeps: Map<string, string[]>,   // plan id -> resolved direct predecessor ids
+ *   levelOffset: number,
+ * }}
+ *   null when the phase directory does not exist (caller emits the not-found shape).
+ */
+function buildPhaseDagInternal(cwd, phase) {
+  const phasesDir = path.join(planningDir(cwd), 'phases');
+  const normalized = normalizePhaseName(phase);
+
+  // Find phase directory (mirrors cmdPhasePlanIndex).
+  let phaseDir = null;
+  try {
+    const entries = fs.readdirSync(phasesDir, { withFileTypes: true });
+    const dirs = entries.filter(e => e.isDirectory()).map(e => e.name).sort((a, b) => comparePhaseNum(a, b));
+    const match = dirs.find(d => phaseTokenMatches(d, normalized));
+    if (match) phaseDir = path.join(phasesDir, match);
+  } catch {
+    // phases dir doesn't exist
+  }
+
+  if (!phaseDir) return null;
+
+  const phaseFiles = fs.readdirSync(phaseDir);
+  const planFiles = phaseFiles.filter(isCanonicalPlanFile).sort();
+  const summaryFiles = phaseFiles.filter(f => f.endsWith('-SUMMARY.md') || f === 'SUMMARY.md');
+  const planNamingWarning = describeNonCanonicalPlans(phaseFiles, planFiles);
+
+  const completedPlanIds = new Set(
+    summaryFiles.flatMap(s => {
+      const exact = s.replace('-SUMMARY.md', '').replace('SUMMARY.md', '');
+      const canonical = extractCanonicalPlanId(s);
+      return canonical === exact ? [exact] : [exact, canonical];
+    })
+  );
+
+  // ── Pass 1: parse each plan file (identical to phase-plan-index) ──────────
+  const rawPlans = [];
+  for (const planFile of planFiles) {
+    const planId = planFile.replace('-PLAN.md', '').replace('PLAN.md', '');
+    const planPath = path.join(phaseDir, planFile);
+    const content = fs.readFileSync(planPath, 'utf-8');
+    const fm = extractFrontmatter(content);
+
+    const xmlTasks = content.match(/<task[\s>]/gi) || [];
+    const mdTasks = content.match(/##\s*Task\s*\d+/gi) || [];
+    const taskCount = xmlTasks.length || mdTasks.length;
+
+    const parsedWave = parseInt(fm.wave, 10);
+    const declaredWave = Number.isNaN(parsedWave) ? null : parsedWave;
+
+    let dependsOn = [];
+    const fmDeps = fm['depends_on'];
+    if (Array.isArray(fmDeps)) {
+      dependsOn = fmDeps.map(String);
+    } else if (typeof fmDeps === 'string' && fmDeps.trim() !== '') {
+      dependsOn = [fmDeps];
+    }
+
+    let autonomous = true;
+    if (fm.autonomous !== undefined) {
+      autonomous = fm.autonomous === 'true' || fm.autonomous === true;
+    }
+
+    let filesModified = [];
+    const fmFiles = fm['files_modified'] || fm['files-modified'];
+    if (fmFiles) {
+      filesModified = Array.isArray(fmFiles) ? fmFiles : [fmFiles];
+    }
+
+    const hasSummary = completedPlanIds.has(planId) || completedPlanIds.has(extractCanonicalPlanId(planFile));
+
+    rawPlans.push({
+      id: planId,
+      declaredWave,
+      dependsOn,
+      autonomous,
+      objective: extractObjective(content) || fm.objective || null,
+      filesModified,
+      taskCount,
+      hasSummary,
+    });
+  }
+
+  // ── Pass 2: Kahn level assignment (identical), but RETAIN direct edges ────
+  const planMap = new Map(rawPlans.map(p => [p.id, p]));
+  const canonicalToId = new Map(rawPlans.map(p => [extractCanonicalPlanId(p.id), p.id]));
+
+  const level = new Map();
+  const inDeg = new Map();
+  const adj = new Map();
+  // directDeps: plan id -> resolved direct predecessor ids (the edge set the
+  // wave-only path discards). External deps are dropped, matching the level pass.
+  const directDeps = new Map();
+
+  for (const p of rawPlans) {
+    if (!inDeg.has(p.id)) inDeg.set(p.id, 0);
+    if (!adj.has(p.id)) adj.set(p.id, []);
+    if (!directDeps.has(p.id)) directDeps.set(p.id, []);
+    for (const dep of p.dependsOn) {
+      const resolvedDep = planMap.has(dep) ? dep : canonicalToId.get(dep);
+      if (!resolvedDep) continue; // external dep — ignore
+      if (!adj.has(resolvedDep)) adj.set(resolvedDep, []);
+      adj.get(resolvedDep).push(p.id);
+      inDeg.set(p.id, (inDeg.get(p.id) ?? 0) + 1);
+      directDeps.get(p.id).push(resolvedDep);
+    }
+  }
+
+  const queue = [];
+  for (const p of rawPlans) {
+    if ((inDeg.get(p.id) ?? 0) === 0) {
+      queue.push(p.id);
+      level.set(p.id, 0);
+    }
+  }
+
+  let visited = 0;
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    visited++;
+    const curLevel = level.get(cur);
+    for (const dep of (adj.get(cur) ?? [])) {
+      const newLevel = curLevel + 1;
+      if (newLevel > (level.get(dep) ?? -1)) {
+        level.set(dep, newLevel);
+      }
+      inDeg.set(dep, inDeg.get(dep) - 1);
+      if (inDeg.get(dep) === 0) {
+        queue.push(dep);
+      }
+    }
+  }
+
+  // Cycle detection (invariant 8) — abort exactly as phase-plan-index does.
+  if (visited < rawPlans.length) {
+    const cycleNodes = rawPlans.filter(p => !level.has(p.id)).map(p => p.id);
+    error(`depends_on cycle detected in phase ${normalized} — cycle involves: ${cycleNodes.join(', ')}`);
+    return null; // unreachable — error() exits the process
+  }
+
+  const anyWaveZero = rawPlans.some(p => p.declaredWave === 0);
+  const levelOffset = anyWaveZero ? 0 : 1;
+
+  return { normalized, phaseDir, planNamingWarning, rawPlans, planMap, canonicalToId, level, directDeps, levelOffset };
+}
+
+/**
+ * Build the set of `files_modified` serialization edges (invariant 9): any two
+ * plans (incomplete OR complete) that share a files_modified entry and are NOT
+ * already ordered by depends_on reachability must not run concurrently.
+ *
+ * Emitted as [idA, idB] pairs only when neither A reaches B nor B reaches A in
+ * the depends_on closure. The pair is ordered by the plans' position in
+ * `rawPlans` (stable, dedup-friendly).
+ *
+ * @param {object[]} rawPlans
+ * @param {Map<string,string[]>} directDeps — plan id -> direct predecessor ids
+ * @returns {string[][]}
+ */
+function computeSerializationEdges(rawPlans, directDeps) {
+  const order = new Map(rawPlans.map((p, i) => [p.id, i]));
+
+  // Reachability closure over depends_on edges. reaches(a) = set of plans a
+  // (transitively) depends on. If b ∈ reaches(a) or a ∈ reaches(b), the pair is
+  // already ordered and needs no serialization edge.
+  const reaches = new Map();
+  const computeReach = (id, seen) => {
+    if (reaches.has(id)) return reaches.get(id);
+    if (seen.has(id)) return new Set(); // cycle guard (cycles already aborted upstream)
+    seen.add(id);
+    const acc = new Set();
+    for (const dep of (directDeps.get(id) ?? [])) {
+      acc.add(dep);
+      for (const t of computeReach(dep, seen)) acc.add(t);
+    }
+    seen.delete(id);
+    reaches.set(id, acc);
+    return acc;
+  };
+  for (const p of rawPlans) computeReach(p.id, new Set());
+
+  const ordered = (a, b) =>
+    (reaches.get(a)?.has(b)) || (reaches.get(b)?.has(a));
+
+  const edges = [];
+  for (let i = 0; i < rawPlans.length; i++) {
+    for (let j = i + 1; j < rawPlans.length; j++) {
+      const a = rawPlans[i];
+      const b = rawPlans[j];
+      const overlap = a.filesModified.some(f => b.filesModified.includes(f));
+      if (!overlap) continue;
+      if (ordered(a.id, b.id)) continue;
+      // Stable order by position in rawPlans.
+      const pair = order.get(a.id) <= order.get(b.id) ? [a.id, b.id] : [b.id, a.id];
+      edges.push(pair);
+    }
+  }
+  return edges;
+}
+
+/**
+ * dag-runspec query — emit the per-plan execution DAG run-spec.
+ * Additive sibling to phase-plan-index; its output shape is unchanged.
+ */
+function cmdDagRunspec(cwd, phase, raw) {
+  if (!phase) {
+    error('phase required for dag-runspec');
+  }
+
+  const config = loadConfig(cwd);
+  // `runtime` is null when unset (Claude-native default) so the key is always
+  // present in the JSON — JSON.stringify drops `undefined` but keeps `null`.
+  const runtime = config.runtime ?? null;
+
+  const dag = buildPhaseDagInternal(cwd, phase);
+  if (!dag) {
+    const normalized = normalizePhaseName(phase);
+    output({
+      phase: normalized,
+      error: 'Phase not found',
+      plans: [],
+      serialization_edges: [],
+      incomplete: [],
+      skipped_complete: [],
+      parallelization: config.parallelization,
+      runtime,
+    }, raw);
+    return;
+  }
+
+  const { normalized, planNamingWarning, rawPlans, level, directDeps, levelOffset } = dag;
+
+  // Model resolution: reuse the gsd-executor resolver (init.cjs emits
+  // executor_model: resolveModelInternal(cwd, 'gsd-executor')). It returns
+  // 'inherit' (or '' when resolve_model_ids: 'omit') — emit 'inherit' in those
+  // cases per invariant 13 so the engine omits the model param.
+  let model;
+  try {
+    const resolved = resolveModelInternal(cwd, 'gsd-executor');
+    model = (resolved === '' || resolved == null) ? 'inherit' : resolved;
+  } catch {
+    model = null; // resolution failed — emit null rather than block (see plan Task 1)
+  }
+
+  const incomplete = [];
+  const skippedComplete = [];
+
+  const plans = rawPlans.map((p) => {
+    if (!p.hasSummary) {
+      incomplete.push(p.id);
+    } else {
+      // Complete plans stay IN the DAG as already-integrated/satisfied
+      // predecessors (invariant 10) — not dropped.
+      skippedComplete.push(p.id);
+    }
+    return {
+      id: p.id,
+      depends_on: (directDeps.get(p.id) ?? []).slice(),
+      wave: (level.get(p.id) ?? 0) + levelOffset,
+      files_modified: p.filesModified,
+      has_summary: p.hasSummary,
+      autonomous: p.autonomous,
+      model,
+    };
+  });
+
+  const serializationEdges = computeSerializationEdges(rawPlans, directDeps);
+
+  const result = {
+    phase: normalized,
+    plans,
+    serialization_edges: serializationEdges,
+    incomplete,
+    skipped_complete: skippedComplete,
+    parallelization: config.parallelization,
+    runtime,
+  };
+  if (planNamingWarning) result.warning = planNamingWarning;
 
   output(result, raw);
 }
@@ -1413,6 +1721,7 @@ module.exports = {
   cmdPhaseNextDecimal,
   cmdFindPhase,
   cmdPhasePlanIndex,
+  cmdDagRunspec,
   cmdPhaseAdd,
   cmdPhaseAddBatch,
   cmdPhaseMvpMode,
