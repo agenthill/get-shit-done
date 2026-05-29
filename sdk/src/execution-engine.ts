@@ -89,14 +89,21 @@ export class Semaphore {
 export class Mutex {
   private chain: Promise<void> = Promise.resolve();
   async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn, fn);
-    // Keep the chain alive regardless of fn's outcome so a rejection does not
-    // wedge the lock for subsequent callers.
-    this.chain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+    // Standard chained mutex: each caller waits for the prior holder to release,
+    // then runs its section exclusively. The chain links on a fresh release
+    // promise (NOT on fn's own settlement), so a prior fn that throws can never
+    // re-invoke the next caller's fn (the bug in `.then(fn, fn)`), and a
+    // rejection never wedges the lock — `prev.catch()` swallows the prior
+    // outcome for ordering only.
+    const prev = this.chain;
+    let release!: () => void;
+    this.chain = new Promise<void>(r => (release = r));
+    await prev.catch(() => {}); // wait for prior holder, ignore its outcome
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   }
 }
 
@@ -165,6 +172,19 @@ export class GitWorktreeManager implements WorktreeManager {
   async create(planId: string, phase: number, baseSha: string): Promise<PlanWorktree> {
     const branch = branchNameFor(phase, planId);
     const dir = `${this.worktreeRoot}/wt-${phase}-${sanitize(planId)}`;
+
+    // Resume case (prior crash): <dir> may already be a REGISTERED worktree. A
+    // plain `worktree add` then fails ("already exists"), and the caller's
+    // fallback-to-shared-cwd would make a dependent miss its predecessor's
+    // commits (invariant 4). Reuse the registered worktree by checking it out to
+    // this plan's branch in place rather than re-adding.
+    if (await this.isRegisteredWorktree(dir)) {
+      await this.ensureBranch(branch, baseSha);
+      await this.git(['checkout', '-f', branch], dir);
+      this.tracked.set(planId, { dir, branch });
+      return { cwd: dir, branch, baseSha };
+    }
+
     // Reattach to a surviving branch on resume rather than forking a duplicate.
     let exists = false;
     try {
@@ -180,6 +200,31 @@ export class GitWorktreeManager implements WorktreeManager {
     }
     this.tracked.set(planId, { dir, branch });
     return { cwd: dir, branch, baseSha };
+  }
+
+  /** True when `dir` is already registered as a linked worktree (resume path). */
+  private async isRegisteredWorktree(dir: string): Promise<boolean> {
+    try {
+      const { stdout } = await this.git(['worktree', 'list', '--porcelain']);
+      for (const line of stdout.split('\n')) {
+        if (line.startsWith('worktree ') && line.slice('worktree '.length).trim() === dir) {
+          return true;
+        }
+      }
+    } catch {
+      // `git worktree list` failing → treat as not-registered; the add path
+      // below will surface any real error.
+    }
+    return false;
+  }
+
+  /** Ensure the plan's branch exists, creating it at `baseSha` if absent. */
+  private async ensureBranch(branch: string, baseSha: string): Promise<void> {
+    try {
+      await this.git(['rev-parse', '--verify', `refs/heads/${branch}`]);
+    } catch {
+      await this.git(['branch', branch, baseSha]).catch(() => {});
+    }
   }
 
   async headSha(planId: string): Promise<string> {
@@ -325,12 +370,45 @@ export class GitMergeSerializer implements MergeSerializer {
     // a three-dot merge-base diff that would surface ancestor deletions.
     const { stdout } = await this.git(['diff', '--name-status', `${baseTip}..HEAD`]);
     const deletions: string[] = [];
+    const additions: string[] = [];
     for (const line of stdout.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       const [status, ...rest] = trimmed.split('\t');
       const file = rest.join('\t');
       if (status.startsWith('D')) deletions.push(file);
+      else if (status.startsWith('A')) additions.push(file);
+    }
+
+    // Resurrected-file guard (invariant 6, ADR 0013 / #2501): a file an ancestor
+    // INTENTIONALLY deleted on the protected branch must not be silently re-added
+    // by this plan's merge. Scoped to the single-plan delta (files this delta
+    // ADDED, baseTip..HEAD). A file is a resurrection only when the protected
+    // branch's history at baseTip shows a prior deletion event for it — matching
+    // the production guard's `git log --diff-filter=D` history check, not a bare
+    // "absent from the pre-merge tree" test (which would wrongly drop genuinely
+    // new files). Resurrections are removed and folded into the guard commit.
+    const resurrected: string[] = [];
+    for (const f of additions) {
+      try {
+        const { stdout: log } = await this.git([
+          'log',
+          '--diff-filter=D',
+          '--format=',
+          '--name-only',
+          baseTip,
+          '--',
+          f,
+        ]);
+        if (log.split('\n').some(l => l.trim().length > 0)) {
+          resurrected.push(f);
+        }
+      } catch {
+        // history unavailable for this path → not provably a resurrection; skip.
+      }
+    }
+    for (const f of resurrected) {
+      await this.git(['rm', '-f', '--', f]).catch(() => {});
     }
 
     // STATE.md / ROADMAP.md restore: parallel plans must never write them
@@ -352,7 +430,9 @@ export class GitMergeSerializer implements MergeSerializer {
     }
     for (const f of stateFiles) toRestore.add(f);
 
-    if (toRestore.size === 0) return;
+    // Nothing for the bulk-delete/state restore AND no resurrection to strip →
+    // no guard commit needed.
+    if (toRestore.size === 0 && resurrected.length === 0) return;
 
     for (const f of toRestore) {
       try {
@@ -362,11 +442,16 @@ export class GitMergeSerializer implements MergeSerializer {
       }
     }
     await this.git(['add', '-A']);
+    const restoreNote =
+      toRestore.size > 0 ? `restore ${toRestore.size} file(s)` : '';
+    const resurrectNote =
+      resurrected.length > 0 ? `strip ${resurrected.length} resurrected file(s)` : '';
+    const note = [restoreNote, resurrectNote].filter(Boolean).join(', ');
     await this.git([
       'commit',
       '--no-verify',
       '-m',
-      `guard: restore ${toRestore.size} file(s) (bulk-delete/state guard)`,
+      `guard: ${note} (bulk-delete/state/resurrection guard)`,
     ]).catch(() => {
       /* nothing staged → no guard commit needed */
     });

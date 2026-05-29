@@ -243,10 +243,15 @@ describe('PhaseRunner DAG engine — correctness falsifiers (git-backed)', () =>
       const result = await runner.run('1');
 
       const exec = result.steps.find(s => s.step === PhaseStepType.Execute)!;
-      // planResults and planDispositions share the same DAG (topological) order.
-      const byId = new Map(
-        exec.planDispositions!.map((d, i) => [d.planId, exec.planResults![i]]),
-      );
+      // Rebuild the planId → PlanResult lookup explicitly. planResults carries no
+      // planId, so the engine emits dispositions and planResults co-indexed in
+      // DAG (topological) order; assert that contract holds before pairing rather
+      // than silently trusting positional alignment.
+      expect(exec.planDispositions!).toHaveLength(exec.planResults!.length);
+      const byId = new Map<string, PlanResult>();
+      exec.planDispositions!.forEach((d, i) => {
+        byId.set(d.planId, exec.planResults![i]);
+      });
       // A failed, B was never dispatched (blocked-by-ancestor), D finished.
       expect(ran.has('A')).toBe(true);
       expect(ran.has('B')).toBe(false);
@@ -302,6 +307,50 @@ describe('PhaseRunner DAG engine — correctness falsifiers (git-backed)', () =>
       for (let i = 0; i < 6; i++) {
         expect(tree).toContain(`f${i}.txt`);
       }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(wtRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('the resurrected-file guard strips a file an ancestor intentionally deleted', async () => {
+    const { dir, baseSha } = await initRepo();
+    const wtRoot = await mkdtemp(join(tmpdir(), 'gsd-dag-wt-'));
+    try {
+      // Ancestor history on main: create `legacy.txt`, then intentionally delete
+      // it in a later commit. A subsequent plan must not silently re-add it.
+      const gitRepo = gitIn(dir);
+      await writeFile(join(dir, 'legacy.txt'), 'legacy\n');
+      await gitRepo(['add', '-A']);
+      await gitRepo(['commit', '-q', '--no-verify', '-m', 'add legacy']);
+      await gitRepo(['rm', '-q', 'legacy.txt']);
+      await gitRepo(['commit', '-q', '--no-verify', '-m', 'intentionally delete legacy']);
+
+      const worktrees = new GitWorktreeManager(dir, wtRoot);
+      const serializer = new GitMergeSerializer(dir, 'main', async () => 0);
+      const protectedHead = (await gitRepo(['rev-parse', 'main'])).stdout.trim();
+      const factory: ExecutionEngineFactory = () => ({ worktrees, serializer, baseSha: protectedHead });
+
+      // The plan re-adds the deleted file (a resurrection).
+      mockSession.mockImplementation(async (_p, step, opts: any) => {
+        if (step !== PhaseStepType.Execute) return okResult();
+        const cwd = opts.cwd as string;
+        const git = gitIn(cwd);
+        await writeFile(join(cwd, 'legacy.txt'), 'resurrected\n');
+        await git(['add', '-A']);
+        await git(['commit', '-q', '--no-verify', '-m', 'resurrect legacy']);
+        return okResult();
+      });
+
+      const { deps } = makeDeps([planInfo({ id: 'R', files_modified: ['other.txt'] })], {
+        projectDir: dir,
+        executionEngineFactory: factory,
+      });
+      await new PhaseRunner(deps).run('1');
+
+      // The guard suite removed the resurrected file from the protected branch.
+      const tree = (await gitRepo(['ls-tree', '--name-only', 'main'])).stdout;
+      expect(tree).not.toContain('legacy.txt');
     } finally {
       await rm(dir, { recursive: true, force: true });
       await rm(wtRoot, { recursive: true, force: true });
@@ -368,6 +417,50 @@ describe('PhaseRunner DAG engine — correctness falsifiers (git-backed)', () =>
     expect(dispatched.has('B')).toBe(true);
     expect(exec.planResults).toHaveLength(1);
     expect(exec.success).toBe(true);
+  });
+
+  it('a level gate testExit=124 (inconclusive) forces the affected plan to fail at the step level', async () => {
+    // Executor succeeds, but the batched build+test gate returns 124
+    // (timeout/inconclusive ≠ pass). The plan must NOT be reported complete:
+    // PhaseStepResult.success derives from planResults[*].success, so the
+    // gate-not-pass must downgrade the plan's success (invariant 3).
+    mockSession.mockImplementation(async (_p, step) => {
+      if (step !== PhaseStepType.Execute) return okResult();
+      return okResult();
+    });
+
+    // Branch non-empty so the merge/gate path runs; the gate always returns 124.
+    const factory: ExecutionEngineFactory = () => ({
+      worktrees: {
+        async create(planId: string) {
+          return { cwd: '/tmp/project', branch: `b-${planId}`, baseSha: '' };
+        },
+        async headSha() {
+          return '';
+        },
+        async cleanup() {},
+      } as any,
+      serializer: {
+        async merge(planId: string) {
+          return { planId, merged: true };
+        },
+        async gate() {
+          return { testExit: 124 };
+        },
+      } as any,
+      baseSha: '',
+    });
+
+    const { deps } = makeDeps([planInfo({ id: 'G' })], { executionEngineFactory: factory });
+    const result = await new PhaseRunner(deps).run('1');
+
+    const exec = result.steps.find(s => s.step === PhaseStepType.Execute)!;
+    // The executor "succeeded" but the gate did not pass → step fails.
+    expect(exec.success).toBe(false);
+    expect(exec.planResults![0].success).toBe(false);
+    const disp = exec.planDispositions!.find(d => d.planId === 'G')!;
+    expect(disp.testExit).toBe(124);
+    expect(disp.merged).toBe(false);
   });
 });
 

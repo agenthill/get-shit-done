@@ -1045,17 +1045,31 @@ export class PhaseRunner {
     const settled = await Promise.allSettled(dag.nodes.map(n => promises.get(n.id)!));
 
     // Await the per-level batched gates (each fired as its level drained, so the
-    // expensive build+test ran concurrently with later-level execution).
-    await Promise.all(gatePromises);
+    // expensive build+test ran concurrently with later-level execution). A
+    // rejected gate must NOT escape runPlanDag (it would skip PhaseStepComplete
+    // emission and lose the per-plan results) — gate outcomes are already
+    // recorded per-disposition, so swallow rejections here and log a warning.
+    const gateSettled = await Promise.allSettled(gatePromises);
+    for (const g of gateSettled) {
+      if (g.status === 'rejected') {
+        this.logger?.warn(
+          `Batched level gate rejected (continuing; outcomes recorded per-disposition): ${
+            g.reason instanceof Error ? g.reason.message : String(g.reason)
+          }`,
+        );
+      }
+    }
 
     // Collect results in DAG (topological/integration) order, allSettled-style.
     const planResults: PlanResult[] = [];
+    const resultById = new Map<string, PlanResult>();
     settled.forEach((s, i) => {
       const node = dag.nodes[i];
+      let result: PlanResult;
       if (s.status === 'fulfilled') {
-        planResults.push(s.value.result);
+        result = s.value.result;
       } else {
-        planResults.push(this.synthesizeRejectedResult(s.reason));
+        result = this.synthesizeRejectedResult(s.reason);
         if (!dispositionById.has(node.id)) {
           dispositionById.set(node.id, {
             planId: node.id,
@@ -1065,7 +1079,31 @@ export class PhaseRunner {
           });
         }
       }
+      planResults.push(result);
+      resultById.set(node.id, result);
     });
+
+    // Gate → success wiring (invariant 3): a plan whose level gate did not PASS
+    // (testExit !== 0; 124 = timeout/inconclusive ≠ pass) must NOT be reported as
+    // a successful/complete plan, even though its executor succeeded. The batched
+    // gate's testExit only lived on the disposition; reflect it in the PlanResult
+    // so PhaseStepResult.success (derived from planResults[*].success) is correct.
+    for (const node of dag.nodes) {
+      const disp = dispositionById.get(node.id);
+      const result = resultById.get(node.id);
+      if (!disp || !result) continue;
+      if (disp.testExit !== undefined && disp.testExit !== 0 && result.success) {
+        result.success = false;
+        result.error = {
+          subtype: 'gate_failed',
+          messages: [
+            `Plan ${node.id} level ${disp.level} build+test gate did not pass (testExit=${disp.testExit}; 124 = timeout/inconclusive)`,
+          ],
+        };
+        disp.merged = false;
+        disp.skippedReason = disp.skippedReason ?? `gate-not-pass:testExit=${disp.testExit}`;
+      }
+    }
 
     const dispositions = dag.nodes
       .map(n => dispositionById.get(n.id))
