@@ -21,6 +21,8 @@ export interface GitConfig {
   phase_branch_template: string;
   milestone_branch_template: string;
   quick_branch_template: string | null;
+  /** Protected branch the SDK execution engine merges plan deltas onto; null = autodetect origin/HEAD (try main, then master, then current branch). Mirrors the manifest's existing git.base_branch key. */
+  base_branch?: string | null;
   /**
    * ADR 0013 option 3. When true (and the runtime is Claude), the SDK phase
    * runner injects the real git-backed execution engine: per-plan worktree
