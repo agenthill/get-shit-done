@@ -35,11 +35,12 @@ Outcome: **reshaped** the engine choice (see ADR Status). A generic probe agent 
 - **Decouple per-plan merge from the per-level batched build+test gate** (the determining fix — per-plan gating is slower than today under a test-dominated suite).
 - `WaveTracker` for synthetic `WaveStart`/`WaveComplete`; additive disposition field; unchanged `PhaseStepResult` shape; keep `allSettled` failure-isolation, cost aggregation, `parallelization===false` fast-path, idempotent gap-closure.
 
-### Task 4 — Read-only fan-out workflow: `gsd-verify-fanout.js` (the dynamic-workflow POC)
+### Task 4 — Read-only fan-out workflow: `dynamic-workflows/gsd-verify-fanout.js` (the dynamic-workflow POC)
 
-- Ship `.claude/workflows/gsd-verify-fanout.js`: `parallel()` the independent, read-only post-execution gates over the frozen post-execution tree — static verify ∥ behavioral test run ∥ code-review ∥ regression ∥ drift detection — collapsing the serial chain from **sum → max**. Returns a schema-forced verdict (`status`, `gaps[]`, `human_verification[]`, per-gate findings).
-- `execute-phase.md` post-execution section becomes the shell: `Workflow({name:'gsd-verify-fanout', args})` → consume verdict → run interactive gates (`human_needed`, `gaps_found`, checkpoints) → `update_roadmap` on a passed/approved verdict. No isolation needed (read-only).
-- This is where dynamic workflows actually ship in the POC; it validates the orchestrator-shell / workflow / schema-verdict split end-to-end.
+- Tracked source at `dynamic-workflows/gsd-verify-fanout.js` (NOT `.claude/workflows/` — that's the gitignored install destination). Correct Workflow module form: `export const meta` literal + top-level body using ambient `agent`/`parallel`/`phase`/`log`/`args` + a top-level `return` verdict (NOT a default-exported function).
+- `parallel()` the 5 independent, read-only gates: static goal verify ∥ code review ∥ prior-phase regression ∥ schema-drift ∥ codebase-drift — collapsing the serial chain from **sum → max**. **Hardened for collision-safety:** exactly ONE branch runs a test process (regression over prior phases — the current suite was already gated per-level in Task 2); every branch returns findings and writes nothing (orchestrator owns all writes). Returns `{ status, gaps[], human_verification[], per_gate[] }`.
+- `execute-phase.md` post_execution_fanout shell: `Workflow({name:'gsd-verify-fanout', args})` → consume verdict → preserve schema-drift BLOCK → run `human_needed`/`gaps_found` interactive gates → `update_roadmap` on passed/approved. Falls back to the verbatim serial chain when the Workflow tool is unavailable.
+- `node --check` passes; correct-form markers verified. **Install residual:** `bin/install.js` must copy `dynamic-workflows/*.js` → `.claude/workflows/` for Claude-Code installs (deferred — see ADR Consequences).
 
 ### Task 5 — Tests: correctness falsifiers + wall-clock harness
 

@@ -13,6 +13,7 @@
     "get-shit-done",
     "agents",
     "hooks",
+    "dynamic-workflows",
     "scripts",
     "sdk/src",
     "sdk/shared",
