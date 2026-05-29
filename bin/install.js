@@ -6901,6 +6901,28 @@ function uninstall(isGlobal, runtime = 'claude') {
     }
   }
 
+  // 3a. Remove GSD dynamic workflows (gsd-*.js files only) for Claude Code.
+  //     Installed by install() under workflows/ for runtime === 'claude'.
+  //     Mirror the agents removal: strip only gsd-* files, leave the dir
+  //     (and any user-owned workflows) in place.
+  if (runtime === 'claude') {
+    const workflowsDir = path.join(targetDir, 'workflows');
+    if (fs.existsSync(workflowsDir)) {
+      const files = fs.readdirSync(workflowsDir);
+      let workflowCount = 0;
+      for (const file of files) {
+        if (file.startsWith('gsd-') && file.endsWith('.js')) {
+          fs.unlinkSync(path.join(workflowsDir, file));
+          workflowCount++;
+        }
+      }
+      if (workflowCount > 0) {
+        removedCount++;
+        console.log(`  ${green}✓${reset} Removed ${workflowCount} GSD dynamic workflow(s)`);
+      }
+    }
+  }
+
   // 4. Remove GSD hooks
   const hooksDir = path.join(targetDir, 'hooks');
   if (fs.existsSync(hooksDir)) {
@@ -8598,6 +8620,27 @@ function install(isGlobal, runtime = 'claude', options = {}) {
       console.log(`  ${green}✓${reset} Installed agents`);
     } else {
       failures.push('agents');
+    }
+  }
+
+  // Copy dynamic-workflows/*.js → workflows/ for Claude Code installs only.
+  // The Workflow tool resolves NAMED dynamic workflows from <configDir>/workflows/
+  // and is Claude-Code-specific (ADR 0013 §Consequences residual). Other runtimes
+  // keep today's serial paths via the runtime gate, so they get no copy.
+  if (runtime === 'claude') {
+    const workflowsSrc = path.join(src, 'dynamic-workflows');
+    if (fs.existsSync(workflowsSrc)) {
+      const workflowsDest = path.join(targetDir, 'workflows');
+      fs.mkdirSync(workflowsDest, { recursive: true });
+      const workflowEntries = fs.readdirSync(workflowsSrc).filter(f => f.endsWith('.js'));
+      for (const file of workflowEntries) {
+        fs.copyFileSync(path.join(workflowsSrc, file), path.join(workflowsDest, file));
+      }
+      if (workflowEntries.length > 0 && verifyInstalled(workflowsDest, 'workflows')) {
+        console.log(`  ${green}✓${reset} Installed ${workflowEntries.length} dynamic workflow(s) to workflows/`);
+      } else if (workflowEntries.length > 0) {
+        failures.push('workflows');
+      }
     }
   }
 
