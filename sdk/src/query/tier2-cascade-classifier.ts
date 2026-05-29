@@ -133,8 +133,17 @@ async function commitTouchedPaths(projectDir: string, commit: string): Promise<s
  *      files with the UNION of that predecessor's commits' touched paths
  *      (diff-tree). A git failure diffing any candidate's commit →
  *      cannot-classify. (A CERTAIN empty implicated set → no-cascade.)
- *   6. attributable set non-empty → revert-confident (cascade set, reverse
- *      promotion order). Empty → no-cascade-confident.
+ *   6. SINGLE-PREDECESSOR CAP (ADR 0013 option 4, chunk 4): exactly ONE
+ *      attributable predecessor → revert-confident (cascade set of one, reverse
+ *      promotion order). TWO OR MORE attributable predecessors → cannot-classify
+ *      (HALT, human review required): a multi-predecessor unwind is exactly the
+ *      case a human should review, and unwinding it unattended is unsafe —
+ *      reverting phase M leaves uncommitted ROADMAP/REQ/STATE mutations, so phase
+ *      M-1's revert (which touches its own planning-doc commit) would hit a dirty
+ *      tree. The conservative posture (attributable-only, else HALT) treats a
+ *      multi-predecessor cascade as halt-worthy. Empty attributable set →
+ *      no-cascade-confident. The cascadeRollbackTier2 loop is intentionally NOT
+ *      removed — it stays single-phase-tested and available if policy loosens.
  */
 export async function classifyCascade(
   input: ClassifyCascadeInput,
@@ -271,7 +280,21 @@ export async function classifyCascade(
     };
   }
 
-  // ── 6. revert-confident: order the cascade set in REVERSE promotion order ──
+  // ── 6a. SINGLE-PREDECESSOR CAP (chunk 4) ──
+  // An autonomous Tier-2 cascade is capped at ONE attributable predecessor. With
+  // ≥2, reverting phase M leaves uncommitted ROADMAP/REQ/STATE mutations that
+  // would make phase M-1's revert hit a dirty tree → conflict. A multi-predecessor
+  // unwind is exactly what a human should review, so HALT (cannot-classify) rather
+  // than attempt it unattended.
+  if (attributable.length > 1) {
+    return {
+      verdict: 'cannot-classify',
+      cascadeSet: [],
+      reason: `multi-predecessor cascade (${attributable.length} attributable depends_on-linked predecessors) — human review required`,
+    };
+  }
+
+  // ── 6b. revert-confident: order the cascade set in REVERSE promotion order ──
   // (newest-promoted first) — the order rollbackTier2 reverts them in, so a
   // later phase's revert lands before the earlier phase it sat on top of.
   const promotedAtByPhase = new Map<string, string>();

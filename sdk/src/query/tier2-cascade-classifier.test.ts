@@ -105,9 +105,11 @@ describe('classifyCascade — ATTRIBUTABLE-ONLY else HALT', () => {
     }
   });
 
-  it('cascade set ordered REVERSE promotion order (newest-promoted first)', async () => {
-    // 3 depends_on 1 and 2; both attributable. Promotion order 1 then 2, so the
-    // cascade set must be [2,1].
+  it('SINGLE-PREDECESSOR CAP (chunk 4): TWO attributable predecessors → cannot-classify, NOT a 2-element cascade', async () => {
+    // 3 depends_on 1 and 2; BOTH are file-attributable to the implicated files.
+    // Pre-chunk-4 this returned revert-confident with cascadeSet [2,1]. The cap
+    // now treats a multi-predecessor unwind as halt-worthy: cannot-classify,
+    // EMPTY cascade set (a human reviews multi-predecessor cascades).
     const { dir, manifest } = await repoWithPhases([
       { phase: '1', files: ['one.ts'], dependsOn: [] },
       { phase: '2', files: ['two.ts'], dependsOn: ['1'] },
@@ -119,8 +121,9 @@ describe('classifyCascade — ATTRIBUTABLE-ONLY else HALT', () => {
         manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['1', '2'], commits: [] } as PhaseManifestEntry },
         implicatedFiles: ['one.ts', 'two.ts'],
       });
-      expect(res.verdict).toBe('revert-confident');
-      expect(res.cascadeSet).toEqual(['2', '1']);
+      expect(res.verdict).toBe('cannot-classify');
+      expect(res.cascadeSet).toEqual([]); // NOT ['2','1'] — never auto-cascade ≥2.
+      expect(res.reason).toMatch(/multi-predecessor/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
