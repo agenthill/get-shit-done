@@ -483,6 +483,10 @@ export class PhaseRunner {
     // reads it from the result to run Tier-1 rollback. Stays undefined on green
     // and on the no-op (shared-cwd) path.
     let rollbackContext: PhaseRollbackContext | undefined;
+    // R4 (GH-1): set when a promote moved protected then failed post-merge and the
+    // runner recovered IN-PLACE (reset protected to LAST_GOOD, integration branch
+    // preserved). Signals the driver to HALT for recovery WITHOUT Tier-1.
+    let promoteRecoveryHalt: PhaseRunnerResult['promoteRecoveryHalt'];
     if (this.phaseIntegration?.phaseNumber === phaseNumber) {
       if (phaseGreen) {
         // Snapshot the context + LAST_GOOD before promote so a failed promote can
@@ -490,51 +494,103 @@ export class PhaseRunner {
         const ctx = this.phaseIntegration;
         let promoteFailed = false;
         let promoteFailDetail = '';
+        let promoteThrew = false;
+        // Protected's sha IMMEDIATELY before promote. R4 detects whether THIS
+        // promote's `merge --no-ff` moved protected by comparing after-vs-before —
+        // NOT after-vs-LAST_GOOD: protected may legitimately differ from LAST_GOOD
+        // (a concurrent commit), and only a change caused by this promote means the
+        // merge landed and a post-merge step then threw.
+        const protectedBeforePromote = await this.revParseOrEmpty(ctx.protectedBranch);
         try {
           await this.promotePhaseOnGreen(phaseNumber);
-          // GROUP-G fix: ctx.manager.promote() does `git merge --no-ff` with no
-          // internal try/catch — a merge conflict throws and used to be caught +
-          // logged while the phase STILL reported success=true, advancing the
-          // driver with protected NEVER moved and work stranded on the integration
-          // branch. After a "successful" promote, ASSERT protected actually moved
-          // off LAST_GOOD; if it did not, the promote silently no-op'd and the
-          // phase is NOT green.
+          // GROUP-G: ctx.manager.promote() does `git merge --no-ff` — a merge that
+          // produces a commit moves protected off LAST_GOOD. After a "successful"
+          // promote, verify protected actually moved.
           const protectedSha = (
             await execFileAsync('git', ['rev-parse', ctx.protectedBranch], { cwd: this.projectDir })
           ).stdout.trim();
           if (protectedSha === ctx.lastGoodSha) {
-            promoteFailed = true;
-            promoteFailDetail = `promote did not move protected ${ctx.protectedBranch} off LAST_GOOD ${ctx.lastGoodSha}`;
+            // R5 (GH-3): protected == LAST_GOOD after a SUCCESS promote is only a
+            // failure when the integration branch actually carried commits beyond
+            // LAST_GOOD (then the merge silently no-op'd / a conflict was caught).
+            // A green phase whose integration branch has ZERO net commits beyond
+            // LAST_GOOD (`git merge --no-ff` reports "Already up to date", makes no
+            // commit) is a genuinely-vacuous green phase that promotes
+            // successfully — protected at LAST_GOOD is the CORRECT promoted state,
+            // not a failure. Only count >0-delta integration branches as failed.
+            const intDelta = await this.countCommitsBeyond(ctx.lastGoodSha, ctx.integrationBranch);
+            if (intDelta > 0) {
+              promoteFailed = true;
+              promoteFailDetail = `promote did not move protected ${ctx.protectedBranch} off LAST_GOOD ${ctx.lastGoodSha} despite ${intDelta} integration commit(s)`;
+            }
+            // intDelta === 0 → vacuous green phase, promote succeeds (no-op).
           }
         } catch (err) {
-          // A promote failure (e.g. a `merge --no-ff` conflict) must NOT be
-          // reported as a green phase. Protected is left at LAST_GOOD (atomic
-          // merge — either fully promoted or untouched).
+          // A promote failure must NOT be reported as a green phase.
           promoteFailed = true;
+          promoteThrew = true;
           promoteFailDetail = err instanceof Error ? err.message : String(err);
         }
         if (promoteFailed) {
-          this.logger?.warn(
-            `Phase ${phaseNumber} promote-on-green failed (protected left at LAST_GOOD): ${promoteFailDetail}`,
-          );
-          // Fail the phase: add a failed step so success=false (the driver does
-          // not advance). Capture rollback context (the driver runs Tier-1 to
-          // tear down the integration branch + restore docs) and KEEP
-          // this.phaseIntegration so the integration branch survives for recovery
-          // until the driver acts.
-          steps.push({
-            step: PhaseStepType.Execute,
-            success: false,
-            durationMs: 0,
-            error: `promote-on-green failed: ${promoteFailDetail}`,
-          });
-          rollbackContext = {
-            phaseNumber: ctx.phaseNumber,
-            protectedBranch: ctx.protectedBranch,
-            lastGoodSha: ctx.lastGoodSha,
-            snapshotDir: checkpointDirFor(this.projectDir, phaseNumber),
-            integrationBranch: ctx.integrationBranch,
-          };
+          // R4 (GH-1): distinguish whether THIS promote's `merge --no-ff` ALREADY
+          // moved protected. A guard-suite failure or a manifest-write failure
+          // throws AFTER the merge commit landed, so protected ADVANCED past where
+          // it was just before this promote. Running Tier-1 there would delete the
+          // integration branch then assert protected === LAST_GOOD and THROW —
+          // leaving protected advanced, the work unrecoverable, and an uncaught
+          // exception. Compare protected NOW against its pre-promote sha (not
+          // LAST_GOOD — a concurrent commit can move protected legitimately without
+          // this promote landing).
+          const protectedShaNow = await this.revParseOrEmpty(ctx.protectedBranch);
+          const protectedMoved =
+            protectedShaNow !== '' &&
+            protectedBeforePromote !== '' &&
+            protectedShaNow !== protectedBeforePromote;
+          if (promoteThrew && protectedMoved) {
+            // Recover a CLEAN, consistent, HALTED state IN-PLACE: reset protected
+            // back to its pre-promote sha (= LAST_GOOD in the single-writer
+            // autonomous flow — the merge is undone, whether the guard caught a bad
+            // delta or the manifest write failed), leave a clean tree, and PRESERVE
+            // the integration branch so the work is recoverable. Do NOT capture a
+            // Tier-1 rollbackContext (its branch-delete + LAST_GOOD assert would
+            // destroy the work / throw); signal the driver to HALT for recovery.
+            await this.resetProtectedToLastGood(ctx.protectedBranch, protectedBeforePromote);
+            this.logger?.warn(
+              `Phase ${phaseNumber} promote moved protected then failed post-merge — reset protected to ${protectedBeforePromote}, integration branch ${ctx.integrationBranch} preserved for recovery: ${promoteFailDetail}`,
+            );
+            steps.push({
+              step: PhaseStepType.Execute,
+              success: false,
+              durationMs: 0,
+              error: `promote-on-green failed after protected moved (recovered, halt for review): ${promoteFailDetail}`,
+            });
+            promoteRecoveryHalt = {
+              detail: promoteFailDetail,
+              integrationBranch: ctx.integrationBranch,
+            };
+            // KEEP this.phaseIntegration null'd so a subsequent run forks a fresh
+            // checkpoint; the integration branch ref itself survives on disk.
+            this.phaseIntegration = null;
+          } else {
+            // Protected still at LAST_GOOD (pre-merge failure, caught conflict, or
+            // a no-op with integration commits): the normal Tier-1 path is valid.
+            this.logger?.warn(
+              `Phase ${phaseNumber} promote-on-green failed (protected left at LAST_GOOD): ${promoteFailDetail}`,
+            );
+            steps.push({
+              step: PhaseStepType.Execute,
+              success: false,
+              durationMs: 0,
+              error: `promote-on-green failed: ${promoteFailDetail}`,
+            });
+            rollbackContext = {
+              phaseNumber: ctx.phaseNumber,
+              protectedBranch: ctx.protectedBranch,
+              lastGoodSha: ctx.lastGoodSha,
+              snapshotDir: checkpointDirFor(this.projectDir, phaseNumber),
+              integrationBranch: ctx.integrationBranch,
+            };
+          }
         }
       } else {
         // Not green: protected stays at LAST_GOOD. Capture the checkpoint
@@ -560,13 +616,15 @@ export class PhaseRunner {
     // GROUP-G fix): advancing would mark the ROADMAP complete for work that never
     // reached protected. (rollbackContext is only set under the isolated engine;
     // the no-op shared-cwd path leaves it undefined and advances as before.)
-    if (!halted && verifyPassed && !rollbackContext) {
+    if (!halted && verifyPassed && !rollbackContext && !promoteRecoveryHalt) {
       const advanceResult = await this.runAdvanceStep(phaseNumber, sessionOpts, callbacks);
       steps.push(advanceResult);
     } else if (!halted && !verifyPassed) {
       this.logger?.warn(`Skipping advance for phase ${phaseNumber}: verification found gaps`);
     } else if (!halted && rollbackContext) {
       this.logger?.warn(`Skipping advance for phase ${phaseNumber}: promote-on-green failed (protected at LAST_GOOD)`);
+    } else if (!halted && promoteRecoveryHalt) {
+      this.logger?.warn(`Skipping advance for phase ${phaseNumber}: promote moved protected then failed (recovered to LAST_GOOD; halt for recovery)`);
     }
 
     const totalDurationMs = Date.now() - startTime;
@@ -597,6 +655,7 @@ export class PhaseRunner {
       totalCostUsd,
       totalDurationMs,
       ...(rollbackContext && { rollbackContext }),
+      ...(promoteRecoveryHalt && { promoteRecoveryHalt }),
     };
   }
 
@@ -1417,6 +1476,55 @@ export class PhaseRunner {
     }
 
     this.phaseIntegration = null;
+  }
+
+  /**
+   * `git rev-parse <ref>` trimmed, or '' on any git error (R4). Used to read
+   * protected's sha when deciding whether a failed promote already moved it.
+   */
+  private async revParseOrEmpty(ref: string): Promise<string> {
+    try {
+      return (await execFileAsync('git', ['rev-parse', ref], { cwd: this.projectDir })).stdout.trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Count commits on `ref` beyond `baseSha` (`git rev-list baseSha..ref`) (R5).
+   * 0 when ref has no net commits past LAST_GOOD (a vacuous green phase whose
+   * `merge --no-ff` is a no-op). Returns 0 on any git error (a missing ref
+   * cannot have contributed commits — treated as the no-op case).
+   */
+  private async countCommitsBeyond(baseSha: string, ref: string): Promise<number> {
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['rev-list', '--count', `${baseSha}..${ref}`],
+        { cwd: this.projectDir },
+      );
+      const n = Number.parseInt(stdout.trim(), 10);
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Recover protected to LAST_GOOD after a promote moved it then failed
+   * post-merge (R4 / GH-1). Checkout protected, hard-reset it to LAST_GOOD (undo
+   * the merge commit), and clean any residue so the tree is consistent. The
+   * integration branch is deliberately LEFT in place for recovery. Best-effort
+   * per step (this runs in a failure path); the caller signals a HALT regardless.
+   */
+  private async resetProtectedToLastGood(protectedBranch: string, lastGoodSha: string): Promise<void> {
+    const git = (args: string[]) =>
+      execFileAsync('git', args, { cwd: this.projectDir }).catch(() => undefined);
+    // Abort any in-flight merge/revert state first so the reset is unobstructed.
+    await git(['merge', '--abort']);
+    await git(['checkout', protectedBranch]);
+    await git(['reset', '--hard', lastGoodSha]);
+    await git(['clean', '-fd']);
   }
 
   /**

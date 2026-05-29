@@ -342,6 +342,122 @@ describe('(D) GROUP-G: a promote-time merge conflict fails the phase (no false s
   });
 });
 
+// ─── (E) R4/GH-1: promote moved protected then failed post-merge → recover ────
+
+describe('(E) R4/GH-1: a promote that MOVED protected then failed post-merge recovers cleanly (no uncaught throw, no dirty tree)', () => {
+  beforeEach(() => mockSession.mockReset());
+
+  it('manifest-write failure AFTER the merge moved protected → protected reset to LAST_GOOD, integration branch preserved, success=false, promoteRecoveryHalt set, clean tree', async () => {
+    // Reproduces-then-kills GH-1 (moved-protected promote failure): the GROUP-H
+    // fix makes recordPhasePromotion THROW on a manifest-write failure AFTER
+    // ctx.manager.promote() ran `git merge --no-ff` (protected ALREADY MOVED).
+    // The prior GROUP-G catch captured a Tier-1 rollbackContext and the driver
+    // ran rollbackTier1 → deletes the integration branch then asserts protected
+    // === LAST_GOOD and THROWS (protected moved) → protected left ADVANCED,
+    // integration branch DELETED (work unrecoverable), uncaught throw. R4 detects
+    // protected moved, resets it to LAST_GOOD in-place, preserves the integration
+    // branch, and signals a recovery HALT instead of Tier-1.
+    const { dir, baseSha } = await initRepo();
+    try {
+      mockSession.mockImplementation(async (_p, step, _c, opts: any, _es, ctx: any) => {
+        if (step !== PhaseStepType.Execute) return okResult();
+        await commitMarker(opts.cwd as string, ctx.planName as string);
+        return okResult();
+      });
+      const config = makeConfig({ git: { ...CONFIG_DEFAULTS.git, sdk_test_command: 'node -e process.exit(0)' } } as Partial<GSDConfig>);
+      const factory = await buildGitExecutionEngineFactory(config, dir);
+
+      // Force recordPhasePromotion's writeFile to fail AFTER the merge: make the
+      // manifest PATH a directory (writeFile → EISDIR) so the merge has already
+      // moved protected when the manifest write throws.
+      await mkdir(join(dir, '.planning', '.phase-manifest.json'), { recursive: true });
+
+      const { deps } = makeDeps([planInfo({ id: 'A' })], { projectDir: dir, config, executionEngineFactory: factory });
+      // THE end-state property: no uncaught exception escapes run().
+      let result: Awaited<ReturnType<PhaseRunner['run']>> | undefined;
+      let threw: unknown;
+      try {
+        result = await new PhaseRunner(deps).run('1');
+      } catch (e) {
+        threw = e;
+      }
+      expect(threw, `run() must not throw — it recovered in-place. Got: ${threw}`).toBeUndefined();
+      expect(result).toBeDefined();
+
+      // success=false; the recovery-halt signal is set (NOT a Tier-1 rollbackContext).
+      expect(result!.success).toBe(false);
+      expect(result!.promoteRecoveryHalt).toBeDefined();
+      expect(result!.promoteRecoveryHalt!.integrationBranch).toBe('gsd-phase-1-int');
+      expect(result!.rollbackContext).toBeUndefined();
+
+      // Protected reset to a CONSISTENT known state: LAST_GOOD (the merge undone).
+      const mainSha = (await gitIn(dir)(['rev-parse', 'main'])).stdout.trim();
+      expect(mainSha).toBe(baseSha);
+      const mainSubjects = await logSubjects(dir, 'main');
+      expect(mainSubjects).not.toContain('A');
+
+      // Integration branch PRESERVED for recovery (work recoverable).
+      expect(await refExists(dir, 'gsd-phase-1-int')).toBe(true);
+      expect(await logSubjects(dir, 'gsd-phase-1-int')).toContain('A');
+
+      // Clean tree: no porcelain changes, no in-flight merge.
+      const porcelain = (await gitIn(dir)(['status', '--porcelain'])).stdout.trim();
+      expect(porcelain).toBe('');
+      expect(existsSync(join(dir, '.git', 'MERGE_HEAD'))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── (F) R5/GH-3: a zero-delta green phase promotes successfully ──────────────
+
+describe('(F) R5/GH-3: a green phase with NO commits beyond LAST_GOOD promotes successfully (no false-positive)', () => {
+  beforeEach(() => mockSession.mockReset());
+
+  it('a vacuous green phase (integration branch == LAST_GOOD) advances; not a promote failure', async () => {
+    // Reproduces-then-kills GH-3 (success-path assert false-positive): a `merge
+    // --no-ff` of an integration branch with ZERO net commits beyond LAST_GOOD
+    // reports "Already up to date", creates no commit, leaves protected ==
+    // LAST_GOOD — a genuinely-green vacuous phase. The prior assert treated
+    // protected == LAST_GOOD as a failure → rollback + retries + HALT. R5 only
+    // treats it as a failure when the integration branch had commits beyond
+    // LAST_GOOD, so a zero-delta phase promotes successfully.
+    const { dir, baseSha } = await initRepo();
+    try {
+      // Executor does NO commit (the plan produced no net change) → integration
+      // branch stays at LAST_GOOD, the promote merge is a no-op.
+      mockSession.mockImplementation(async (_p, step) => {
+        if (step !== PhaseStepType.Execute) return okResult();
+        return okResult(); // no commitMarker → zero delta
+      });
+      const config = makeConfig({ git: { ...CONFIG_DEFAULTS.git, sdk_test_command: 'node -e process.exit(0)' } } as Partial<GSDConfig>);
+      const factory = await buildGitExecutionEngineFactory(config, dir);
+
+      const { deps } = makeDeps([planInfo({ id: 'A' })], { projectDir: dir, config, executionEngineFactory: factory });
+      const result = await new PhaseRunner(deps).run('1');
+
+      // The phase is SUCCESS — a zero-delta green phase promotes (no-op) cleanly.
+      expect(result.success).toBe(true);
+      const promoteFail = result.steps.find(s => !s.success && (s.error ?? '').includes('promote'));
+      expect(promoteFail, 'no promote failure step for a vacuous green phase').toBeUndefined();
+      expect(result.rollbackContext).toBeUndefined();
+      expect(result.promoteRecoveryHalt).toBeUndefined();
+
+      // Protected is still at LAST_GOOD (nothing to merge) — the correct promoted
+      // state for a zero-delta phase.
+      const mainSha = (await gitIn(dir)(['rev-parse', 'main'])).stdout.trim();
+      expect(mainSha).toBe(baseSha);
+
+      // An advance step ran (the phase advanced, not rolled back).
+      const advance = result.steps.find(s => s.step === PhaseStepType.Advance);
+      expect(advance?.success).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── (C) Gate-off parity (PR #8 behaviour preserved) ─────────────────────────
 
 describe('(C) gate-off parity — no integration branch / tags / checkpoint dir', () => {

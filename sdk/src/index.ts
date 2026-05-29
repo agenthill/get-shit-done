@@ -409,6 +409,30 @@ export class GSD {
         return { result, halted: false };
       }
 
+      // R4 (GH-1): a promote that MOVED protected then failed post-merge (guard-
+      // suite / manifest-write failure). The phase-runner ALREADY recovered a
+      // clean, consistent state (protected reset to LAST_GOOD, integration branch
+      // preserved). Do NOT run Tier-1 (its branch-delete + LAST_GOOD assert would
+      // destroy the recoverable work and throw on the moved tree). HALT directly
+      // for recovery: clear any transient signal, persist a halted ledger, stop.
+      if (result.promoteRecoveryHalt) {
+        await stateSignalResume([], this.projectDir, this.workstream);
+        await writeRollbackLedger(this.projectDir, {
+          failed_phase: phase.number,
+          attempt_count: attempt,
+          failure_context: [
+            ...failureContext,
+            {
+              attempt,
+              signal: 'gate',
+              detail: `promote moved protected then failed post-merge — recovered to LAST_GOOD, integration branch ${result.promoteRecoveryHalt.integrationBranch} preserved; recovery required: ${result.promoteRecoveryHalt.detail}`,
+            },
+          ],
+          status: 'halted',
+        });
+        return { result, halted: true };
+      }
+
       // Classify the failure: transient/quota vs genuine.
       const { signal, detail } = this.classifyPhaseFailure(result, threw);
       // GROUP-C fix: a quota sentinel is only trusted as transient when it comes

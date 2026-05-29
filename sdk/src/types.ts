@@ -955,6 +955,19 @@ export interface PhaseRunnerResult {
    * no-op (shared-cwd) path.
    */
   rollbackContext?: PhaseRollbackContext;
+  /**
+   * Set (R4 / GH-1) when a promote FAILED AFTER `merge --no-ff` had already
+   * moved protected off LAST_GOOD (a guard-suite failure or a manifest-write
+   * failure post-merge). The phase-runner has ALREADY recovered a consistent,
+   * clean state — protected reset to LAST_GOOD, integration branch PRESERVED for
+   * recovery — so the driver must NOT run Tier-1 rollback (its branch-delete +
+   * `protected === LAST_GOOD` assert would delete the recoverable work and, on
+   * the moved tree, throw). The driver HALTs (recovery required), writing a
+   * halted ledger, WITHOUT a retry. Carries the recovery detail for the ledger.
+   * Mutually exclusive with rollbackContext (the protected-still-at-LAST_GOOD
+   * case keeps the normal Tier-1 path).
+   */
+  promoteRecoveryHalt?: { detail: string; integrationBranch: string };
 }
 
 /**
