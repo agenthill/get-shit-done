@@ -10,9 +10,9 @@
  *       protected, phase 1 untouched) and HALTs with ROLLBACK.json tier:2.
  *   (b) cannot-classify: a throw with no parseable implicated files → HALT
  *       clean with tier:2, NO cascade (never guess).
- *   (c) no-cascade-confident: failure in a brand-new file, no promoted
- *       predecessor attributable → fall through to chunk-2's informed retry
- *       (Tier-1 only), NO Tier-2 ledger tier.
+ *   (c) no-cascade-confident: NO promoted predecessor in the failing phase's
+ *       depends_on closure → fall through to chunk-2's informed retry (Tier-1
+ *       only), NO Tier-2 ledger tier.
  */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
@@ -249,9 +249,26 @@ describe('Tier-2 loop wiring — (b) cannot-classify HALTs clean', () => {
 });
 
 describe('Tier-2 loop wiring — (c) no-cascade-confident falls through to informed retry', () => {
-  it('a failure in a brand-new file (no attributable predecessor) does Tier-1 only and retries; no Tier-2 ledger', async () => {
+  it('a failure with NO promoted predecessor in the closure does Tier-1 only and retries; no Tier-2 ledger', async () => {
     const { dir, lastGoodSha, rollbackContext } = await setupRepoWithPromotedPredecessors();
     try {
+      // Make phase 3 depend on NOTHING promoted: with no promoted predecessor in
+      // its depends_on closure, the classifier is confidently no-cascade and the
+      // driver falls through to the informed-retry loop. (A failure whose
+      // implicated files are present-but-unmatchable WHILE a promoted candidate
+      // exists is now cannot-classify, not no-cascade — the GROUP-D #2983 fix —
+      // so this falls-through case is exercised via the no-candidate path, the
+      // genuine confident-negative.)
+      const roadmapPath = join(dir, '.planning', 'ROADMAP.md');
+      const roadmap = await readFile(roadmapPath, 'utf-8');
+      await writeFile(
+        roadmapPath,
+        roadmap.replace(
+          '### Phase 3: Ship\n**Requirements:** REQ-03\n**Depends on:** Phase 2',
+          '### Phase 3: Ship\n**Requirements:** REQ-03\n**Depends on:** None',
+        ),
+      );
+
       const gsd = new GSD({ projectDir: dir });
       vi.spyOn(gsd, 'createTools').mockReturnValue({
         roadmapAnalyze: vi.fn().mockResolvedValue(phase3Info()),
@@ -270,7 +287,8 @@ describe('Tier-2 loop wiring — (c) no-cascade-confident falls through to infor
         await writeFile(join(dir, 'phase3.ts'), `try ${attemptNo}\n`);
         await git(['add', '-A']); await git(['commit', '-q', '--no-verify', '-m', `phase 3 work ${attemptNo}`]);
         await git(['checkout', '-q', 'main']);
-        // Break is in a brand-new phase-3 file — NOT attributable to phase 2.
+        // Phase 3 declares no promoted dependency → no cascade candidate → the
+        // classifier is confidently no-cascade regardless of the implicated file.
         return failResult(rollbackContext, 'gate failed: error in phase3-new-module.ts', 'gate');
       }) as never);
 

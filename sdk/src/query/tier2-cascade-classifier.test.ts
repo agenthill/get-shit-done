@@ -129,7 +129,11 @@ describe('classifyCascade — ATTRIBUTABLE-ONLY else HALT', () => {
     }
   });
 
-  it('no-cascade-confident: depends_on-linked predecessor exists but is NOT file-attributable', async () => {
+  it('cannot-classify (GROUP-D): implicated files PRESENT but unmatchable to ANY predecessor while a candidate exists → HALT, never silent no-cascade', async () => {
+    // Phase 3 depends_on 2 (a promoted candidate). The implicated file is a
+    // brand-new file phase 2 never touched — an inability to attribute, not a
+    // confident negative. Pre-GROUP-D this silently downgraded to no-cascade
+    // (the #2983 footgun: a genuine cascade skipped). Post-fix it HALTs.
     const { dir, manifest } = await repoWithPhases([
       { phase: '1', files: ['a.ts'], dependsOn: [] },
       { phase: '2', files: ['b.ts'], dependsOn: ['1'] },
@@ -142,8 +146,72 @@ describe('classifyCascade — ATTRIBUTABLE-ONLY else HALT', () => {
         // Break is in a brand-new file phase 2 never touched.
         implicatedFiles: ['phase3-new.ts'],
       });
-      expect(res.verdict).toBe('no-cascade-confident');
+      expect(res.verdict).toBe('cannot-classify');
       expect(res.cascadeSet).toEqual([]);
+      expect(res.reason).toMatch(/no implicated path matched/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('GROUP-D: implicated files given as ABSOLUTE paths and BARE basenames of a predecessor\'s file → revert-confident (robust match)', async () => {
+    // Reproduces-then-kills implicated-files-format-mismatch-silent-no-cascade:
+    // real failure details carry absolute stack-trace paths and bare basenames
+    // that never EXACTLY equal a repo-relative diff-tree path. Pre-fix these
+    // produced zero attribution → no-cascade-confident, silently skipping a
+    // needed cascade. Post-fix the matcher relativizes absolutes + matches
+    // basenames → revert-confident.
+    const { dir, manifest } = await repoWithPhases([
+      { phase: '1', files: ['lib/a.ts'], dependsOn: [] },
+      { phase: '2', files: ['src/feature.ts'], dependsOn: ['1'] },
+    ]);
+    try {
+      // Absolute path form (a stack-trace line) for the phase-2 file.
+      const absRes = await classifyCascade({
+        projectDir: dir,
+        failingPhase: '3',
+        manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry },
+        implicatedFiles: [`${dir}/src/feature.ts`],
+      });
+      expect(absRes.verdict).toBe('revert-confident');
+      expect(absRes.cascadeSet).toEqual(['2']);
+
+      // Bare-basename form ("feature.ts" with no directory).
+      const baseRes = await classifyCascade({
+        projectDir: dir,
+        failingPhase: '3',
+        manifest: { ...manifest, '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry },
+        implicatedFiles: ['feature.ts'],
+      });
+      expect(baseRes.verdict).toBe('revert-confident');
+      expect(baseRes.cascadeSet).toEqual(['2']);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('GROUP-J: a manifest with duplicate canonical keys (\'2\' and \'02\') → cannot-classify (no dropped predecessor commits)', async () => {
+    // Reproduces-then-kills dup-canonical-manifest-key-drops-predecessor-commits:
+    // '2' and '02' canonicalize identically, so the canonical maps collapse and
+    // one entry's commits silently drop from attribution. Fail closed instead.
+    const { dir, manifest } = await repoWithPhases([
+      { phase: '1', files: ['a.ts'], dependsOn: [] },
+      { phase: '2', files: ['b.ts'], dependsOn: ['1'] },
+    ]);
+    try {
+      const res = await classifyCascade({
+        projectDir: dir,
+        failingPhase: '3',
+        // Inject a duplicate canonical key '02' alongside '2'.
+        manifest: {
+          ...manifest,
+          '02': { ...manifest['2']! } as PhaseManifestEntry,
+          '3': { ...manifest['2']!, depends_on: ['2'], commits: [] } as PhaseManifestEntry,
+        },
+        implicatedFiles: ['b.ts'],
+      });
+      expect(res.verdict).toBe('cannot-classify');
+      expect(res.reason).toMatch(/duplicate phase entries for canonical 2/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -129,10 +129,16 @@ async function commitTouchedPaths(projectDir: string, commit: string): Promise<s
  *      file uncertainty, since there is no live cascade decision).
  *   4. Implicated files uncertain WHILE a cascade candidate exists →
  *      cannot-classify (cannot attribute → refuse to guess).
- *   5. For each linked promoted predecessor, intersect the failure's implicated
- *      files with the UNION of that predecessor's commits' touched paths
- *      (diff-tree). A git failure diffing any candidate's commit →
- *      cannot-classify. (A CERTAIN empty implicated set → no-cascade.)
+ *   5. For each linked promoted predecessor, match the failure's implicated
+ *      files against the UNION of that predecessor's commits' touched paths
+ *      (diff-tree) robustly — exact repo-relative equality, an absolute
+ *      implicated path relativized against projectDir, or basename/suffix match
+ *      (GROUP-D #2983 fix: real failure details carry absolute stack-trace paths
+ *      and bare basenames that never EXACTLY equal a repo-relative path). A git
+ *      failure diffing any candidate's commit → cannot-classify. A CERTAIN empty
+ *      implicated set → no-cascade. A present-but-UNMATCHABLE implicated set
+ *      while a candidate exists → cannot-classify (an inability to attribute is
+ *      not a confident negative — the #2983 rule).
  *   6. SINGLE-PREDECESSOR CAP (ADR 0013 option 4, chunk 4): exactly ONE
  *      attributable predecessor → revert-confident (cascade set of one, reverse
  *      promotion order). TWO OR MORE attributable predecessors → cannot-classify
@@ -163,6 +169,27 @@ export async function classifyCascade(
         reason: `manifest entry for phase ${key} is structurally invalid`,
       };
     }
+  }
+
+  // ── 1b. DUPLICATE canonical phase keys (GROUP-J fix) ──
+  // `promoted` + `keyByCanonical` below both key on canonicalizePhaseId(k), so
+  // two manifest keys that canonicalize identically ('2' and '02') would COLLAPSE
+  // — one entry's commits silently dropped from attribution, under-reaching the
+  // cascade. A manifest with duplicate canonical phase keys cannot be scoped
+  // reliably; fail closed to cannot-classify (consistent with the corrupt-manifest
+  // posture), never silently drop a predecessor's commits.
+  const canonSeen = new Map<string, string>();
+  for (const [key] of entries) {
+    const canon = canonicalizePhaseId(key) || key;
+    const prior = canonSeen.get(canon);
+    if (prior !== undefined && prior !== key) {
+      return {
+        verdict: 'cannot-classify',
+        cascadeSet: [],
+        reason: `manifest has duplicate phase entries for canonical ${canon} ('${prior}' and '${key}') — cannot scope attribution`,
+      };
+    }
+    canonSeen.set(canon, key);
   }
 
   // ── 2. PHASE-TIER cycle check ──
@@ -228,18 +255,47 @@ export async function classifyCascade(
   }
 
   // ── 5. File attribution per linked promoted predecessor ──
-  const implicated = new Set(implicatedFiles.map(f => f.replace(/\\/g, '/')));
+  // Normalize implicated tokens to forward slashes. Real failure details carry
+  // paths in shapes that never EXACTLY equal a predecessor's repo-relative
+  // diff-tree path (GROUP-D #2983 footgun): absolute stack-trace paths
+  // ("/home/u/proj/lib/a.js"), bare basenames ("foo.ts"), and `./`-prefixed
+  // tokens. Matching must be robust to all of them, or an attributable cascade
+  // is silently downgraded to no-cascade.
+  const implicated = implicatedFiles.map(f => f.replace(/\\/g, '/').replace(/^\.\//, ''));
   // No implicated files at all → nothing to attribute → no-cascade (NOT
   // cannot-classify: an EMPTY implicated set is a confident negative, the way
   // diff-touches-shipped-paths exit-1 is a confident "no shipped paths"; only an
   // UNCERTAIN set (step 3) is cannot-classify).
-  if (implicated.size === 0) {
+  if (implicated.length === 0) {
     return {
       verdict: 'no-cascade-confident',
       cascadeSet: [],
       reason: 'no implicated files — failure not attributable to any predecessor',
     };
   }
+
+  const projectDirNorm = projectDir.replace(/\\/g, '/').replace(/\/+$/, '');
+  /**
+   * True when an implicated token matches a predecessor's repo-relative touched
+   * path by ANY of: (a) exact equality; (b) the implicated token relativized
+   * against projectDir equals the touched path; (c) basename/suffix match — the
+   * touched path ends with `/<implicated>` or their basenames are equal. (a)/(b)
+   * are exact; (c) is a deliberate widening so a bare basename or absolute path
+   * still attributes. */
+  const matches = (impl: string, touched: string): boolean => {
+    if (impl === touched) return true;
+    // (b) Relativize an absolute implicated path against projectDir.
+    if (impl.startsWith('/') && impl.startsWith(`${projectDirNorm}/`)) {
+      const rel = impl.slice(projectDirNorm.length + 1);
+      if (rel === touched) return true;
+    }
+    // (c) basename / suffix match.
+    if (touched.endsWith(`/${impl}`)) return true;
+    const implBase = impl.slice(impl.lastIndexOf('/') + 1);
+    const touchedBase = touched.slice(touched.lastIndexOf('/') + 1);
+    if (implBase.length > 0 && implBase === touchedBase) return true;
+    return false;
+  };
 
   // Map canonical phase → manifest key so we can pull its commits.
   const keyByCanonical = new Map<string, string>();
@@ -264,7 +320,8 @@ export async function classifyCascade(
           reason: `cannot diff commit ${commit} of phase ${phase}: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
-      if (paths.some(p => implicated.has(p.replace(/\\/g, '/')))) {
+      const touchedPaths = paths.map(p => p.replace(/\\/g, '/'));
+      if (implicated.some(impl => touchedPaths.some(tp => matches(impl, tp)))) {
         touchesImplicated = true;
         break;
       }
@@ -273,10 +330,20 @@ export async function classifyCascade(
   }
 
   if (attributable.length === 0) {
+    // GROUP-D #2983 footgun: implicated files ARE present (past the empty-set
+    // check above) and a depends_on-linked promoted CANDIDATE exists, yet NONE
+    // of the implicated tokens matched ANY predecessor's touched paths by ANY
+    // rule (exact / relativized-absolute / basename-suffix). That is an
+    // INABILITY to attribute — a present-but-unmatchable set while a candidate
+    // exists — NOT a confident no-cascade. Fail closed to cannot-classify rather
+    // than silently skip a cascade the failure might genuinely require. (The
+    // confident no-cascade verdicts live upstream: NO candidate at all (step 3),
+    // or a CERTAIN-empty implicated set (step 5 top).)
     return {
-      verdict: 'no-cascade-confident',
+      verdict: 'cannot-classify',
       cascadeSet: [],
-      reason: 'depends_on-linked predecessor(s) exist but none is file-attributable to the failure',
+      reason:
+        'implicated files are present and a depends_on-linked promoted predecessor exists, but no implicated path matched any predecessor\'s touched paths — cannot attribute, refusing to guess',
     };
   }
 
