@@ -1,6 +1,6 @@
 # ADR 0013 — Dynamic-Workflow Parallelization of GSD Execution
 
-- **Status:** Proposed (awaiting review)
+- **Status:** Accepted — reshaped after Task 0 validation (Workflow `agent()` isolation is a no-op here; execution moved to Agent-tool/SDK engines, dynamic workflows drive the read-only fan-out)
 - **Date:** 2026-05-29
 - **Scope:** `execute-phase` proof-of-concept (markdown surface + SDK surface); rollout template for the rest
 - **Related:** `references/model-profiles.md`, `workflows/execute-phase.md`, `sdk/src/phase-runner.ts`, `3524-cjs-sdk-hard-seam.md`
@@ -9,9 +9,11 @@
 
 ## TL;DR
 
-GSD's quality (`max`) mode is slow for a structural reason, not a model-choice one: execution fans out through an **LLM orchestrator reasoning turn-by-turn**, gated by **coarse wave-level barriers** that are strictly cruder than the real per-plan dependency DAG. We replace the dispatch layer with **deterministic dynamic-workflow scripts** that express the *true* `depends_on` DAG, so independent chains run concurrently and a dependent plan starts the instant its predecessor's commits exist — never at a whole-level barrier. The GSD metaframework (gates, atomic commits, `STATE.md` single-writer, verifiers, worktree safety) is **preserved unchanged**: agents are called as-is via `agentType`; only *who schedules them* changes.
+GSD's quality (`max`) mode is slow for a structural reason, not a model-choice one: work fans out through an **LLM orchestrator reasoning turn-by-turn**, gated by **coarse wave-level barriers** that are strictly cruder than the real per-plan dependency DAG, and the reasoning-heavy read-only stages run in series. We express the *true* `depends_on` DAG instead of wave-level barriers, and we move the **read-only fan-out** (verification gates, code review, codebase mapping, plan research) onto **deterministic dynamic workflows**. The GSD metaframework (gates, atomic commits, `STATE.md` single-writer, verifiers, worktree safety) is **preserved unchanged**: agents are called as-is via `agentType`/`subagent_type`; only *who schedules them* changes.
 
-The chosen protocol — **fork-off-predecessor + per-plan topological integration + per-level batched test gate** — survived an adversarial design review that killed two plausible alternatives. The proof-of-concept lands on `execute-phase` across both execution surfaces; the same pattern then templates to verification, `plan-phase`, `map-codebase`/`code-review`, and (later, with a rollback protocol) the cross-phase `autonomous` pipeline.
+**A Task 0 validation (see §"Validation findings") reshaped the engine choice.** The Workflow tool's `agent({isolation:'worktree'})` does **not** provide worktree isolation in this environment (verified: agents land in the main repo), so **file-mutating execution** runs on the engines whose isolation is verified to work — the **Agent tool** (interactive `/gsd:execute-phase`) and the **SDK** (headless, git-direct) — while **dynamic workflows drive the read-only fan-out** (no isolation needed). The split is clean: *mutates files → Agent-tool/SDK; read-only analysis → Workflow tool.*
+
+The execution protocol — **fork-off-predecessor + per-plan topological integration + per-level batched test gate** — survived an adversarial design review that killed two plausible alternatives, and its core git mechanism (sibling-reachable commits via a shared object store) is **validated** (Task 0). The proof-of-concept lands on `execute-phase` across both execution engines plus the read-only post-execution fan-out; the same pattern then templates to `plan-phase`, `map-codebase`/`code-review`, and (later, with a rollback protocol) the cross-phase `autonomous` pipeline.
 
 ## Context
 
@@ -43,37 +45,58 @@ Three constraints shape the entire design:
 - **No `AskUserQuestion`.** A workflow cannot prompt the user mid-run.
 - **Concurrency-capped and background.** It returns structured data to the orchestrator; it is not interactive.
 
+### Validation findings (Task 0)
+
+Three probes ran before any production code. Results are reproducible in this environment:
+
+| Probe | Result |
+|---|---|
+| **Commit persistence across worktrees** | ✅ A commit made in one worktree is reachable from a sibling by sha; `git reset --hard <sibling-sha>` reproduces its tree. The fork-off-predecessor git mechanism is sound. |
+| **Workflow tool `agent({isolation:'worktree'})`** | ❌ **No-op.** All three concurrent agents landed in the **main repo** on `main` (`.git` is a directory, `git-dir == git-common-dir`, `toplevel == pwd`). No per-agent worktree was created. |
+| **Agent tool `isolation:"worktree"`** | ✅ **Works.** Fresh linked worktree (`.git` is a file → `.git/worktrees/<name>`), own `worktree-agent-*` branch, `locked`. This is the path GSD's execute-phase uses today. |
+
+**Consequence:** the Workflow tool cannot drive *file-mutating* parallel agents here (they would collide on the main working tree). It remains the right tool for **read-only fan-out**, where agents read and return findings and the orchestrator owns all writes. Execution parallelism uses the Agent tool / SDK, whose isolation is verified.
+
+**Safety note:** the no-op is dangerous only when paired with an agent that lacks GSD's mandatory `<worktree_branch_check>` (invariant 5). The real `gsd-executor` fails closed — it asserts HEAD ∈ `worktree-agent-*` and FATAL-aborts rather than mutate `main` — so even under the broken isolation it degrades to "refuses to run," never to corruption. The Task 0 generic probe agent lacked that guard and required a manual recovery; production agents do not.
+
 ## Decision
 
 ### D1 — Ship versioned, named workflow scripts (not LLM-generated inline scripts)
 
-GSD ships `.claude/workflows/gsd-execute-phase-dag.js` (etc.) as **tested, version-controlled artifacts**. The slash command becomes a thin interactive shell that calls `Workflow({name, args: <resolved JSON>})`. Rejected alternative: orchestrator-generated inline scripts — nondeterministic, untestable, and they re-introduce the per-turn LLM-reasoning tax we are removing.
+GSD ships its **read-only fan-out** workflows (e.g. `.claude/workflows/gsd-verify-fanout.js`) as **tested, version-controlled artifacts**. The slash command becomes a thin interactive shell that calls `Workflow({name, args: <resolved JSON>})` for those stages, and fires Agent-tool executors directly for file-mutating execution. Rejected alternative: orchestrator-generated inline scripts — nondeterministic, untestable, and they re-introduce the per-turn LLM-reasoning tax we are removing.
 
 ### D2 — Orchestrator owns interaction + single-writer side effects; workflow owns non-interactive fan-out
 
 Every reader of every subsystem converged on this split, and the Workflow constraints force it:
 
-- **Orchestrator (the slash-command shell):** pre-flight (`gsd-sdk query`, gates, DAG build, model resolution), **all** `AskUserQuestion` interaction, **all** git merges to the protected branch, and **all** `STATE.md`/`ROADMAP.md` writes (single-writer).
-- **Workflow (background):** the non-interactive fan-out — scheduling executor agents over the true DAG — and returns a **schema-forced verdict object**.
-- **Handshake:** when the workflow hits something needing the user (stall, conflict, checkpoint, `human_needed`), it **encodes it into the verdict and returns early** — it never blocks. The orchestrator runs `AskUserQuestion` and resumes via `resumeFromRunId` (already-OK plans return cached) or a fresh workflow over the unblocked sub-DAG.
+- **Orchestrator (the slash-command shell):** pre-flight (`gsd-sdk query`, gates, DAG build, model resolution), **all** `AskUserQuestion` interaction, **all** git merges to the protected branch, **all** `STATE.md`/`ROADMAP.md` writes (single-writer), and — on the interactive surface — firing the Agent-tool-isolated **executor** agents over the true DAG (execution mutates files, so it cannot run inside a workflow here).
+- **Workflow (background):** the non-interactive **read-only fan-out** — verification gate chain, code-review dimensions, codebase mappers, plan research/checking — returning a **schema-forced verdict object**. No file mutation, so no worktree isolation is needed.
+- **Handshake:** when a workflow surfaces something needing the user (e.g. a `human_needed` verdict, a finding requiring a decision), it **encodes it into the verdict and returns** — it never blocks. The orchestrator runs `AskUserQuestion` and resumes via `resumeFromRunId` (already-OK agents return cached) or a fresh workflow over the remaining work. The same return-a-sentinel pattern applies to the execution DAG (stall/conflict/checkpoint), driven by the Agent-tool/SDK engine.
 
 ### D3 — Protocol: fork-off-predecessor + per-plan topological integration + per-level batched test gate
 
 This is the load-bearing decision; §"The DAG protocol" specifies it and §"Rejected protocols" records why the alternatives are unsound.
 
-- **Fork-off-predecessor:** a dependent plan's executor, as step 0 in its harness-created worktree, sets its base to its direct predecessor's branch tip via the executor's *existing* `git reset --hard {EXPECTED_BASE}` step (we template `EXPECTED_BASE` = predecessor `head_sha`). Worktrees share one object store, so a sibling's commit sha is reachable. Multi-predecessor (diamond) plans `git merge` the additional predecessor branches into their own `worktree-agent-*` branch (legal — they stay in their own namespace). **No mid-run merge to the protected branch; no integration branch; no orchestrator callback.**
+- **Fork-off-predecessor:** a dependent plan's executor, as step 0 in its **Agent-tool-isolated** worktree (the path validated to work in Task 0), sets its base to its direct predecessor's branch tip via the executor's *existing* `git reset --hard {EXPECTED_BASE}` step (we template `EXPECTED_BASE` = predecessor `head_sha`). Worktrees share one object store, so a sibling's commit sha is reachable (**validated**). Multi-predecessor (diamond) plans `git merge` the additional predecessor branches into their own `worktree-agent-*` branch (legal — they stay in their own namespace). **No mid-run merge to the protected branch; no integration branch; no orchestrator callback.**
 - **Per-plan topological integration:** after the workflow returns, the orchestrator (single writer) merges each plan's **own commit delta** onto the protected branch in topo order, so every existing merge guard sees a **single-plan delta** — exactly today's semantics.
 - **Per-level batched test gate:** the expensive build+test gate runs at **level boundaries**, not per plan-merge. This is the single change that determines whether the design is a net win (see §Measure of success).
 
-### D4 — Both surfaces share one spec
+### D4 — Two execution engines, one shared DAG spec
 
-The markdown surface (Workflow tool, side effects in agents) and the SDK surface (`phase-runner.ts`, git-direct TS) implement the *same* DAG/integration/gating spec. The SDK additionally gets a `Semaphore(cap)`, worktree isolation (it has none today), and a `MergeSerializer` single-writer mutex — while keeping `PhaseStepResult`'s shape byte-compatible and emitting synthetic `WaveStart`/`WaveComplete` at level boundaries so the event-stream tests stay green.
+Execution parallelism ships on the two engines whose isolation works, sharing one `depends_on`-DAG / integration / gating spec:
+
+- **Interactive markdown** (`/gsd:execute-phase`): the orchestrator fires **Agent-tool** executors with `isolation:"worktree"`, gated on the true per-plan DAG — multiple in one message (now safe; the Agent tool serializes worktree creation internally, so today's one-`Agent()`-per-message stagger is removed). This is the path the user's "max mode is slow" complaint targets.
+- **SDK headless** (`phase-runner.ts`, git-direct TS): replaces `for(waves)+Promise.allSettled` with a memoized promise-per-plan DAG, a `Semaphore(cap)`, worktree-per-plan (it has none today), and a `MergeSerializer` single-writer mutex — keeping `PhaseStepResult` byte-compatible and emitting synthetic `WaveStart`/`WaveComplete` at level boundaries so the event-stream tests stay green.
+
+The **read-only fan-out** (post-execution verification/gate chain, and later code-review/mapping/plan stages) ships as **dynamic workflows** invoked by the orchestrator — the surface where the Workflow tool cleanly applies.
 
 ### D5 — Aggressive *within-phase* DAG now; cross-phase pipeline deferred
 
 The within-phase per-plan DAG is the prize and is safe. Cross-phase pipelining (overlapping independent phases in `autonomous`) carries a **state-rollback hazard** — a `human_needed`/conflict gate on phase N firing after N+1 has forked orphans commits. It moves to a later milestone with its own phase-level `depends_on` metadata, a rollback protocol, and a rule that barriers phase N's interactive gates before N+1 forks.
 
-## The DAG protocol — markdown surface
+## The DAG protocol — execution engines (Agent-tool + SDK)
+
+The same `depends_on`-DAG / integration / gating spec drives both execution engines. On the **interactive** surface the orchestrator fires Agent-tool executors gated on the DAG; the **SDK** runs the equivalent memoized promise-per-plan graph in code. The stages below are engine-agnostic.
 
 ### Stages
 
@@ -83,12 +106,12 @@ The within-phase per-plan DAG is the prize and is safe. Cross-phase pipelining (
 3. Filter `has_summary:true` out of the dispatch set (inv 10) but **keep them in the DAG as already-integrated predecessors** (their commits are already on the protected branch, so a dependent of a skipped plan needs no rebase for that edge).
 4. Build the reduced DAG over incomplete plans; add a **serialization edge** between any two plans sharing a `files_modified` entry that are not already `depends_on`-ordered (inv 9). Persist a run-spec JSON; reap orphan worktrees (inv 7).
 
-**Workflow** (`execute-phase-dag.js`, background, no git/fs):
-5. One memoized `Promise` per plan. A plan's gate `await`s all direct-predecessor promises (each resolves with `{branch, head_sha, worktree_path}`). **No wave barrier.**
-6. On gate release, dispatch `agent(prompt, {agentType:'gsd-executor', isolation:'worktree', model?, schema:ExecutorReturn, label, phase})`. The prompt injects each predecessor's `{branch, head_sha}` and sets `EXPECTED_BASE`.
+**Execution engine** (interactive: orchestrator dispatches the DAG's ready-set as Agent-tool executors each round; SDK: memoized promise-per-plan, in code):
+5. Each plan is gated on its **direct predecessors only** (each predecessor yields `{branch, head_sha, worktree_path}` on completion). **No wave barrier** — a plan starts the instant its own predecessors finish.
+6. On gate release, dispatch the executor in its own **isolated worktree** — interactive: `Agent(subagent_type:'gsd-executor', isolation:"worktree", model?)`; SDK: `git worktree add` + the executor session. The prompt injects each predecessor's `{branch, head_sha}` and sets `EXPECTED_BASE` (omit `model` when `inherit`, inv 13).
 7. The executor runs `execute-plan.md` **unchanged**: step 0 asserts HEAD ∈ `worktree-agent-*` (inv 5), `reset --hard` to the predecessor tip (or merges multiple predecessor branches in-worktree); then atomic per-task commits with hooks (inv 1), writes + commits `SUMMARY.md` before returning (inv 4), never touches `STATE.md`/`ROADMAP.md` (inv 2). Returns `ExecutorReturn`.
-8. The plan's promise resolves with `ExecutorReturn` — dependents unblock the instant it returns. A non-OK return **rejects** the promise, propagating `blocked-by-ancestor` to transitive dependents while independent chains keep running. Worktrees/branches are **not** removed (descendants and final integration read from them).
-9. The workflow returns `WorkflowVerdict`.
+8. A completed plan unblocks its dependents immediately. A non-OK return propagates `blocked-by-ancestor` to transitive dependents while independent chains keep running. Worktrees/branches are **not** removed (descendants and final integration read from them).
+9. The engine returns `EngineVerdict` to the orchestrator.
 
 **Orchestrator post** (single writer, has git):
 10. If `needs_user_decision` present → `AskUserQuestion` (inv 14), then resume the unblocked sub-DAG.
@@ -105,10 +128,12 @@ The within-phase per-plan DAG is the prize and is safe. Cross-phase pipelining (
 
 Today's model would serialize: wave-0 `{A,D}` → barrier+merge+build+test → wave-1 `{B}` → barrier+merge+build+test → wave-2 `{C}`. The new model overlaps D with the whole A→B→C chain and removes the inter-wave build+test cycles, collapsing makespan toward `critical-path(chain) + batched gate`.
 
-### JS sketch (`execute-phase-dag.js`)
+### Reference implementation (SDK promise-DAG)
+
+The SDK runs this directly (git-direct TS). The interactive surface implements the same gating by dispatching each round's ready-set as Agent-tool executor calls (`dispatchExecutor` ≈ `Agent(subagent_type:'gsd-executor', isolation:"worktree")`).
 
 ```js
-// input: runSpec {plans, edges, serialEdges, expectedBase, meta}. No fs/git/clock.
+// SDK form: one memoized promise per plan == the true depends_on DAG.
 const { plans, predsOf, model, schema } = prepare(runSpec); // predsOf = direct deps + serial-edge peers
 const ready = new Map();   // plan_id -> Promise<ExecutorReturn>
 
@@ -133,7 +158,7 @@ ExecutorReturn (agent schema): { plan_id, status:'ok'|'conflict'|'stall'|'self_c
   branch, head_sha, worktree_path, summary_committed, predecessors_integrated:[{plan_id,head_sha,method:'reset'|'merge'}],
   conflict?:{against_plan_id, files[]}, detail? }
 
-WorkflowVerdict (workflow return): { run_id, completed[], leaves:[{plan_id,branch,head_sha,worktree_path}],
+EngineVerdict (engine return): { run_id, completed[], leaves:[{plan_id,branch,head_sha,worktree_path}],
   integration_order:[branch], blocked:[{plan_id,blocked_by}], stalled[], conflicts[],
   manifest_path, needs_user_decision?:{kind:'stall'|'conflict'|'checkpoint'|'human_verify', plan_id, detail} }
 ```
@@ -142,7 +167,7 @@ WorkflowVerdict (workflow return): { run_id, completed[], leaves:[{plan_id,branc
 
 ## The DAG protocol — SDK surface (`phase-runner.ts`)
 
-The SDK is git-direct TS, so the integration/guard logic that the markdown surface puts in agents runs as code here:
+The SDK is git-direct TS, so the integration/guard logic the orchestrator runs on the interactive surface runs as in-process code here:
 
 - Replace `for (waves) { Promise.allSettled }` with one **memoized promise per plan** gated on its pruned `depends_on` predecessors (has_summary preds are satisfied external deps).
 - `Semaphore(cap = parallelization===false ? 1 : min(16, cores−2))` bounds in-flight executors (the SDK has no cap today).
@@ -180,7 +205,7 @@ The SDK is git-direct TS, so the integration/guard logic that the markdown surfa
 | 13 | `inherit` → omit `model` param | Pre-flight resolves; `agent({...(model?{model}:{})})` omits it |
 | 14 | Interactive gates outside the workflow | Encoded in `needs_user_decision`; orchestrator runs `AskUserQuestion` and resumes |
 
-**Residual risk to validate in the POC:** the protocol relies on a `isolation:'worktree'` agent's commits landing on a **named branch that persists in the shared object store after the agent completes**, reachable by a sibling agent. If the harness discards worktree commits on cleanup, the markdown surface must adopt the SDK-style git-direct path. **This is POC de-risk #1** — see the plan.
+**Residual risk — RESOLVED (Task 0):** the protocol relies on an isolated agent's commits landing on a named branch that persists and is reachable by a sibling. **Validated:** commits made in an Agent-tool `isolation:"worktree"` worktree are reachable from a sibling by sha, and `reset --hard <sibling-sha>` reproduces them. The remaining environment limitation — the Workflow tool's own `agent({isolation:'worktree'})` is a no-op (see §Validation findings) — is precisely why execution runs on the Agent-tool/SDK engines rather than inside a workflow.
 
 ## Measure of success
 
@@ -202,4 +227,5 @@ The orchestrator-shell / background-workflow / schema-verdict split is reusable:
 ## Consequences
 
 - **Positive:** real concurrency bounded by `min(16,cores−2)`; the worktree-creation race and per-turn LLM-dispatch tax disappear; one shared DAG spec across surfaces; metaframework untouched.
-- **Negative / cost:** peak worktree count rises to in-flight plan count (mitigated by removing a predecessor's worktree once all successors have forked, since the branch ref persists); the markdown surface gains a dependency on the Workflow tool (Claude Code runtimes only — non-Claude runtimes keep today's sequential/SDK paths via the runtime gate); two surfaces to keep spec-aligned (mitigated by a shared fixture/contract test).
+- **Negative / cost:** peak worktree count rises to in-flight plan count (mitigated by removing a predecessor's worktree once all successors have forked, since the branch ref persists); the read-only fan-out depends on the Workflow tool (Claude Code only); execution depends on Agent-tool/SDK worktree isolation (Claude Code) — non-Claude runtimes keep today's sequential paths via the runtime gate; two execution engines to keep spec-aligned (mitigated by a shared fixture/contract test).
+- **Open upstream item:** the Workflow tool's `agent({isolation:'worktree'})` no-op is worth reporting; if fixed, the read-only fan-out story is unaffected and execution *could* optionally move into workflows later — but the design deliberately does not depend on that.
