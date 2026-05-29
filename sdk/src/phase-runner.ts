@@ -886,6 +886,10 @@ export class PhaseRunner {
           worktrees: new SharedCwdWorktreeManager(this.projectDir) as WorktreeManager,
           serializer: new NoopMergeSerializer() as MergeSerializer,
           baseSha: '',
+          // No-op engine: create() never throws, so create()-failure is not fatal
+          // (a degrade to shared cwd is the today-behaviour). Explicit `false` keeps
+          // both union arms structurally aligned for `engine.isolated`.
+          isolated: false,
         };
 
     const phaseLevel = Number.parseInt(phaseNumber, 10);
