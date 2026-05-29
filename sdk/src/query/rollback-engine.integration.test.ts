@@ -185,6 +185,55 @@ describe('rollbackTier1 — clean rollback of a failed (never-promoted) phase', 
     }
   });
 
+  it('reaps a DECIMAL phase\'s worktree branches (prefix derived the same way chunk 1 creates them)', async () => {
+    // Task A regression: chunk 1 forks per-plan branches with
+    // Number.parseInt("5.1", 10) === 5 → `worktree-agent-5-<id>`. The reap MUST
+    // derive the SAME prefix; a naive Number("5.1") === 5.1 would build prefix
+    // `worktree-agent-5.1-` and reap NOTHING.
+    const { dir, baseSha } = await initRepo();
+    try {
+      const phaseNumber = '5.1';
+      // The branch chunk 1 actually creates for a "5.1" phase plan.
+      const planBranch = branchNameFor(Number.parseInt(phaseNumber, 10), '01');
+      expect(planBranch).toBe('worktree-agent-5-01');
+
+      const git = gitIn(dir);
+      // Checkpoint + integration branch (so the rollback's early teardown finds
+      // them) and the decimal-phase per-plan worktree branch.
+      const checkpoint = await createPhaseCheckpoint({
+        projectDir: dir,
+        phaseNumber,
+        protectedBranch: 'main',
+      });
+      const intBranch = integrationBranchFor(phaseNumber);
+      await git(['checkout', '-q', '-B', intBranch, baseSha]);
+      await git(['checkout', '-q', 'main']);
+      const wtDir = join(dir, '.wt', 'wt-5-01');
+      await mkdir(join(dir, '.wt'), { recursive: true });
+      await git(['worktree', 'add', '-q', '-b', planBranch, wtDir, baseSha]);
+      await writeFile(join(wtDir, 'plan.txt'), 'work\n');
+      await gitIn(wtDir)(['add', '-A']);
+      await gitIn(wtDir)(['commit', '-q', '--no-verify', '-m', 'plan work']);
+
+      expect(await refExists(dir, planBranch)).toBe(true);
+
+      const result = await rollbackTier1({
+        projectDir: dir,
+        phaseNumber,
+        protectedBranch: 'main',
+        lastGoodSha: baseSha,
+        snapshotDir: checkpoint.snapshotDir,
+        integrationBranch: intBranch,
+      });
+
+      // The decimal phase's real branch was reaped — the prefix matched.
+      expect(result.reapedBranches).toContain('worktree-agent-5-01');
+      expect(await refExists(dir, planBranch)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('throws (fail-closed) when protected has MOVED off LAST_GOOD', async () => {
     const { dir, baseSha } = await initRepo();
     try {

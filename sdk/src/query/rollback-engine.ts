@@ -168,11 +168,16 @@ async function reapPhaseWorktrees(
   projectDir: string,
   phaseNumber: string,
 ): Promise<string[]> {
-  // Deterministic prefix for this phase's per-plan branches. branchNameFor uses
-  // the raw numeric phase; the planId is sanitized after the trailing dash, so
-  // matching the `worktree-agent-<phase>-` prefix selects exactly this phase's
-  // branches. Use a sentinel planId only to recover the prefix shape.
-  const prefix = branchNameFor(Number(phaseNumber), '').replace(/-$/, '') ; // worktree-agent-<phase>
+  // Deterministic prefix for this phase's per-plan branches. The prefix MUST be
+  // derived the SAME way chunk 1 creates the branches, or a decimal phase reaps
+  // nothing: phase-runner.ts forks per-plan branches with
+  // `phaseTag = Number.parseInt(phaseNumber, 10)` (the `Number.isFinite ? : 0`
+  // fallback for a non-numeric phase). A naive `Number("5.1")` here would yield
+  // `worktree-agent-5.1-` and MISS the real `worktree-agent-5-*` branches that
+  // `parseInt("5.1", 10) === 5` created. Match branch creation exactly.
+  const phaseLevel = Number.parseInt(phaseNumber, 10);
+  const phaseTag = Number.isFinite(phaseLevel) ? phaseLevel : 0;
+  const prefix = branchNameFor(phaseTag, '').replace(/-$/, ''); // worktree-agent-<phaseTag>
   const branchPrefix = `${prefix}-`;
 
   const reaped: string[] = [];
