@@ -244,4 +244,32 @@ describe('Autonomous crash-resume HALT — never auto-advance after a resumed Ti
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('GROUP-E: a present-but-CORRUPT ROLLBACK.json → GSD.run HALTS without running any phase (distinct from absent)', async () => {
+    // Reproduces-then-kills corrupt-ledger-silent-noop-resume: a truncated
+    // ROLLBACK.json (a crash mid non-atomic write) used to read as null → resume
+    // returned resumed:false → the driver AUTO-ADVANCED on a possibly half-
+    // unwound tree. Post-fix the corrupt ledger HALTs the driver and no phase runs.
+    const { dir } = await setupTwoPromotedPhases();
+    try {
+      // Write a truncated ROLLBACK.json directly (no valid journal).
+      await writeFile(join(dir, '.planning', 'ROLLBACK.json'), '{ "steps": { "2": { "git_done": tr');
+
+      const gsd = new GSD({ projectDir: dir });
+      vi.spyOn(gsd, 'createTools').mockReturnValue({
+        roadmapAnalyze: vi.fn().mockResolvedValue(phase3Info()),
+      } as never);
+      const runPhaseSpy = vi.spyOn(gsd, 'runPhase').mockImplementation((async () => {
+        throw new Error('runPhase must NOT be invoked when ROLLBACK.json is corrupt');
+      }) as never);
+
+      const result = await gsd.run('ship it');
+
+      expect(result.success).toBe(false);
+      expect(runPhaseSpy).not.toHaveBeenCalled();
+      expect(result.phases).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

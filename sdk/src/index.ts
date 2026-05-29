@@ -43,7 +43,7 @@ import { detectRuntime } from './query/helpers.js';
 import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
 import { classifyAgentFailure } from './query/agent-failure-classifier.js';
 import { rollbackTier1, cascadeRollbackTier2, resumeIncompleteRollback } from './query/rollback-engine.js';
-import { writeRollbackLedger } from './query/rollback-ledger.js';
+import { readRollbackLedger, writeRollbackLedger } from './query/rollback-ledger.js';
 import { readPhaseManifest } from './query/phase-manifest.js';
 import { classifyCascade } from './query/tier2-cascade-classifier.js';
 import { readPhaseDependsOn } from './query/phase-depends-on.js';
@@ -252,6 +252,14 @@ export class GSD {
     // does.
     let haltedByResume = false;
     try {
+      // GROUP-E fix: detect a PRESENT-but-CORRUPT ROLLBACK.json BEFORE the
+      // manifest gate. A truncated ledger means a possibly half-unwound tree;
+      // the driver must HALT regardless of whether a manifest exists (the
+      // resume-replay below only runs with a manifest, but the corruption HALT
+      // is independent of it). readRollbackLedger throws on corrupt, returns null
+      // on absent. An absent/valid ledger proceeds.
+      await readRollbackLedger(this.projectDir);
+
       const resumeManifest = await readPhaseManifest(this.projectDir);
       if (Object.keys(resumeManifest).length > 0) {
         const protectedBranch = await this.resolveProtectedBranch(config);
@@ -263,14 +271,14 @@ export class GSD {
           manifest: resumeManifest,
           ...(this.workstream && { workstream: this.workstream }),
         });
-        // A Tier-2 unwind was completed on restart → the autonomous driver
-        // NEVER auto-advances after Tier-2; halt for a human (consistent with
-        // the clean maybeCascadeTier2 halt path, which makes
-        // runPhaseWithRollbackRetry return halted and breaks the loop with
-        // success=false). ROLLBACK.json records {tier:2, status:'halted'} and
-        // its manifest still lists the now-reverted predecessor's commits, so
-        // advancing would mis-re-cascade it.
-        haltedByResume = resume.resumed;
+        // The driver MUST HALT when `resume.halt` is set — either because a
+        // Tier-2 unwind was completed on restart (NEVER auto-advance after
+        // Tier-2; consistent with the clean maybeCascadeTier2 halt path) OR
+        // because ROLLBACK.json is PRESENT-but-CORRUPT (GROUP-E fix: a truncated
+        // ledger means a possibly half-unwound tree — advancing would corrupt
+        // protected; a corrupt ledger is no longer silently read as absent and
+        // skipped). An ABSENT ledger leaves `halt` false → normal run.
+        haltedByResume = resume.halt;
       }
     } catch {
       // An errored resume could not safely complete the unwind; the driver must
@@ -403,7 +411,16 @@ export class GSD {
 
       // Classify the failure: transient/quota vs genuine.
       const { signal, detail } = this.classifyPhaseFailure(result, threw);
-      const classification = classifyAgentFailure(detail);
+      // GROUP-C fix: a quota sentinel is only trusted as transient when it comes
+      // from the agent RUNTIME's termination cause. The `throw` signal IS that
+      // cause (the SDK/session crashed); `gate`/`verify` are CONTENT (test/build
+      // output, verifier findings) where a quota-looking word can be the GENUINE
+      // failure itself (a failing test about rate-limiting). For content, the
+      // classifier additionally requires the sentinel to co-occur with HTTP/
+      // runtime context before reading it as transient.
+      const classification = classifyAgentFailure(detail, {
+        fromRuntimeTermination: signal === 'throw',
+      });
 
       if (classification.class === 'quota-exceeded') {
         // Transient: resume the SAME phase via the existing WAITING.json
@@ -627,14 +644,38 @@ export class GSD {
       rollbackContext.protectedBranch,
       async () => 0, // the revert's guard suite never runs the build gate
     );
-    const casc = await cascadeRollbackTier2({
-      projectDir: this.projectDir,
-      protectedBranch: rollbackContext.protectedBranch,
-      cascadeSet: cls.cascadeSet,
-      manifest,
-      serializer,
-      ...(this.workstream && { workstream: this.workstream }),
-    });
+    // An UNEXPECTED throw out of the rollback engine (e.g. commitParents on a
+    // GC'd manifest sha, or a `git rev-parse` failure) must NOT escape GSD.run
+    // with a dirty tree. The engine's own conflict path already restores a clean
+    // tree before halting; this catch is the fail-closed backstop for a throw
+    // that bypasses it — best-effort clean the tree, settle a halted Tier-2
+    // ledger, and HALT (GROUP-B fix).
+    let casc: Awaited<ReturnType<typeof cascadeRollbackTier2>>;
+    try {
+      casc = await cascadeRollbackTier2({
+        projectDir: this.projectDir,
+        protectedBranch: rollbackContext.protectedBranch,
+        cascadeSet: cls.cascadeSet,
+        manifest,
+        serializer,
+        ...(this.workstream && { workstream: this.workstream }),
+      });
+    } catch (cascErr) {
+      await this.cleanWorkingTree(rollbackContext.protectedBranch);
+      const cascDetail = cascErr instanceof Error ? cascErr.message : String(cascErr);
+      await writeRollbackLedger(this.projectDir, {
+        failed_phase: phase.number,
+        attempt_count: thisAttempt.attempt,
+        failure_context: [
+          ...failureContext,
+          { ...thisAttempt, detail: `${thisAttempt.detail} | Tier-2 cascade threw: ${cascDetail}` },
+        ],
+        status: 'halted',
+        tier: 2,
+        cascade_set: cls.cascadeSet,
+      });
+      return true;
+    }
 
     await writeRollbackLedger(this.projectDir, {
       failed_phase: phase.number,
@@ -651,6 +692,23 @@ export class GSD {
       cascade_set: cls.cascadeSet,
     });
     return true;
+  }
+
+  /**
+   * Best-effort restore a clean working tree on the protected branch after an
+   * unexpected throw out of the rollback engine (GROUP-B fail-closed backstop):
+   * abort any in-flight revert, unstage, restore tracked files, and drop
+   * untracked residue. Every step swallows its own error — this runs in a
+   * catch handler and must never throw.
+   */
+  private async cleanWorkingTree(protectedBranch: string): Promise<void> {
+    const git = (args: string[]) =>
+      execFileAsync('git', args, { cwd: this.projectDir }).catch(() => undefined);
+    await git(['revert', '--abort']);
+    await git(['reset', 'HEAD']);
+    await git(['checkout', protectedBranch]);
+    await git(['restore', '.']);
+    await git(['clean', '-fd']);
   }
 
   /**

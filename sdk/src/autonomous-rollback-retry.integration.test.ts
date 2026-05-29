@@ -255,6 +255,53 @@ describe('(b) transient/quota failure → WAITING.json resume, no attempt consum
   });
 });
 
+describe('(GROUP-C) a GENUINE gate failure whose detail contains "rate limit"/"429" is NOT misread as transient', () => {
+  it('a failing rate-limit TEST (gate signal, no HTTP/runtime context) → Tier-1 rollback + informed retry (consumes attempts), not a WAITING.json resume', async () => {
+    // Reproduces-then-kills genuine-failure-misclassified-transient-via-quota-
+    // sentinel: the gate detail names a failing test ABOUT rate-limiting. Pre-fix
+    // classifyAgentFailure substring-matched "rate limit"/"429" in the gate
+    // CONTENT → quota-exceeded → WAITING.json resume, no rollback, burning up to
+    // 50 identical re-runs. Post-fix the gate signal is content (not a runtime
+    // termination), the sentinel has no HTTP/runtime co-occurrence → GENUINE →
+    // Tier-1 rollback fires and attempts are consumed to the cap.
+    const { dir, lastGoodSha, rollbackContext } = await setupFailedPhaseRepo('1');
+    try {
+      const gsd = new GSD({ projectDir: dir });
+      vi.spyOn(gsd, 'createTools').mockReturnValue({
+        roadmapAnalyze: vi.fn().mockResolvedValue(phaseInfo('1')),
+      } as never);
+
+      let attemptNo = 0;
+      vi.spyOn(gsd, 'runPhase').mockImplementation((async () => {
+        attemptNo += 1;
+        await restageIntegration(dir, '1', lastGoodSha);
+        // Gate failure naming a failing rate-limit test — the quota words are
+        // CONTENT, not a runtime quota-kill, and carry no HTTP/runtime context.
+        return failResult('1', rollbackContext, 'FAIL test/rate-limit.spec.ts > should enforce rate limit: expected 429 got 200');
+      }) as never);
+
+      const result = await gsd.run('build the thing');
+
+      // GENUINE path: halted at the cap (NOT spinning on transient resumes).
+      expect(result.success).toBe(false);
+      expect(attemptNo).toBe(5); // attempts CONSUMED — proves genuine, not transient
+
+      // Tier-1 rollback fired each attempt: protected at LAST_GOOD, no WAITING.json.
+      const mainSha = (await gitIn(dir)(['rev-parse', 'main'])).stdout.trim();
+      expect(mainSha).toBe(lastGoodSha);
+      expect(existsSync(join(dir, '.planning', 'WAITING.json'))).toBe(false);
+
+      // ROLLBACK.json halted at 5 genuine attempts.
+      const ledger = JSON.parse(await readFile(join(dir, '.planning', 'ROLLBACK.json'), 'utf-8'));
+      expect(ledger.status).toBe('halted');
+      expect(ledger.attempt_count).toBe(5);
+      expect(ledger.failure_context.length).toBe(5);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('(c) green phase advances normally — no rollback, no ROLLBACK.json', () => {
   it('a phase that succeeds advances without any rollback or ledger', async () => {
     const { dir } = await setupFailedPhaseRepo('1');
