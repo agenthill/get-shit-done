@@ -69,6 +69,17 @@ function routePhaseCommand({ phase, args, cwd, raw, error }) {
     return;
   }
 
+  // `uncomplete` (ADR 0013 option 4, chunk 2 — Tier-1 rollback inverse) is a
+  // non-family static-catalog command in the SDK, so it is not in
+  // PHASE_SUBCOMMANDS and the hub manifest would reject it. Dispatch the
+  // CJS-native cmdPhaseUncomplete directly, mirroring the mvp-mode special-case
+  // above. The autonomous driver invokes the SDK handler in-process; this CLI
+  // seam is the CJS-fallback / manual surface.
+  if (subcommand === 'uncomplete') {
+    phase.cmdPhaseUncomplete(cwd, args[2], raw);
+    return;
+  }
+
   // ── Build the CJS registry ──────────────────────────────────────────────────
   // Each handler receives a ctx object from the hub and must return a HubResult.
   const cjsRegistry = {

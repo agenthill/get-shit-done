@@ -2066,3 +2066,236 @@ export const milestoneComplete: QueryHandler = async (args, projectDir, workstre
     },
   };
 };
+
+// ─── phaseUncomplete handler (ADR 0013 option 4, chunk 2) ──────────────────
+
+/**
+ * Query handler for `phase.uncomplete` — the inverse of {@link phaseComplete}'s
+ * ROADMAP mutations.
+ *
+ * When a phase is rolled back (Tier-1, chunk 2), its ROADMAP completion marks
+ * are stale signals that must be undone. ROADMAP-complete is TRUSTED OVER disk
+ * (see roadmap.cjs: `roadmapComplete && diskStatus !== 'complete'` forces
+ * diskStatus to 'complete'), so a leftover `[x]` would mask a reverted phase and
+ * the autonomous driver would skip re-running it. This handler reverses, under
+ * the ROADMAP lock, exactly the three ROADMAP edits phaseComplete makes:
+ *
+ *   1. Checkbox: `- [x] Phase N: ... (completed DATE)` → `- [ ] Phase N: ...`
+ *      (uncheck AND strip the trailing `(completed DATE)` suffix this phase
+ *      appended).
+ *   2. Progress-table row: Status `Complete` → `Pending`, plan cell `M/N` → `0/N`,
+ *      and clear the Completed-date cell (handles both 4- and 5-column tables,
+ *      mirroring phaseComplete's column layout).
+ *   3. `**Plans:** M/N plans complete` → `**Plans:** 0/N plans complete`.
+ *
+ * It does NOT touch STATE.md (the rollback engine restores STATE.md byte-for-byte
+ * from the checkpoint snapshot) and does NOT renumber phases. REQUIREMENTS.md is
+ * handled by the separate {@link requirementsMarkIncomplete} handler.
+ *
+ * @param args - args[0]: phaseNum (required)
+ * @returns QueryResult with { uncompleted_phase, roadmap_updated, changes }
+ */
+export const phaseUncomplete: QueryHandler = async (args, projectDir, workstream) => {
+  const phaseNum = args[0];
+  if (!phaseNum) {
+    throw new GSDError('phase number required for phase uncomplete', ErrorClassification.Validation);
+  }
+  assertNoNullBytes(phaseNum, 'phaseNum');
+
+  const paths = planningPaths(projectDir, workstream);
+  if (!existsSync(paths.roadmap)) {
+    return { data: { uncompleted_phase: phaseNum, roadmap_updated: false, changes: [] } };
+  }
+
+  const changes: string[] = [];
+
+  await readModifyWriteRoadmapMd(projectDir, (roadmapContent) => {
+    // Padding-tolerant fragment — same source phaseComplete uses (#3537), so a
+    // padded input like "02.7" still matches un-padded ROADMAP prose.
+    const phaseEscaped = phaseMarkdownRegexSource(phaseNum);
+
+    // 1. Checkbox: - [x] ... Phase N: ... (completed DATE) → - [ ] ... Phase N: ...
+    //    Reverse of phaseComplete's `$1x$2 (completed ${today})`. Uncheck the box
+    //    and strip the trailing ` (completed YYYY-MM-DD)` suffix on the same line.
+    const checkboxPattern = new RegExp(
+      `(-\\s*\\[)x(\\]\\s*.*Phase\\s+${phaseEscaped}[:\\s][^\\n]*)`,
+      'i',
+    );
+    const afterCheckbox = roadmapContent.replace(checkboxPattern, (_m, pre: string, rest: string) => {
+      const cleaned = rest.replace(/\s*\(completed \d{4}-\d{2}-\d{2}\)/i, '');
+      return `${pre} ${cleaned}`;
+    });
+    if (afterCheckbox !== roadmapContent) {
+      roadmapContent = afterCheckbox;
+      changes.push('checkbox');
+    }
+
+    // 2. Progress table: Complete → Pending, M/N → 0/N, clear completed date.
+    //    Reverse of phaseComplete's per-column overwrite (4- or 5-col layout).
+    const tableRowPattern = new RegExp(
+      `^(\\|\\s*${phaseEscaped}\\.?\\s[^|]*(?:\\|[^\\n]*))$`,
+      'im',
+    );
+    const afterTable = roadmapContent.replace(tableRowPattern, (fullRow) => {
+      const cells = fullRow.split('|').slice(1, -1);
+      let planIdx = -1;
+      let statusIdx = -1;
+      let dateIdx = -1;
+      if (cells.length === 5) {
+        // Phase | Milestone | Plans | Status | Completed
+        planIdx = 2; statusIdx = 3; dateIdx = 4;
+      } else if (cells.length === 4) {
+        // Phase | Plans | Status | Completed
+        planIdx = 1; statusIdx = 2; dateIdx = 3;
+      } else {
+        return fullRow;
+      }
+      // Plans M/N → 0/N (preserve the denominator).
+      const planMatch = cells[planIdx]!.match(/(\d+)\s*\/\s*(\d+)/);
+      cells[planIdx] = planMatch ? ` 0/${planMatch[2]} ` : cells[planIdx];
+      cells[statusIdx] = ' Pending     ';
+      cells[dateIdx] = ' - ';
+      return '|' + cells.join('|') + '|';
+    });
+    if (afterTable !== roadmapContent) {
+      roadmapContent = afterTable;
+      changes.push('progress_table');
+    }
+
+    // 3. **Plans:** M/N plans complete → **Plans:** 0/N plans complete.
+    //    Reverse of phaseComplete's plan-count overwrite; preserve the
+    //    denominator. Same phase-scoped heading pattern (direct replace, not
+    //    milestone-scoped — see phaseComplete's #2005 note).
+    const planCountPattern = new RegExp(
+      `(#{2,4}\\s*Phase\\s+${phaseEscaped}(?:(?!\\n#{2,4})[\\s\\S])*?\\*\\*Plans:\\*\\*[ \\t]*)(\\d+)/(\\d+)[^\\n]*`,
+      'i',
+    );
+    const afterPlanCount = roadmapContent.replace(
+      planCountPattern,
+      (_m, pre: string, _done: string, total: string) => `${pre}0/${total} plans complete`,
+    );
+    if (afterPlanCount !== roadmapContent) {
+      roadmapContent = afterPlanCount;
+      changes.push('plan_count');
+    }
+
+    return roadmapContent;
+  }, workstream);
+
+  return {
+    data: {
+      uncompleted_phase: phaseNum,
+      roadmap_updated: changes.length > 0,
+      changes,
+    },
+  };
+};
+
+// ─── requirementsMarkIncomplete handler (ADR 0013 option 4, chunk 2) ───────
+
+/**
+ * Query handler for `requirements.mark-incomplete` — the inverse of
+ * `requirements.mark-complete` (and of the REQUIREMENTS.md flip embedded in
+ * {@link phaseComplete}).
+ *
+ * Reverses, for each requirement ID, the two REQUIREMENTS.md edits a phase
+ * completion makes:
+ *   - Checkbox: `- [x] **REQ-ID**` → `- [ ] **REQ-ID**`.
+ *   - Traceability table: `| REQ-ID | ... | Complete |` → `| REQ-ID | ... | Pending |`.
+ *
+ * The forward writes (requirementsMarkComplete and the in-phaseComplete flip)
+ * are lock-FREE today. A rollback that re-flips concurrently with any other
+ * REQUIREMENTS writer could interleave a read-modify-write and lose an edit, so
+ * this handler takes the same advisory lock used for STATE.md/ROADMAP.md
+ * (acquireStateLock on the REQUIREMENTS path) around its whole
+ * read→transform→write cycle.
+ *
+ * @param args - requirement IDs (comma- or space-separated, brackets tolerated)
+ * @returns QueryResult with { updated, marked_incomplete, already_pending, not_found, total }
+ */
+export const requirementsMarkIncomplete: QueryHandler = async (args, projectDir, workstream) => {
+  if (args.length === 0) {
+    throw new GSDError(
+      'requirement IDs required. Usage: requirements mark-incomplete REQ-01,REQ-02 or REQ-01 REQ-02',
+      ErrorClassification.Validation,
+    );
+  }
+
+  const reqIds = args
+    .join(' ')
+    .replace(/[[\]]/g, '')
+    .split(/[,\s]+/)
+    .map(r => r.trim())
+    .filter(Boolean);
+
+  if (reqIds.length === 0) {
+    throw new GSDError('no valid requirement IDs found', ErrorClassification.Validation);
+  }
+
+  const paths = planningPaths(projectDir, workstream);
+  if (!existsSync(paths.requirements)) {
+    return { data: { updated: false, reason: 'REQUIREMENTS.md not found', ids: reqIds } };
+  }
+
+  const updated: string[] = [];
+  const alreadyPending: string[] = [];
+  const notFound: string[] = [];
+
+  // Mirror the STATE/ROADMAP lock pattern: hold the lock across read→write so a
+  // concurrent forward flip can never clobber this re-flip (the forward path is
+  // lock-free, so the lock is one-sided but still serializes this writer's own
+  // read-modify-write against another holder of the same lock).
+  const lockPath = await acquireStateLock(paths.requirements);
+  try {
+    let reqContent = (await readFile(paths.requirements, 'utf-8')).replace(/\r\n/g, '\n');
+
+    for (const reqId of reqIds) {
+      let found = false;
+      const reqEscaped = escapeRegex(reqId);
+
+      // Checkbox: - [x] **REQ-ID** → - [ ] **REQ-ID**
+      const checkboxPattern = new RegExp(`(-\\s*\\[)x(\\]\\s*\\*\\*${reqEscaped}\\*\\*)`, 'gi');
+      const afterCheckbox = reqContent.replace(checkboxPattern, '$1 $2');
+      if (afterCheckbox !== reqContent) {
+        reqContent = afterCheckbox;
+        found = true;
+      }
+
+      // Traceability table: | REQ-ID | ... | Complete | → | REQ-ID | ... | Pending |
+      const tablePattern = new RegExp(`(\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|)\\s*Complete\\s*(\\|)`, 'gi');
+      const afterTable = reqContent.replace(tablePattern, '$1 Pending $2');
+      if (afterTable !== reqContent) {
+        reqContent = afterTable;
+        found = true;
+      }
+
+      if (found) {
+        updated.push(reqId);
+      } else {
+        const pendingCheckbox = new RegExp(`-\\s*\\[ \\]\\s*\\*\\*${reqEscaped}\\*\\*`, 'i');
+        const pendingTable = new RegExp(`\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|\\s*(?:Pending|In Progress)\\s*\\|`, 'i');
+        if (pendingCheckbox.test(reqContent) || pendingTable.test(reqContent)) {
+          alreadyPending.push(reqId);
+        } else {
+          notFound.push(reqId);
+        }
+      }
+    }
+
+    if (updated.length > 0) {
+      await writeFile(paths.requirements, reqContent, 'utf-8');
+    }
+  } finally {
+    await releaseStateLock(lockPath);
+  }
+
+  return {
+    data: {
+      updated: updated.length > 0,
+      marked_incomplete: updated,
+      already_pending: alreadyPending,
+      not_found: notFound,
+      total: reqIds.length,
+    },
+  };
+};

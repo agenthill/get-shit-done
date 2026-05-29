@@ -931,8 +931,11 @@ async function runCommand(command, args, cwd, raw, defaultValue, originalCommand
       const subcommand = args[1];
       if (subcommand === 'mark-complete') {
         milestone.cmdRequirementsMarkComplete(cwd, args.slice(2), raw);
+      } else if (subcommand === 'mark-incomplete') {
+        // Inverse of mark-complete (ADR 0013 option 4, chunk 2 — Tier-1 rollback).
+        milestone.cmdRequirementsMarkIncomplete(cwd, args.slice(2), raw);
       } else {
-        error('Unknown requirements subcommand. Available: mark-complete', ERROR_REASON.SDK_UNKNOWN_COMMAND);
+        error('Unknown requirements subcommand. Available: mark-complete, mark-incomplete', ERROR_REASON.SDK_UNKNOWN_COMMAND);
       }
       break;
     }

@@ -2,7 +2,7 @@ import type { QueryHandler } from './utils.js';
 import { agentSkills } from './skills.js';
 import { requirementsMarkComplete } from './roadmap.js';
 import { todoMatchPhase, statsJson, statsTable, progressBar, progressTable, listTodos, todoComplete } from './progress.js';
-import { milestoneComplete } from './phase-lifecycle.js';
+import { milestoneComplete, phaseUncomplete, requirementsMarkIncomplete } from './phase-lifecycle.js';
 import { summaryExtract, historyDigest } from './summary.js';
 import { commitToSubrepo } from './commit.js';
 import { workstreamGet, workstreamList, workstreamCreate, workstreamSet, workstreamStatus, workstreamComplete, workstreamProgress } from './workstream.js';
@@ -27,6 +27,11 @@ export const DOMAIN_STATIC_CATALOG: ReadonlyArray<readonly [string, QueryHandler
   ['agent-skills', agentSkills],
   ['requirements.mark-complete', requirementsMarkComplete],
   ['requirements mark-complete', requirementsMarkComplete],
+  // Inverse mutations for autonomous Tier-1 rollback (ADR 0013 option 4, chunk 2).
+  ['requirements.mark-incomplete', requirementsMarkIncomplete],
+  ['requirements mark-incomplete', requirementsMarkIncomplete],
+  ['phase.uncomplete', phaseUncomplete],
+  ['phase uncomplete', phaseUncomplete],
   ['todo.match-phase', todoMatchPhase],
   ['todo match-phase', todoMatchPhase],
   ['list-todos', listTodos],

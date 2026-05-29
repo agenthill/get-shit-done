@@ -29,6 +29,8 @@ export const NON_FAMILY_COMMAND_MANIFEST: readonly NonFamilyCommandManifestEntry
   { canonical: 'template.select', aliases: ['template select'], mutation: true, outputMode: 'json' },
 
   { canonical: 'requirements.mark-complete', aliases: ['requirements mark-complete'], mutation: true, outputMode: 'json' },
+  { canonical: 'requirements.mark-incomplete', aliases: ['requirements mark-incomplete'], mutation: true, outputMode: 'json' },
+  { canonical: 'phase.uncomplete', aliases: ['phase uncomplete'], mutation: true, outputMode: 'json' },
   { canonical: 'todo.complete', aliases: ['todo complete'], mutation: true, outputMode: 'json' },
   { canonical: 'milestone.complete', aliases: ['milestone complete'], mutation: true, outputMode: 'json' },
 

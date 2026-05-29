@@ -1748,3 +1748,175 @@ describe('collectDecimalSuffixesFromDirNames — CR-3267 finding 3: alphanumeric
     expect(result.has(2)).toBe(true);
   });
 });
+
+// ─── phaseUncomplete (ADR 0013 option 4, chunk 2 — inverse of phaseComplete) ──
+
+describe('phaseUncomplete', () => {
+  it('unchecks the ROADMAP checkbox and strips the (completed DATE) suffix', async () => {
+    const { phaseUncomplete } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: ROADMAP_FOR_COMPLETE,
+      state: STATE_FOR_COMPLETE,
+      phases: ['09-foundation', '10-read-only-queries', '11-final-phase'],
+    });
+
+    // Phase 9 starts completed: "- [x] Phase 9: Foundation (completed 2026-04-01)".
+    const result = await phaseUncomplete(['9'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+    expect(data.roadmap_updated).toBe(true);
+    expect(data.changes).toContain('checkbox');
+
+    const roadmap = await readFile(join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    // Checkbox unchecked, completed-date suffix stripped.
+    expect(roadmap).toMatch(/-\s*\[ \]\s*Phase 9: Foundation/);
+    expect(roadmap).not.toMatch(/Phase 9: Foundation \(completed/);
+  });
+
+  it('flips the progress-table row Complete -> Pending, M/N -> 0/N, clears date', async () => {
+    const { phaseUncomplete } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: ROADMAP_FOR_COMPLETE,
+      state: STATE_FOR_COMPLETE,
+      phases: ['09-foundation', '10-read-only-queries', '11-final-phase'],
+    });
+
+    // Phase 9 row: "| 9.    | 3/3   | Complete | 2026-04-01 |".
+    const result = await phaseUncomplete(['9'], tmpDir);
+    expect((result.data as Record<string, unknown>).changes).toContain('progress_table');
+
+    const roadmap = await readFile(join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    // The Phase 9 row now reads Pending with 0/3 and no date.
+    expect(roadmap).toMatch(/\|\s*9\.\s*\|\s*0\/3\s*\|\s*Pending\s*\|/);
+    expect(roadmap).not.toMatch(/\|\s*9\.\s*\|\s*3\/3\s*\|\s*Complete/);
+    // The 2026-04-01 date in the Phase 9 row is gone (no other row carried it).
+    expect(roadmap).not.toContain('2026-04-01');
+  });
+
+  it('resets the **Plans:** M/N count back to 0/N (denominator preserved)', async () => {
+    const { phaseUncomplete } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: ROADMAP_FOR_COMPLETE,
+      state: STATE_FOR_COMPLETE,
+      phases: ['09-foundation', '10-read-only-queries', '11-final-phase'],
+    });
+
+    // Phase 9 section: "**Plans:** 3/3 plans complete".
+    const result = await phaseUncomplete(['9'], tmpDir);
+    expect((result.data as Record<string, unknown>).changes).toContain('plan_count');
+
+    const roadmap = await readFile(join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    expect(roadmap).toContain('**Plans:** 0/3 plans complete');
+    expect(roadmap).not.toContain('**Plans:** 3/3 plans complete');
+  });
+
+  it('round-trips: phaseComplete then phaseUncomplete restores the planned ROADMAP marks', async () => {
+    const { phaseComplete, phaseUncomplete } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: ROADMAP_FOR_COMPLETE,
+      state: STATE_FOR_COMPLETE,
+      phases: ['09-foundation', '10-read-only-queries', '11-final-phase'],
+    });
+    const p10Dir = join(tmpDir, '.planning', 'phases', '10-read-only-queries');
+    for (const id of ['10-01', '10-02', '10-03']) {
+      await writeFile(join(p10Dir, `${id}-PLAN.md`), 'plan', 'utf-8');
+      await writeFile(join(p10Dir, `${id}-SUMMARY.md`), 'summary', 'utf-8');
+    }
+    await writeFile(join(tmpDir, '.planning', 'REQUIREMENTS.md'), REQUIREMENTS_FOR_COMPLETE, 'utf-8');
+
+    // Complete phase 10 → it is now marked complete in ROADMAP.
+    await phaseComplete(['10'], tmpDir);
+    const completed = await readFile(join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    expect(completed).toMatch(/\[x\].*Phase 10/);
+    expect(completed).toContain('3/3 plans complete');
+    expect(completed).toMatch(/10\.?\s*\|.*3\/3.*\|.*Complete/i);
+
+    // Uncomplete phase 10 → all three marks reverted to the planned state.
+    await phaseUncomplete(['10'], tmpDir);
+    const reverted = await readFile(join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8');
+    // Checkbox unchecked, no completed-date suffix.
+    expect(reverted).toMatch(/-\s*\[ \]\s*Phase 10: Read-Only Queries/);
+    expect(reverted).not.toMatch(/Phase 10: Read-Only Queries \(completed/);
+    // Progress-table row back to Pending / 0/3.
+    expect(reverted).toMatch(/\|\s*10\.\s*\|\s*0\/3\s*\|\s*Pending\s*\|/);
+    // Phase 10's section plan count reset to 0/3 (scoped to Phase 10's section;
+    // Phase 9 legitimately stays at 3/3 — it was complete in the base fixture).
+    const phase10Section = reverted.slice(
+      reverted.indexOf('### Phase 10:'),
+      reverted.indexOf('### Phase 11:'),
+    );
+    expect(phase10Section).toContain('**Plans:** 0/3 plans complete');
+    expect(phase10Section).not.toContain('**Plans:** 3/3 plans complete');
+  });
+
+  it('is a no-op (roadmap_updated:false) when ROADMAP.md is absent', async () => {
+    const { phaseUncomplete } = await import('./phase-lifecycle.js');
+    // No setupTestProject → no .planning/ROADMAP.md.
+    const result = await phaseUncomplete(['10'], tmpDir);
+    expect((result.data as Record<string, unknown>).roadmap_updated).toBe(false);
+  });
+});
+
+// ─── requirementsMarkIncomplete (chunk 2 — inverse of requirements.mark-complete) ──
+
+describe('requirementsMarkIncomplete', () => {
+  it('re-flips checkbox [x] -> [ ] and traceability Complete -> Pending', async () => {
+    const { requirementsMarkIncomplete } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: ROADMAP_FOR_COMPLETE,
+      state: STATE_FOR_COMPLETE,
+    });
+    await writeFile(join(tmpDir, '.planning', 'REQUIREMENTS.md'), REQUIREMENTS_FOR_COMPLETE, 'utf-8');
+
+    // FOUND-01 starts complete (checkbox [x] + table Complete).
+    const result = await requirementsMarkIncomplete(['FOUND-01'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+    expect(data.updated).toBe(true);
+    expect(data.marked_incomplete).toEqual(['FOUND-01']);
+
+    const req = await readFile(join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+    expect(req).toMatch(/-\s*\[ \]\s*\*\*FOUND-01\*\*/);
+    expect(req).toMatch(/FOUND-01\s*\|[^|]+\|\s*Pending\s*\|/);
+    // FOUND-02 untouched (still complete).
+    expect(req).toMatch(/-\s*\[x\]\s*\*\*FOUND-02\*\*/);
+    expect(req).toMatch(/FOUND-02\s*\|[^|]+\|\s*Complete\s*\|/);
+  });
+
+  it('round-trips: requirements.mark-complete then mark-incomplete returns to pending', async () => {
+    const { requirementsMarkComplete } = await import('./roadmap.js');
+    const { requirementsMarkIncomplete } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: ROADMAP_FOR_COMPLETE,
+      state: STATE_FOR_COMPLETE,
+    });
+    await writeFile(join(tmpDir, '.planning', 'REQUIREMENTS.md'), REQUIREMENTS_FOR_COMPLETE, 'utf-8');
+
+    // FINAL-01 starts as "- [ ] **FINAL-01**" + a "Pending" table row — the
+    // case requirementsMarkComplete actually flips (its table pattern matches
+    // Pending only, not In Progress).
+    await requirementsMarkComplete(['FINAL-01'], tmpDir);
+    const afterComplete = await readFile(join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+    expect(afterComplete).toMatch(/-\s*\[x\]\s*\*\*FINAL-01\*\*/);
+    expect(afterComplete).toMatch(/FINAL-01\s*\|[^|]+\|\s*Complete\s*\|/);
+
+    await requirementsMarkIncomplete(['FINAL-01'], tmpDir);
+    const afterIncomplete = await readFile(join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+    expect(afterIncomplete).toMatch(/-\s*\[ \]\s*\*\*FINAL-01\*\*/);
+    // Table re-flipped Complete -> Pending — exact reverse of the forward flip.
+    expect(afterIncomplete).toMatch(/FINAL-01\s*\|[^|]+\|\s*Pending\s*\|/);
+  });
+
+  it('reports already_pending for IDs that are not complete', async () => {
+    const { requirementsMarkIncomplete } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: ROADMAP_FOR_COMPLETE,
+      state: STATE_FOR_COMPLETE,
+    });
+    await writeFile(join(tmpDir, '.planning', 'REQUIREMENTS.md'), REQUIREMENTS_FOR_COMPLETE, 'utf-8');
+
+    // FINAL-01 is pending (checkbox [ ] + table Pending).
+    const result = await requirementsMarkIncomplete(['FINAL-01'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+    expect(data.updated).toBe(false);
+    expect(data.already_pending).toEqual(['FINAL-01']);
+  });
+});
