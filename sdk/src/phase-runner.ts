@@ -16,7 +16,7 @@ import type {
   SessionOptions,
   ParsedPlan,
   PhasePlanIndex,
-  PlanInfo,
+  PlanDisposition,
 } from './types.js';
 import { PhaseStepType, PhaseType, GSDEventType } from './types.js';
 import type { GSDConfig } from './config.js';
@@ -31,6 +31,106 @@ import { realpathSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { checkResearchGate } from './research-gate.js';
+import { buildPlanDag, type PlanDag, type DagNode } from './plan-dag.js';
+import {
+  Semaphore,
+  resolveConcurrencyCap,
+  SharedCwdWorktreeManager,
+  NoopMergeSerializer,
+  type WorktreeManager,
+  type MergeSerializer,
+} from './execution-engine.js';
+
+// ─── Wave tracker ──────────────────────────────────────────────────────────────
+
+/**
+ * Emits synthetic WaveStart/WaveComplete at topological-level transitions so the
+ * event-stream cardinality stays byte-compatible with the old wave-barrier model
+ * (one WaveStart + one WaveComplete per level, planIds in declaration order,
+ * aggregated success/failure counts). Unlike the old hard barrier, the engine
+ * itself does not block on these — they are observational markers fired as a
+ * level's first plan starts and as its last plan settles.
+ *
+ * When parallelization is disabled, no wave events are emitted (matching the
+ * prior sequential path).
+ */
+class WaveTracker {
+  private readonly planIdsByLevel = new Map<number, string[]>();
+  private readonly remaining = new Map<number, number>();
+  private readonly started = new Set<number>();
+  private readonly waveStart = new Map<number, number>();
+  private readonly success = new Map<number, number>();
+  private readonly failure = new Map<number, number>();
+
+  constructor(
+    private readonly eventStream: GSDEventStream,
+    private readonly phaseNumber: string,
+    private readonly enabled: boolean,
+  ) {}
+
+  /** Register the plan ids per level (in declaration order) before execution. */
+  plan(levelGroups: Map<number, string[]>): void {
+    for (const [level, ids] of levelGroups) {
+      this.planIdsByLevel.set(level, ids);
+      this.remaining.set(level, ids.length);
+      this.success.set(level, 0);
+      this.failure.set(level, 0);
+    }
+  }
+
+  /** Mark a plan at `level` as started; emit WaveStart on the level's first start. */
+  start(level: number): void {
+    if (!this.enabled) return;
+    if (this.started.has(level)) return;
+    this.started.add(level);
+    this.waveStart.set(level, Date.now());
+    const ids = this.planIdsByLevel.get(level) ?? [];
+    this.eventStream.emitEvent({
+      type: GSDEventType.WaveStart,
+      timestamp: new Date().toISOString(),
+      sessionId: '',
+      phaseNumber: this.phaseNumber,
+      waveNumber: level,
+      planCount: ids.length,
+      planIds: ids,
+    });
+  }
+
+  /** Mark a plan at `level` settled; emit WaveComplete once all settle. */
+  settle(level: number, ok: boolean): void {
+    if (!this.enabled) return;
+    // A plan can settle without starting (blocked-by-ancestor never dispatched).
+    // Ensure WaveStart fired so the start/complete pair stays balanced.
+    this.start(level);
+    if (ok) this.success.set(level, (this.success.get(level) ?? 0) + 1);
+    else this.failure.set(level, (this.failure.get(level) ?? 0) + 1);
+    const left = (this.remaining.get(level) ?? 0) - 1;
+    this.remaining.set(level, left);
+    if (left <= 0) {
+      this.eventStream.emitEvent({
+        type: GSDEventType.WaveComplete,
+        timestamp: new Date().toISOString(),
+        sessionId: '',
+        phaseNumber: this.phaseNumber,
+        waveNumber: level,
+        successCount: this.success.get(level) ?? 0,
+        failureCount: this.failure.get(level) ?? 0,
+        durationMs: Date.now() - (this.waveStart.get(level) ?? Date.now()),
+      });
+    }
+  }
+}
+
+/**
+ * Thin wrapper over a MergeSerializer that records per-plan merge outcomes. The
+ * serializer is itself the single-writer mutex; this just adapts the call site.
+ */
+class MergeSerializerCoordinator {
+  constructor(private readonly serializer: MergeSerializer) {}
+  merge(planId: string, branch: string) {
+    return this.serializer.merge(planId, branch);
+  }
+}
 
 // ─── Error type ──────────────────────────────────────────────────────────────
 
@@ -65,6 +165,23 @@ interface ArchitecturalDebtCheck {
   reason?: ArchitecturalDebtCheckReason;
 }
 
+// ─── Execution engine factory (injectable for git-direct isolation/tests) ─────
+
+/**
+ * Builds the per-run worktree manager + merge serializer. When omitted, the
+ * runner uses no-op collaborators that preserve today's in-process, shared-cwd,
+ * no-merge-gate SDK behaviour. Falsifier/integration tests inject git-backed
+ * implementations against a real temp repository.
+ */
+export interface ExecutionEngineFactory {
+  (ctx: { projectDir: string; phaseNumber: string }): {
+    worktrees: WorktreeManager;
+    serializer: MergeSerializer;
+    /** Base commit roots fork off (current protected HEAD). '' for the no-op path. */
+    baseSha: string;
+  };
+}
+
 // ─── PhaseRunner deps interface ──────────────────────────────────────────────
 
 export interface PhaseRunnerDeps {
@@ -75,6 +192,8 @@ export interface PhaseRunnerDeps {
   eventStream: GSDEventStream;
   config: GSDConfig;
   logger?: GSDLogger;
+  /** Optional git-direct execution engine. Default: shared-cwd no-op. */
+  executionEngineFactory?: ExecutionEngineFactory;
 }
 
 // ─── PhaseRunner ─────────────────────────────────────────────────────────────
@@ -87,6 +206,7 @@ export class PhaseRunner {
   private readonly eventStream: GSDEventStream;
   private readonly config: GSDConfig;
   private readonly logger?: GSDLogger;
+  private readonly executionEngineFactory?: ExecutionEngineFactory;
 
   constructor(deps: PhaseRunnerDeps) {
     this.projectDir = deps.projectDir;
@@ -96,6 +216,7 @@ export class PhaseRunner {
     this.eventStream = deps.eventStream;
     this.config = deps.config;
     this.logger = deps.logger;
+    this.executionEngineFactory = deps.executionEngineFactory;
   }
 
   /**
@@ -618,11 +739,26 @@ export class PhaseRunner {
   }
 
   /**
-   * Run the execute step — uses phase-plan-index for wave-grouped parallel execution.
-   * Plans in the same wave run concurrently via Promise.allSettled().
-   * Waves execute sequentially (wave 1 completes before wave 2 starts).
-   * Respects config.parallelization: false to fall back to sequential execution.
-   * Filters out plans with has_summary: true (already completed).
+   * Run the execute step as a true per-plan dependency DAG (ADR 0013).
+   *
+   * Each incomplete plan gets one memoized promise gated on its DIRECT
+   * predecessors (pruned `depends_on` + `files_modified` serialization edges) —
+   * a plan starts the instant ITS predecessors finish, with NO whole-wave
+   * barrier, so independent chains overlap. A Semaphore caps in-flight executors
+   * (parallelization===false → 1 → strictly sequential topological order).
+   *
+   * When a git-direct execution engine is injected, each plan runs in its own
+   * worktree forked off its predecessor's merged commit; a single-writer
+   * MergeSerializer integrates each plan's delta behind the guard suite and the
+   * EXPENSIVE build+test gate is BATCHED at level boundaries (decoupled from the
+   * cheap per-plan merge — per-plan gating is slower than today under a
+   * test-dominated suite). Without an engine, plans run in-process in the shared
+   * cwd exactly as before.
+   *
+   * Synthetic WaveStart/WaveComplete fire at topological-level transitions so
+   * event-stream cardinality and PhaseStepResult shape stay byte-compatible.
+   * Plans with has_summary:true are filtered out but kept as satisfied
+   * predecessors; gap-closure re-seeds the base from current HEAD each call.
    */
   private async runExecuteStep(
     phaseNumber: string,
@@ -685,84 +821,16 @@ export class PhaseRunner {
       };
     }
 
-    const planResults: PlanResult[] = [];
+    // Build the reduced per-plan DAG over incomplete plans (direct depends_on
+    // edges + files_modified serialization edges; has_summary preds are dropped
+    // as satisfied). Topological level drives synthetic wave events only.
+    const dag = buildPlanDag(planIndex.plans);
 
-    // Sequential fallback when parallelization is disabled
-    if (this.config.parallelization === false) {
-      for (const plan of incompletePlans) {
-        const result = await this.executeSinglePlan(phaseNumber, plan.id, sessionOpts);
-        planResults.push(result);
-      }
-    } else {
-      // Group incomplete plans by wave, sort waves numerically
-      const waveMap = new Map<number, PlanInfo[]>();
-      for (const plan of incompletePlans) {
-        const existing = waveMap.get(plan.wave) ?? [];
-        existing.push(plan);
-        waveMap.set(plan.wave, existing);
-      }
-      const sortedWaves = [...waveMap.keys()].sort((a, b) => a - b);
-
-      for (const waveNum of sortedWaves) {
-        const wavePlans = waveMap.get(waveNum)!;
-        const wavePlanIds = wavePlans.map(p => p.id);
-
-        // Emit wave_start
-        this.eventStream.emitEvent({
-          type: GSDEventType.WaveStart,
-          timestamp: new Date().toISOString(),
-          sessionId: '',
-          phaseNumber,
-          waveNumber: waveNum,
-          planCount: wavePlans.length,
-          planIds: wavePlanIds,
-        });
-
-        const waveStart = Date.now();
-
-        // Execute all plans in this wave concurrently
-        const settled = await Promise.allSettled(
-          wavePlans.map(plan => this.executeSinglePlan(phaseNumber, plan.id, sessionOpts)),
-        );
-
-        // Map settled results to PlanResult[]
-        let successCount = 0;
-        let failureCount = 0;
-        for (const outcome of settled) {
-          if (outcome.status === 'fulfilled') {
-            planResults.push(outcome.value);
-            if (outcome.value.success) successCount++;
-            else failureCount++;
-          } else {
-            failureCount++;
-            planResults.push({
-              success: false,
-              sessionId: '',
-              totalCostUsd: 0,
-              durationMs: 0,
-              usage: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
-              numTurns: 0,
-              error: {
-                subtype: 'error_during_execution',
-                messages: [outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)],
-              },
-            });
-          }
-        }
-
-        // Emit wave_complete
-        this.eventStream.emitEvent({
-          type: GSDEventType.WaveComplete,
-          timestamp: new Date().toISOString(),
-          sessionId: '',
-          phaseNumber,
-          waveNumber: waveNum,
-          successCount,
-          failureCount,
-          durationMs: Date.now() - waveStart,
-        });
-      }
-    }
+    const { planResults, dispositions } = await this.runPlanDag(
+      phaseNumber,
+      sessionOpts,
+      dag,
+    );
 
     const durationMs = Date.now() - stepStart;
     const allSucceeded = planResults.every(r => r.success);
@@ -782,6 +850,259 @@ export class PhaseRunner {
       success: allSucceeded,
       durationMs,
       planResults,
+      ...(dispositions.length > 0 && { planDispositions: dispositions }),
+    };
+  }
+
+  /**
+   * Drive the per-plan DAG: one memoized promise per plan, gated on its direct
+   * predecessors, capped by a Semaphore, with per-plan worktrees, a single-writer
+   * MergeSerializer, and a batched per-level build+test gate. Returns the
+   * settled PlanResults (allSettled-style failure isolation) and the additive
+   * per-plan dispositions.
+   */
+  private async runPlanDag(
+    phaseNumber: string,
+    sessionOpts: SessionOptions,
+    dag: PlanDag,
+  ): Promise<{ planResults: PlanResult[]; dispositions: PlanDisposition[] }> {
+    const parallel = this.config.parallelization !== false;
+    const cap = resolveConcurrencyCap(this.config.parallelization);
+    const semaphore = new Semaphore(cap);
+
+    // Build (or default) the git-direct execution engine. The no-op engine runs
+    // every plan in the shared project cwd with no merge step — today's SDK path.
+    const engine = this.executionEngineFactory
+      ? this.executionEngineFactory({ projectDir: this.projectDir, phaseNumber })
+      : {
+          worktrees: new SharedCwdWorktreeManager(this.projectDir) as WorktreeManager,
+          serializer: new NoopMergeSerializer() as MergeSerializer,
+          baseSha: '',
+        };
+
+    const phaseLevel = Number.parseInt(phaseNumber, 10);
+    const phaseTag = Number.isFinite(phaseLevel) ? phaseLevel : 0;
+
+    // WaveTracker: emit synthetic WaveStart/WaveComplete at level boundaries so
+    // event-stream cardinality stays byte-compatible. Only when parallelizing
+    // (parallelization===false emits no wave events, matching prior behaviour).
+    const tracker = new WaveTracker(this.eventStream, phaseNumber, parallel);
+    const levelGroups = new Map<number, string[]>();
+    for (const node of dag.nodes) {
+      const g = levelGroups.get(node.level) ?? [];
+      g.push(node.id);
+      levelGroups.set(node.level, g);
+    }
+    tracker.plan(levelGroups);
+
+    // Per-plan execution outcome carrying the resolved branch + head sha so a
+    // dependent forks off its predecessor's merged commit (fork-off-predecessor).
+    interface PlanOutcome {
+      result: PlanResult;
+      branch: string;
+      headSha: string;
+      ok: boolean;
+    }
+
+    const promises = new Map<string, Promise<PlanOutcome>>();
+    const dispositionById = new Map<string, PlanDisposition>();
+    // Plans whose merge unblocks dependents but whose level gate hasn't run yet,
+    // keyed by level — drained at level boundaries (batched gate).
+    const mergedByLevel = new Map<number, string[]>();
+    const merger = new MergeSerializerCoordinator(engine.serializer);
+
+    // Batched gate scheduling: count plans per level and fire that level's gate
+    // the instant its last plan settles. The gate runs CONCURRENTLY with ongoing
+    // execution of independent later-level plans (the merge — not the gate —
+    // unblocks dependents), so the expensive build+test never serializes the
+    // critical path. "Coalesced when the serializer queue drains" (ADR 0013).
+    const levelRemaining = new Map<number, number>();
+    for (const node of dag.nodes) {
+      levelRemaining.set(node.level, (levelRemaining.get(node.level) ?? 0) + 1);
+    }
+    const gatePromises: Array<Promise<void>> = [];
+    const runLevelGate = async (level: number): Promise<void> => {
+      const ids = mergedByLevel.get(level) ?? [];
+      if (ids.length === 0) return;
+      const { testExit } = await engine.serializer.gate(ids);
+      for (const id of ids) {
+        const d = dispositionById.get(id);
+        if (d) d.testExit = testExit;
+      }
+      // Manifest-scoped cleanup: a plan's worktree is removed after its level's
+      // gate runs (successors have already forked off its committed branch).
+      for (const id of ids) {
+        await engine.worktrees.cleanup(id).catch(() => {});
+      }
+    };
+    const noteLevelSettled = (level: number): void => {
+      const left = (levelRemaining.get(level) ?? 1) - 1;
+      levelRemaining.set(level, left);
+      if (left <= 0) gatePromises.push(runLevelGate(level));
+    };
+
+    const runNode = async (node: DagNode): Promise<PlanOutcome> => {
+      // Gate on direct predecessors only — NOT a whole-wave barrier.
+      const predOutcomes = await Promise.allSettled(
+        node.predecessors.map(id => promises.get(id)!),
+      );
+
+      // If any predecessor failed, propagate blocked-by-ancestor: do not run.
+      const blockedBy = node.predecessors.filter((id, i) => {
+        const o = predOutcomes[i];
+        return o.status === 'rejected' || (o.status === 'fulfilled' && !o.value.ok);
+      });
+      if (blockedBy.length > 0) {
+        const disposition: PlanDisposition = {
+          planId: node.id,
+          level: node.level,
+          merged: false,
+          skippedReason: `blocked-by-ancestor:${blockedBy.join(',')}`,
+        };
+        dispositionById.set(node.id, disposition);
+        tracker.settle(node.level, false);
+        noteLevelSettled(node.level);
+        return {
+          result: this.synthesizeBlockedResult(node.id, blockedBy),
+          branch: '',
+          headSha: '',
+          ok: false,
+        };
+      }
+
+      // Fork base = the single predecessor's merged commit (chain), or the run
+      // base for roots / multi-predecessor (which merge the rest in-worktree).
+      const predBase =
+        node.predecessors.length > 0
+          ? (predOutcomes[0] as PromiseFulfilledResult<PlanOutcome>).value.headSha || engine.baseSha
+          : engine.baseSha;
+
+      tracker.start(node.level);
+
+      const outcome = await semaphore.run(async () => {
+        let cwd = this.projectDir;
+        let branch = '';
+        try {
+          const wt = await engine.worktrees.create(node.id, phaseTag, predBase);
+          cwd = wt.cwd || this.projectDir;
+          branch = wt.branch;
+        } catch (err) {
+          this.logger?.warn(
+            `Worktree create failed for plan ${node.id}, running in shared cwd: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+
+        const result = await this.executeSinglePlan(phaseNumber, node.id, {
+          ...sessionOpts,
+          ...(cwd !== this.projectDir && { cwd }),
+        });
+
+        let headSha = '';
+        if (result.success) {
+          try {
+            headSha = await engine.worktrees.headSha(node.id);
+          } catch {
+            headSha = '';
+          }
+        }
+        return { result, branch, headSha };
+      });
+
+      const ok = outcome.result.success;
+
+      // Cheap per-plan merge (unblocks dependents). Decoupled from the gate.
+      let merged = false;
+      if (ok && outcome.branch !== '') {
+        const m = await merger.merge(node.id, outcome.branch);
+        merged = m.merged;
+      } else if (ok) {
+        merged = true; // no-op engine: nothing to merge, treat as integrated
+      }
+
+      const disposition: PlanDisposition = {
+        planId: node.id,
+        level: node.level,
+        merged,
+      };
+      dispositionById.set(node.id, disposition);
+      if (ok && merged) {
+        const lvl = mergedByLevel.get(node.level) ?? [];
+        lvl.push(node.id);
+        mergedByLevel.set(node.level, lvl);
+      }
+
+      tracker.settle(node.level, ok);
+      noteLevelSettled(node.level);
+
+      return { result: outcome.result, branch: outcome.branch, headSha: outcome.headSha, ok };
+    };
+
+    // Wire promises before awaiting any (true DAG, no parallel() barrier).
+    for (const node of dag.nodes) {
+      promises.set(node.id, runNode(node));
+    }
+
+    const settled = await Promise.allSettled(dag.nodes.map(n => promises.get(n.id)!));
+
+    // Await the per-level batched gates (each fired as its level drained, so the
+    // expensive build+test ran concurrently with later-level execution).
+    await Promise.all(gatePromises);
+
+    // Collect results in DAG (topological/integration) order, allSettled-style.
+    const planResults: PlanResult[] = [];
+    settled.forEach((s, i) => {
+      const node = dag.nodes[i];
+      if (s.status === 'fulfilled') {
+        planResults.push(s.value.result);
+      } else {
+        planResults.push(this.synthesizeRejectedResult(s.reason));
+        if (!dispositionById.has(node.id)) {
+          dispositionById.set(node.id, {
+            planId: node.id,
+            level: node.level,
+            merged: false,
+            skippedReason: 'error_during_execution',
+          });
+        }
+      }
+    });
+
+    const dispositions = dag.nodes
+      .map(n => dispositionById.get(n.id))
+      .filter((d): d is PlanDisposition => d !== undefined);
+
+    return { planResults, dispositions };
+  }
+
+  /** Synthesize a failed PlanResult for a plan blocked by a failed ancestor. */
+  private synthesizeBlockedResult(planId: string, blockedBy: string[]): PlanResult {
+    return {
+      success: false,
+      sessionId: '',
+      totalCostUsd: 0,
+      durationMs: 0,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      numTurns: 0,
+      error: {
+        subtype: 'error_during_execution',
+        messages: [`Plan ${planId} blocked by failed ancestor(s): ${blockedBy.join(', ')}`],
+      },
+    };
+  }
+
+  /** Synthesize a failed PlanResult for a rejected plan promise. */
+  private synthesizeRejectedResult(reason: unknown): PlanResult {
+    return {
+      success: false,
+      sessionId: '',
+      totalCostUsd: 0,
+      durationMs: 0,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      numTurns: 0,
+      error: {
+        subtype: 'error_during_execution',
+        messages: [reason instanceof Error ? reason.message : String(reason)],
+      },
     };
   }
 

@@ -1906,11 +1906,13 @@ Use TypeScript.`, 'utf-8');
       }
     });
 
-    it('wave 2 does not start until wave 1 completes', async () => {
+    it('a dependent plan does not start until its predecessor completes', async () => {
+      // The DAG engine (ADR 0013) gates on depends_on edges, not on the integer
+      // wave bucket. w2-p1 depends_on w1-p1 → it must wait for w1-p1 to finish.
       const planIndex = makePlanIndex(0, {
         plans: [
-          makePlanInfo({ id: 'w1-p1', wave: 1 }),
-          makePlanInfo({ id: 'w2-p1', wave: 2 }),
+          makePlanInfo({ id: 'w1-p1', wave: 1, depends_on: [] }),
+          makePlanInfo({ id: 'w2-p1', wave: 2, depends_on: ['w1-p1'] }),
         ],
         waves: { '1': ['w1-p1'], '2': ['w2-p1'] },
         incomplete: ['w1-p1', 'w2-p1'],
@@ -2087,11 +2089,13 @@ Use TypeScript.`, 'utf-8');
     });
 
     it('emits wave_start and wave_complete events with correct data', async () => {
+      // Topological levels drive the synthetic wave events: p1,p2 are roots
+      // (level 1); p3 depends_on p1 → level 2.
       const planIndex = makePlanIndex(0, {
         plans: [
-          makePlanInfo({ id: 'p1', wave: 1 }),
-          makePlanInfo({ id: 'p2', wave: 1 }),
-          makePlanInfo({ id: 'p3', wave: 2 }),
+          makePlanInfo({ id: 'p1', wave: 1, depends_on: [] }),
+          makePlanInfo({ id: 'p2', wave: 1, depends_on: [] }),
+          makePlanInfo({ id: 'p3', wave: 2, depends_on: ['p1'] }),
         ],
         waves: { '1': ['p1', 'p2'], '2': ['p3'] },
         incomplete: ['p1', 'p2', 'p3'],
@@ -2147,14 +2151,17 @@ Use TypeScript.`, 'utf-8');
       expect(executeStep!.planResults).toHaveLength(1);
     });
 
-    it('handles non-contiguous wave numbers (e.g. 1, 3, 5)', async () => {
+    it('runs a dependency chain p1 → p2 → p3 strictly in order', async () => {
+      // A linear depends_on chain. Each plan gates on its direct predecessor,
+      // so even though the engine has no whole-wave barrier the chain advances
+      // one plan at a time (critical path = chain length).
       const planIndex = makePlanIndex(0, {
         plans: [
-          makePlanInfo({ id: 'p1', wave: 1 }),
-          makePlanInfo({ id: 'p2', wave: 3 }),
-          makePlanInfo({ id: 'p3', wave: 5 }),
+          makePlanInfo({ id: 'p1', wave: 1, depends_on: [] }),
+          makePlanInfo({ id: 'p2', wave: 2, depends_on: ['p1'] }),
+          makePlanInfo({ id: 'p3', wave: 3, depends_on: ['p2'] }),
         ],
-        waves: { '1': ['p1'], '3': ['p2'], '5': ['p3'] },
+        waves: { '1': ['p1'], '2': ['p2'], '3': ['p3'] },
         incomplete: ['p1', 'p2', 'p3'],
       });
 

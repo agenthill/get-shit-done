@@ -882,6 +882,23 @@ export interface PhaseOpInfo {
 }
 
 /**
+ * Per-plan disposition from the DAG execute engine (ADR 0013). Additive; carried
+ * on PhaseStepResult only for the execute step. Absent on every other step and
+ * on the no-op (shared-cwd) path when empty.
+ */
+export interface PlanDisposition {
+  planId: string;
+  /** Topological level (1-based) the plan ran at. */
+  level: number;
+  /** Whether the plan's delta merged onto the protected branch. */
+  merged: boolean;
+  /** Batched build+test gate exit code for the plan's level (0 = pass). */
+  testExit?: number;
+  /** Reason the plan did not run/merge (e.g. blocked-by-ancestor). */
+  skippedReason?: string;
+}
+
+/**
  * Result of a single phase step execution.
  */
 export interface PhaseStepResult {
@@ -890,6 +907,8 @@ export interface PhaseStepResult {
   durationMs: number;
   error?: string;
   planResults?: PlanResult[];
+  /** Additive: per-plan DAG dispositions for the execute step (ADR 0013). */
+  planDispositions?: PlanDisposition[];
 }
 
 /**
