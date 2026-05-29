@@ -5,8 +5,9 @@
  * Each entry records what a phase promoted onto the protected branch: the
  * checkpoint base tag + sha it forked off, the head it promoted, and every
  * commit in `base_sha..head_sha`. Rollback (chunk 2) reads this to know exactly
- * which commits a phase contributed; `depends_on` (empty for now) is where
- * chunk 3's cross-phase dependency edges land.
+ * which commits a phase contributed; `depends_on` carries the phase-level
+ * cross-phase dependency edges (chunk 3, parsed from the ROADMAP at promote
+ * time) that the Tier-2 cascade classifier scopes a reverted predecessor to.
  *
  * NO CLOCK in the writer: `promotedAt` is passed in by the caller (the
  * orchestrator stamps `new Date().toISOString()` at the promote call site in
@@ -31,7 +32,7 @@ export interface PhaseManifestEntry {
   commits: string[];
   /** ISO-8601 promotion timestamp, stamped by the caller. */
   promoted_at: string;
-  /** Cross-phase dependency edges (chunk 3). Empty for now. */
+  /** Phase-level cross-phase dependency edges, canonicalized phase numbers (chunk 3). */
   depends_on: string[];
 }
 
@@ -46,6 +47,14 @@ export interface RecordPhasePromotionInput {
   headSha: string;
   /** ISO-8601 timestamp; the caller stamps it (no clock in the writer). */
   promotedAt: string;
+  /**
+   * Cross-phase dependency edges (chunk 3): the phase-level `depends_on` parsed
+   * from the ROADMAP, canonicalized to phase numbers. Defaults to `[]` when the
+   * caller does not supply it (the phase declared no dependencies, or a
+   * pre-chunk-3 caller). The Tier-2 cascade classifier reads these to scope a
+   * reverted predecessor to the failing phase's transitive closure.
+   */
+  dependsOn?: string[];
 }
 
 /** `.planning/.phase-manifest.json` for a project. */
@@ -62,7 +71,7 @@ export function phaseManifestPath(projectDir: string): string {
 export async function recordPhasePromotion(
   input: RecordPhasePromotionInput,
 ): Promise<PhaseManifestEntry> {
-  const { projectDir, phaseNumber, baseTag, baseSha, headSha, promotedAt } = input;
+  const { projectDir, phaseNumber, baseTag, baseSha, headSha, promotedAt, dependsOn } = input;
   const git = (args: string[]) => execFileAsync('git', args, { cwd: projectDir });
 
   // Commits this phase contributed: base_sha (exclusive)..head_sha (inclusive).
@@ -88,7 +97,7 @@ export async function recordPhasePromotion(
     head_sha: headSha,
     commits,
     promoted_at: promotedAt,
-    depends_on: [],
+    depends_on: dependsOn ?? [],
   };
 
   const manifest = await readPhaseManifest(projectDir);

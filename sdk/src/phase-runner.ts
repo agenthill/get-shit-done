@@ -52,6 +52,7 @@ import {
   checkpointDirFor,
 } from './query/phase-checkpoint.js';
 import { recordPhasePromotion } from './query/phase-manifest.js';
+import { readPhaseDependsOn } from './query/phase-depends-on.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -1309,6 +1310,18 @@ export class PhaseRunner {
       ctx.lastGoodSha,
     );
 
+    // Parse the phase's cross-phase `depends_on` from the ROADMAP so the manifest
+    // records the dependency edges chunk 3's Tier-2 cascade classifier scopes a
+    // reverted predecessor to. Best-effort: a parse failure leaves [] (no edges →
+    // the classifier can only ever decide no-cascade for this phase, never
+    // cascade on a guess).
+    let dependsOn: string[] = [];
+    try {
+      dependsOn = await readPhaseDependsOn(this.projectDir, phaseNumber);
+    } catch {
+      dependsOn = [];
+    }
+
     await recordPhasePromotion({
       projectDir: this.projectDir,
       phaseNumber,
@@ -1317,6 +1330,7 @@ export class PhaseRunner {
       headSha,
       // Orchestrator stamps the clock (the manifest writer has none).
       promotedAt: new Date().toISOString(),
+      dependsOn,
     });
 
     // Tag the promoted protected HEAD. Force so a re-promote (resume) re-pins.
