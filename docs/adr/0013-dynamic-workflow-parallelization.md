@@ -177,6 +177,8 @@ The SDK is git-direct TS, so the integration/guard logic the orchestrator runs o
 - A `WaveTracker` fires synthetic `WaveStart(L)`/`WaveComplete(L)` at level transitions so event-stream cardinality and `PhaseStepResult` shape stay byte-compatible. Per-plan disposition (`merged`, `testExit`, `skippedReason`) rides in an **additive** field.
 - Resume/gap-closure stay idempotent via `has_summary` filtering and re-seeding the integration ref from current HEAD each `runExecuteStep`.
 
+**SDK engine → production landed (option 3).** The `ExecutionEngineFactory` seam that production previously never injected (so headless `gsd-sdk` runs took the no-op shared-cwd / fake-merge / always-pass-gate path, bypassing inv-3) is now wired into production behind the opt-in config gate `git.sdk_worktree_execution` (default `false`, Claude runtime only per inv-12). When on, `GSD.runPhase` builds the real `GitWorktreeManager` + `GitMergeSerializer` via `sdk/src/build-execution-engine.ts`, gated by a **fail-closed worktree-capability pre-flight** (`git worktree add --detach` off HEAD, asserts a LINKED worktree, removes it) that **THROWS** rather than ever returning the no-op engine — the throw is the load-bearing safety property (a silent fallback would run concurrent shared-tree mutation and bypass inv-3). The real build+test gate resolves `git.sdk_test_command` (else `npm test` when a `package.json` test script exists), run via execFile in the post-merge protected checkout with a timeout (→ exit 124, inconclusive ≠ pass). A `worktrees.create()` failure under the isolated engine is now **fatal** (the plan is marked failed, via an `isolated` discriminator on the engine) instead of degrading to shared cwd. Default `false` preserves today's no-op path byte-for-byte; fully reversible.
+
 ## Rejected protocols (the adversarial findings)
 
 | Approach | Verdict | Why |
@@ -201,7 +203,7 @@ The SDK is git-direct TS, so the integration/guard logic the orchestrator runs o
 | 9 | `files_modified` overlap safety | Serialization edge added in the DAG between file-colliding plans not already ordered |
 | 10 | Resumability (skip `has_summary`) | Filtered from dispatch; kept as satisfied predecessors |
 | 11 | `parallelization===false` → sequential | `SEQUENTIAL_FORCE` / `cap=1` topo-ordered path |
-| 12 | Runtime fail-closed (no worktree isolation) | Pre-flight FATAL for codex; SDK asserts worktree capability before dispatch |
+| 12 | Runtime fail-closed (no worktree isolation) | Pre-flight FATAL for codex; SDK asserts worktree capability before dispatch (**implemented**, option 3: `GSD.runPhase` gates on `detectRuntime()==='claude'`, and the fail-closed pre-flight in `build-execution-engine.ts` THROWS when `git worktree add` is unavailable — never degrades to the no-op shared-cwd engine) |
 | 13 | `inherit` → omit `model` param | Pre-flight resolves; `agent({...(model?{model}:{})})` omits it |
 | 14 | Interactive gates outside the workflow | Encoded in `needs_user_decision`; orchestrator runs `AskUserQuestion` and resumes |
 
