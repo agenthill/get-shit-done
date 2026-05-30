@@ -595,6 +595,12 @@ export interface PhaseParallelOutcome {
   prUrl?: string;
   /** Set when this phase was SKIPPED because a depends_on predecessor failed (D4). */
   skippedReason?: string;
+  /**
+   * Set when the per-phase run THREW/rejected rather than settling a result. The
+   * wave loop catches it, records a non-promoted outcome, and continues siblings
+   * (FIX 2) — the message of the caught error, for diagnostics.
+   */
+  errorReason?: string;
 }
 
 /** Result of one wave (parallel within, sequential across). */

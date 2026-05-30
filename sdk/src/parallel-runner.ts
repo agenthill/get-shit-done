@@ -104,9 +104,13 @@ export async function runParallelWaves(
   // outcome rather than racing it.
   const failed = new Set<string>();
   const settled = new Map<string, { promise: Promise<void>; resolve: () => void }>();
-  for (const wave of schedule.waves) {
-    for (const token of wave) {
+  // Map each scheduled phase (canonical) → its wave index, for the schedule-vs-
+  // dependency-order validation below.
+  const tokenToWaveIndex = new Map<string, number>();
+  for (let wi = 0; wi < schedule.waves.length; wi++) {
+    for (const token of schedule.waves[wi]!) {
       const id = canonicalizePhaseId(token) || token;
+      tokenToWaveIndex.set(id, wi);
       if (!settled.has(id)) {
         let resolve!: () => void;
         const promise = new Promise<void>((r) => { resolve = r; });
@@ -116,6 +120,46 @@ export async function runParallelWaves(
   }
   const markSettled = (id: string) => settled.get(id)?.resolve();
 
+  // ── FIX 1: up-front schedule-validity pass (BEFORE any phase runs) ──────────
+  // The runner pre-seeds one settled-promise per scheduled phase and a member
+  // awaits its in-run predecessors' settlement. Two schedules make that await
+  // un-resolvable → permanent hang: (a) a predecessor scheduled in a LATER wave
+  // than its dependent (the file-conflict schedule contradicts the dependency
+  // order — the awaited promise only resolves in a wave that can't start until
+  // this one finishes), and (b) a depends_on CYCLE (mutual await). Both abort the
+  // whole run LOUDLY here, outside the per-member try/catch of FIX 2, so an
+  // invalid schedule never silently deadlocks. Resolve every scheduled phase's
+  // DIRECT in-run depends_on ONCE; the member fn reuses this map.
+  const inRunDeps = new Map<string, string[]>();
+  for (const token of tokenToWaveIndex.keys()) {
+    const raw = ctx.resolveDependsOn ? await ctx.resolveDependsOn(token) : [];
+    const deps = raw
+      .map((d) => canonicalizePhaseId(d) || d)
+      .filter((d) => tokenToWaveIndex.has(d)); // in-run, scheduled phases only
+    inRunDeps.set(token, deps);
+  }
+
+  // CYCLE guard: a back-edge in the in-run direct-depends_on graph ⇒ mutual await.
+  const cycle = findDependsOnCycle(inRunDeps);
+  if (cycle) {
+    throw new Error(
+      `parallel run aborted: depends_on cycle among phases ${cycle.join(' -> ')} — unschedulable`,
+    );
+  }
+
+  // CROSS-WAVE guard: a dependency scheduled in a LATER wave than its dependent.
+  for (const [member, deps] of inRunDeps) {
+    const memberWave = tokenToWaveIndex.get(member)!;
+    for (const dep of deps) {
+      const depWave = tokenToWaveIndex.get(dep)!;
+      if (depWave > memberWave) {
+        throw new Error(
+          `parallel run aborted: phase ${member} depends_on ${dep} but ${dep} is scheduled in a later wave (${depWave}) than ${member} (${memberWave}) — the file-conflict schedule contradicts the dependency order`,
+        );
+      }
+    }
+  }
+
   for (let waveIndex = 0; waveIndex < schedule.waves.length; waveIndex++) {
     const members = schedule.waves[waveIndex]!;
     // D3: re-seed the per-phase base SHA at the wave boundary so this wave's
@@ -124,18 +168,23 @@ export async function runParallelWaves(
     const outcomes = await Promise.all(
       members.map(async (waveToken): Promise<PhaseParallelOutcome> => {
         const memberId = canonicalizePhaseId(waveToken) || waveToken;
+        const memberWave = tokenToWaveIndex.get(memberId) ?? waveIndex;
 
-        // D4: resolve this phase's direct depends_on and await any in-run
+        // D4: this phase's direct in-run depends_on, precomputed up front (FIX 1)
+        // and reused here instead of re-resolving per member. Await any in-run
         // predecessor's settlement BEFORE acquiring a semaphore slot — so a
         // dependent never holds a permit while blocking on a predecessor that
         // also needs one (which would deadlock under a small cap).
-        const deps = ctx.resolveDependsOn
-          ? (await ctx.resolveDependsOn(waveToken)).map((d) => canonicalizePhaseId(d) || d)
-          : [];
-        // Only wait on predecessors that are part of THIS run (scheduled) — an
-        // out-of-run dependency is the caller's contract to have landed.
+        const deps = inRunDeps.get(memberId) ?? [];
+        // FIX 1: the up-front pass guaranteed no dep is scheduled in a LATER wave,
+        // so only deps in the SAME or an EARLIER wave remain. Earlier-wave deps are
+        // already settled (waves run sequentially); same-wave deps are awaited so a
+        // same-wave dependent (conflict-graph schedules by files only, not
+        // depends_on) observes its predecessor's outcome rather than racing it.
         await Promise.all(
-          deps.filter((d) => settled.has(d)).map((d) => settled.get(d)!.promise),
+          deps
+            .filter((d) => tokenToWaveIndex.get(d)! <= memberWave && settled.has(d))
+            .map((d) => settled.get(d)!.promise),
         );
         const blocking = deps.filter((d) => failed.has(d));
         if (blocking.length > 0) {
@@ -156,16 +205,40 @@ export async function runParallelWaves(
         }
 
         return semaphore.run(async (): Promise<PhaseParallelOutcome> => {
-          const phase = await ctx.resolvePhase(waveToken);
-          const { result, halted } = await ctx.runPhase(phase);
-          const promoted = result.success && !halted;
-          if (!promoted) failed.add(memberId);
-          markSettled(memberId);
-          let prUrl: string | undefined;
-          if (promoted && ctx.promotePhasePr) {
-            prUrl = await promoteMutex.runExclusive(() => ctx.promotePhasePr!(phase, result));
+          // FIX 2: a thrown/rejected resolvePhase or runPhase must NOT reject the
+          // wave's Promise.all — that would abort concurrent siblings, record no
+          // outcome, and make the post-wave assertLedgersClean unreachable. Catch
+          // it, emit a non-promoted outcome (continue-independents), and ALWAYS
+          // markSettled in finally so no dependent hangs. (FIX 1's up-front
+          // schedule-validity errors are raised OUTSIDE this body and still abort
+          // the whole run.)
+          try {
+            const phase = await ctx.resolvePhase(waveToken);
+            const { result, halted } = await ctx.runPhase(phase);
+            const promoted = result.success && !halted;
+            if (!promoted) failed.add(memberId);
+            let prUrl: string | undefined;
+            if (promoted && ctx.promotePhasePr) {
+              prUrl = await promoteMutex.runExclusive(() => ctx.promotePhasePr!(phase, result));
+            }
+            return { phaseNumber: phase.number, result, promoted, ...(prUrl && { prUrl }) };
+          } catch (err) {
+            failed.add(memberId);
+            const errorReason = err instanceof Error ? err.message : String(err);
+            const phaseInfo = await ctx.resolvePhase(waveToken).catch(() => undefined);
+            const phaseNumber = phaseInfo?.number ?? memberId;
+            const result: PhaseRunnerResult = {
+              phaseNumber,
+              phaseName: phaseInfo?.phase_name ?? phaseNumber,
+              steps: [],
+              success: false,
+              totalCostUsd: 0,
+              totalDurationMs: 0,
+            };
+            return { phaseNumber, result, promoted: false, errorReason };
+          } finally {
+            markSettled(memberId);
           }
-          return { phaseNumber: phase.number, result, promoted, ...(prUrl && { prUrl }) };
         });
       }),
     );
@@ -185,4 +258,48 @@ export async function runParallelWaves(
     totalCostUsd,
     totalDurationMs: Date.now() - startTime,
   };
+}
+
+/**
+ * Detect a cycle in the in-run direct-`depends_on` graph (FIX 1). Keys are the
+ * scheduled (canonical) phase ids; values are their in-run direct deps. Returns
+ * the nodes on the first back-edge cycle found (for the error message), or `null`
+ * when the graph is acyclic. DFS with a WHITE/GRAY/BLACK recursion-stack — the
+ * phase-tier cycle check `transitiveDependsOnClosure` operates on a
+ * `PhaseManifest`, not this in-run adjacency map, so a small local walk fits.
+ */
+function findDependsOnCycle(adj: Map<string, string[]>): string[] | null {
+  const GRAY = 1;
+  const BLACK = 2;
+  const color = new Map<string, number>();
+  const path: string[] = [];
+
+  const visit = (node: string): string[] | null => {
+    color.set(node, GRAY);
+    path.push(node);
+    for (const next of adj.get(node) ?? []) {
+      if (!adj.has(next)) continue; // edge to an out-of-run phase — not a cycle
+      const c = color.get(next);
+      if (c === GRAY) {
+        // Back-edge: slice the current path from `next` to close the cycle.
+        const from = path.indexOf(next);
+        return [...path.slice(from), next];
+      }
+      if (c === undefined) {
+        const found = visit(next);
+        if (found) return found;
+      }
+    }
+    path.pop();
+    color.set(node, BLACK);
+    return null;
+  };
+
+  for (const node of adj.keys()) {
+    if (color.get(node) === undefined) {
+      const found = visit(node);
+      if (found) return found;
+    }
+  }
+  return null;
 }
