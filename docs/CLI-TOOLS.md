@@ -66,6 +66,18 @@ Use this when authoring workflows, not when you only need the command list below
 
 **CLI-only (not in registry):** e.g. **graphify**, **from-gsd2** / **gsd2-import** — call `gsd-tools.cjs` until registered.
 
+**SDK-only query verbs (no CJS mirror):**
+
+```bash
+# Concurrency schedule for N phases from their PLAN.md `files_modified` frontmatter.
+# Reads every PLAN.md each phase owns (root + nested plans/), builds the file-overlap
+# adjacency, classifies each overlap, and partitions the phases into waves of
+# mutually non-(hard-)conflicting phases that can run concurrently.
+gsd-sdk query conflict-graph <phase...>   # e.g. conflict-graph 43 44 45
+```
+
+Overlaps on the known shared-write hotspots `ROADMAP.md`, `STATE.md`, and `register-all.ts` (matched by basename) are **soft** (trivial-merge, co-schedulable); any other shared file is a **hard** conflict (serialize into a later wave). A phase with empty/missing `files_modified` (or an unresolved directory) is treated conservatively as hard-conflicting with all others and lands in its own wave. The result is `{ phases, edges, schedule: { waves } }`. This verb only *computes* the schedule — it does not dispatch or change any workflow's synchronous-dispatch rules (issue #13 gap 1).
+
 **Mutation events (SDK):** `QUERY_MUTATION_COMMANDS` in `sdk/src/query/index.ts` lists commands that may emit structured events after a successful dispatch. Exceptions called out in QUERY-HANDLERS: `state validate` (read-only), `skill-manifest` (writes only with `--write`), `intel update` (stub).
 
 **Golden parity:** Policy and CJS↔SDK test categories are documented under **Golden parity** in [QUERY-HANDLERS.md](../sdk/src/query/QUERY-HANDLERS.md).

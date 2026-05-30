@@ -1,0 +1,5 @@
+---
+type: Added
+pr: 14
+---
+**`gsd-sdk query conflict-graph <phase...>` — concurrency schedule from `files_modified`** (issue #13, gap 1). The new SDK query verb reads each named phase's PLAN.md `files_modified` frontmatter (unioned across every PLAN.md the phase owns, root and nested `plans/`), builds the file-overlap adjacency between phases, classifies each overlap, and partitions the phases into concurrency waves. Overlaps confined to the known shared-write hotspots `ROADMAP.md`, `STATE.md`, and `register-all.ts` (matched by basename) are **soft** (trivial-merge, co-schedulable); any other shared file is a **hard** conflict that serializes the two phases into different waves. A phase with empty/missing `files_modified` or an unresolved directory is treated conservatively as hard-conflicting with all others and lands in its own wave. Returns `{ phases, edges, schedule: { waves } }`. Scoped to the mechanically-specified core: this verb only *computes* the schedule — the parallel orchestrator command and the async/background-dispatch-contract relaxation (issue #13, gap 2) are deferred pending design and are NOT part of this change. (#14)
