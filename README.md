@@ -45,6 +45,11 @@ npx get-shit-done-cc@latest
 
 ---
 
+> [!NOTE]
+> **This is a fork — [`agenthill/get-shit-done-in-workflow`](https://github.com/agenthill/get-shit-done-in-workflow).** A dynamic-workflow fork of [GSD](https://github.com/gsd-build/get-shit-done) by TÂCHES, forked at **v1.50.0-canary.0**. It parallelizes GSD's execution and review stages with **dynamic workflows** and adds **autonomous cross-phase execution with a rollback protocol** — all behind **default-off** config gates, so stock GSD behavior is unchanged. See **[What this fork adds](#what-this-fork-adds)** and **[ADR 0013](docs/adr/0013-dynamic-workflow-parallelization.md)**. Not published to npm — [install from source](#install-the-fork-from-source). The upstream usage docs below apply as-is.
+
+---
+
 > [!IMPORTANT]
 > **Returning to GSD?**
 >
@@ -63,6 +68,56 @@ So I built GSD. The complexity is in the system, not in your workflow. Behind th
 The system gives Claude everything it needs to do the work *and* verify it. I trust the workflow. It just does a good job.
 
 — **TÂCHES**
+
+---
+
+## What this fork adds
+
+This fork extends stock GSD — forked from [`gsd-build/get-shit-done`](https://github.com/gsd-build/get-shit-done) at **v1.50.0-canary.0** (inheriting the `@opengsd` rebrand lineage) — with **dynamic-workflow parallelization**: GSD's independent work runs concurrently instead of sequentially. Design and rationale live in **[ADR 0013](docs/adr/0013-dynamic-workflow-parallelization.md)**.
+
+**The load-bearing finding.** Claude Code's Workflow-tool per-agent worktree isolation is a no-op in this environment — parallel workflow agents share one working tree. So the fork splits execution by trust boundary: **read-only fan-out** runs on dynamic workflows (agents return findings via schema; the orchestrator is the single writer of all files, commits, and interaction), while **file-mutating execution** runs on the Agent tool / SDK, whose worktree isolation does hold. Every dynamic-workflow path is runtime-gated with a verbatim single-agent fallback, so behavior is identical on runtimes without the Workflow tool.
+
+**Shipped — each behind a default-off gate or as an opt-in fan-out:**
+
+| Stage | What the fork adds | PR |
+|---|---|---|
+| Execute-phase | True per-plan dependency-DAG dispatch (fork-off-predecessor + topological integration + per-level test gate) on both the Agent tool and the SDK | [#1](https://github.com/agenthill/get-shit-done-in-workflow/pull/1) |
+| Code review | `bugs` / `security` / `quality` reviewers fan out concurrently over the full diff; the orchestrator composes a byte-identical `REVIEW.md` (so `--fix`/`--auto` are unaffected) | [#5](https://github.com/agenthill/get-shit-done-in-workflow/pull/5) |
+| Map codebase | `tech` / `arch` / `quality` / `concerns` mappers fan out into disjoint `.planning/codebase/` documents | [#6](https://github.com/agenthill/get-shit-done-in-workflow/pull/6) |
+| Plan check | One checker per `PLAN.md` plus a cross-plan checker fan out; the orchestrator drives the revision loop | [#7](https://github.com/agenthill/get-shit-done-in-workflow/pull/7) |
+| SDK worktree engine | Config-gated (`git.sdk_worktree_execution`) isolated-worktree execution promoted to production, with a fail-closed worktree-capability probe | [#8](https://github.com/agenthill/get-shit-done-in-workflow/pull/8) |
+| Autonomous + rollback | `GSD.run` executes a milestone unattended — promote-on-green per phase, Tier-1/Tier-2 rollback, informed retry, and a crash-resume journal | [#9](https://github.com/agenthill/get-shit-done-in-workflow/pull/9) |
+
+### Autonomous cross-phase execution + rollback (ADR 0013 D5)
+
+Behind the default-off gate, `GSD.run` drives a whole milestone with no human in the loop. Each phase executes on an orchestrator-owned integration branch and **promotes to the protected branch only on green** (test gate passes *and* verification passes). Failure handling is structural, not procedural:
+
+- **Tier-1** — a failed phase never promoted, so the protected branch is provably untouched; its integration branch and worktrees are torn down and the phase **retries with accumulated failure context** (up to `git.sdk_max_phase_attempts`, default 5), then halts for a human.
+- **Tier-2** — an already-promoted predecessor later found at fault is reverted history-preservingly, **only when the failure is file-attributable to it**, else the run halts (attributable-only, else halt). The driver never auto-advances after a Tier-2.
+- **Crash-resume** — a `ROLLBACK.json` per-step journal lets a crash mid-unwind resume idempotently. The protected branch is never left half-reverted.
+
+The protocol was hardened through three rounds of adversarial multi-agent review before merge; residual risks (the file-overlap attribution heuristic, a bounded quota-resume false-positive) are documented in the [#9](https://github.com/agenthill/get-shit-done-in-workflow/pull/9) description.
+
+### Install the fork (from source)
+
+The fork is not published to npm; install from the clone:
+
+```bash
+git clone https://github.com/agenthill/get-shit-done-in-workflow
+cd get-shit-done-in-workflow
+npm run build:sdk && npm run build:hooks      # build the TypeScript SDK + hooks
+node bin/install.js --claude --global --profile=full
+```
+
+For an install that doesn't depend on the clone staying in place, pack it and install globally:
+
+```bash
+npm pack
+npm install -g ./get-shit-done-cc-*.tgz --prefix ~/.local
+( cd ~/.local/lib/node_modules/get-shit-done-cc/sdk && npm ci --omit=dev )   # the SDK's synckit dep is not in the root manifest
+```
+
+Then **restart your runtime**. The dynamic-workflow fan-outs and the autonomous engine are off until you enable them (e.g. `git.sdk_worktree_execution`); everything else behaves like stock GSD.
 
 ---
 
