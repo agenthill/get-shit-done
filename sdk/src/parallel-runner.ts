@@ -36,13 +36,51 @@ export interface ParallelDriverContext {
   parallelization: boolean;
   /** Resolve a phase's roadmap metadata by wave token (reconciles normalization). */
   resolvePhase: (waveToken: string) => Promise<RoadmapPhaseInfo>;
-  /** The EXISTING per-phase rollback/retry driver (GSD.runPhaseWithRollbackRetry). */
-  runPhase: (phase: RoadmapPhaseInfo) => Promise<{ result: PhaseRunnerResult; halted: boolean }>;
   /**
-   * Open + admin-merge the phase's PR after a green local promote (D6). Returns
-   * the PR url. Absent → no PR step (local-only / openPullRequests:false).
+   * The EXISTING per-phase rollback/retry driver (GSD.runPhaseWithRollbackRetry).
+   * `phaseDir` (Chunk C PR-1, #13 gap 2) is the phase's OWN linked worktree — the
+   * driver runs segment (a) (checkpoint / begin-integration / execute / verify) in
+   * it so two concurrent wave members never race the shared projectDir's HEAD /
+   * index. Absent (sequential path / runner-only unit tests) → the driver uses the
+   * shared projectDir, behaviour unchanged.
+   */
+  runPhase: (
+    phase: RoadmapPhaseInfo,
+    phaseDir?: string,
+  ) => Promise<{ result: PhaseRunnerResult; halted: boolean }>;
+  /**
+   * Create the phase's own linked worktree (forked off the wave base SHA, on the
+   * phase's integration branch) and return its absolute path. Called per wave
+   * member BEFORE `runPhase`, AFTER the semaphore permit is held (so at most `cap`
+   * worktrees exist at once). Absent → no isolation; `runPhase` runs against the
+   * shared projectDir (sequential / non-isolated path). Reuses GitWorktreeManager
+   * — never reimplements worktree management.
+   */
+  createPhaseWorktree?: (phase: RoadmapPhaseInfo) => Promise<string>;
+  /**
+   * Remove a phase's worktree after it settles (success / fail / skip). Called in
+   * the member's finally so a worktree never survives the wave. Best-effort — must
+   * not throw. Paired with {@link createPhaseWorktree}.
+   */
+  removePhaseWorktree?: (phaseDir: string) => Promise<void>;
+  /**
+   * Open + admin-merge the phase's PR after a green phase (D6, openPullRequests:
+   * true). The admin-merge IS the promotion — protected advances on the REMOTE, so
+   * no local checkout+merge runs in this path. Absent → fall back to
+   * {@link promoteLocal} (openPullRequests:false / non-remote).
    */
   promotePhasePr?: (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => Promise<string>;
+  /**
+   * Local promotion fallback for openPullRequests:false (Chunk C PR-1): since the
+   * phase ran segment (a) in its own worktree (which CANNOT `git checkout
+   * protected` — the main projectDir holds it), the orchestrator promotes the
+   * phase's integration branch onto protected (checkout protected && merge int) in
+   * the shared projectDir. Serialized under the same promoteMutex as
+   * {@link promotePhasePr}, so promotes onto protected are ordered, never
+   * concurrent. Called only when {@link promotePhasePr} is absent and the phase is
+   * green. Absent (runner-only unit tests) → no local promote.
+   */
+  promoteLocal?: (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => Promise<void>;
   /**
    * Called once at the START of each wave (D3): re-checks-out the protected
    * branch so this wave's phases build their engines off the protected HEAD AS
@@ -212,14 +250,32 @@ export async function runParallelWaves(
           // markSettled in finally so no dependent hangs. (FIX 1's up-front
           // schedule-validity errors are raised OUTSIDE this body and still abort
           // the whole run.)
+          // Per-phase worktree isolation (Chunk C PR-1): each wave member runs
+          // segment (a) in its OWN linked worktree so two concurrent members never
+          // race the shared projectDir's HEAD / index. Created under the held
+          // permit (so at most `cap` worktrees coexist) and removed in `finally`
+          // so a worktree never survives the phase's settlement — even on a
+          // resolvePhase / runPhase throw.
+          let phaseDir: string | undefined;
           try {
             const phase = await ctx.resolvePhase(waveToken);
-            const { result, halted } = await ctx.runPhase(phase);
+            if (ctx.createPhaseWorktree) {
+              phaseDir = await ctx.createPhaseWorktree(phase);
+            }
+            const { result, halted } = await ctx.runPhase(phase, phaseDir);
             const promoted = result.success && !halted;
             if (!promoted) failed.add(memberId);
+            // Promotion (segment b) is serialized under promoteMutex so protected
+            // advances one phase at a time, never concurrently (D2/D6). With
+            // openPullRequests:true the admin-merge IS the promotion (protected
+            // advances on the remote); otherwise the orchestrator promotes the
+            // integration branch locally in the shared projectDir (the phase
+            // worktree cannot check out protected).
             let prUrl: string | undefined;
             if (promoted && ctx.promotePhasePr) {
               prUrl = await promoteMutex.runExclusive(() => ctx.promotePhasePr!(phase, result));
+            } else if (promoted && ctx.promoteLocal) {
+              await promoteMutex.runExclusive(() => ctx.promoteLocal!(phase, result));
             }
             return { phaseNumber: phase.number, result, promoted, ...(prUrl && { prUrl }) };
           } catch (err) {
@@ -237,6 +293,13 @@ export async function runParallelWaves(
             };
             return { phaseNumber, result, promoted: false, errorReason };
           } finally {
+            // Remove this phase's worktree (success / fail / skip) — best-effort,
+            // never throws (the hook swallows its own errors). Runs BEFORE
+            // markSettled so a dependent that wakes on settlement never observes a
+            // live predecessor worktree.
+            if (phaseDir && ctx.removePhaseWorktree) {
+              await ctx.removePhaseWorktree(phaseDir);
+            }
             markSettled(memberId);
           }
         });

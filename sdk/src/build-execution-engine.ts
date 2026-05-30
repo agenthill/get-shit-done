@@ -199,20 +199,30 @@ export async function buildGitExecutionEngineFactory(
   // logic reattach to a prior run's worktrees after a crash.
   const projectHash = createHash('sha1').update(projectDir).digest('hex').slice(0, 12);
 
-  return ({ phaseNumber }) => {
+  return ({ projectDir: phaseDir, phaseNumber }) => {
+    // HONOR the PASSED projectDir (ADR 0014 #13 gap-2, Chunk C PR-1): under the
+    // parallel wave executor the runner passes the phase's OWN linked worktree as
+    // `projectDir`, so the per-plan worktrees, merge serializer, and integration
+    // manager all operate inside that isolated tree — never the shared build-time
+    // projectDir whose HEAD/index two concurrent phases would race. The sequential
+    // path passes the build-time projectDir, so behaviour there is unchanged.
+    // `baseSha`/`protectedBranch` are resolved at build time against the real repo
+    // (a linked worktree shares the object store, so the base commit + protected
+    // ref are reachable from the phase worktree).
+    const engineDir = phaseDir;
     const worktreeRoot = join(tmpdir(), 'gsd-sdk-worktrees', projectHash, `phase-${phaseNumber}`);
     // `git worktree add` creates the leaf dir but not intermediate parents; the
     // manager does not mkdir its root, so ensure it exists here.
     mkdirSync(worktreeRoot, { recursive: true });
-    const serializer = new GitMergeSerializer(projectDir, protectedBranch, runGate);
+    const serializer = new GitMergeSerializer(engineDir, protectedBranch, runGate);
     return {
-      worktrees: new GitWorktreeManager(projectDir, worktreeRoot),
+      worktrees: new GitWorktreeManager(engineDir, worktreeRoot),
       serializer,
       baseSha,
       isolated: true,
       // Per-phase branch + promote-on-green (ADR 0013 option 4). Shares the
       // serializer so its promote merge reuses the same guard suite.
-      phaseIntegration: new GitPhaseIntegrationManager(projectDir, serializer),
+      phaseIntegration: new GitPhaseIntegrationManager(engineDir, serializer),
       protectedBranch,
     };
   };

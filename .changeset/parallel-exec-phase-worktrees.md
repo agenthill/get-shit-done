@@ -1,0 +1,6 @@
+---
+type: Changed
+pr: 22
+---
+<!-- docs-exempt: engine wiring; user-facing docs for the /gsd-execute-parallel command land in Chunk C PR-2 (ADR 0014). -->
+**Per-phase worktree isolation for the parallel wave executor (Chunk C PR-1 of ADR 0014, issue #13 gap 2).** Each wave member of `GSD.runParallel` now executes its isolated segment (checkpoint → integration branch → plan execution → verify) in its OWN linked git worktree, off the wave's protected base SHA, so two concurrent phases in a wave never race the shared `projectDir` working tree / index / `HEAD`. The promote-to-protected segment stays a serialized shared-`projectDir` operation (the protected branch can only be checked out in one worktree): under `openPullRequests:true` promotion is the per-phase PR admin-merge (D6); under `openPullRequests:false` it is the local serialized `GitPhaseIntegrationManager.promote()` under the `promoteMutex`. The sequential `GSD.run` path is unchanged (a phase's worktree dir is threaded only when present; absent → the original `projectDir` behaviour). Worktrees are removed after each phase settles (success/fail/skip). The `/gsd-execute-parallel` command, config, and the `onWaveStart` origin-sync for the multi-wave PR-promote path land in Chunk C PR-2.
