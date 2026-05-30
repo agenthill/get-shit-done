@@ -41,6 +41,8 @@ import { ContextEngine } from './context-engine.js';
 import { PromptFactory } from './phase-prompt.js';
 import { detectRuntime, normalizePhaseName } from './query/helpers.js';
 import { runParallelWaves } from './parallel-runner.js';
+import { pushBranchAndOpenPr, adminMergeOnGreen, defaultRunners } from './pr-merge.js';
+import { integrationBranchFor } from './query/phase-checkpoint.js';
 import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
 import { classifyAgentFailure } from './query/agent-failure-classifier.js';
 import { rollbackTier1, cascadeRollbackTier2, resumeIncompleteRollback } from './query/rollback-engine.js';
@@ -401,6 +403,12 @@ export class GSD {
       analysis.phases.map((p) => [normalizePhaseName(p.number), p] as const),
     );
 
+    // D6: PR-per-phase promotion. On by default; tests / non-remote repos pass
+    // `openPullRequests: false` to stop at the local promote-on-green.
+    const openPrs = options?.openPullRequests !== false;
+    const protectedBranch = await this.resolveProtectedBranch(config);
+    const runners = options?.prRunners ?? defaultRunners(this.projectDir);
+
     return runParallelWaves(phaseNumbers, options, {
       projectDir: this.projectDir,
       ...(this.workstream && { workstream: this.workstream }),
@@ -413,6 +421,22 @@ export class GSD {
         return found;
       },
       runPhase: (phase) => this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts),
+      ...(openPrs && {
+        promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
+          const branch = integrationBranchFor(phase.number);
+          const url = await pushBranchAndOpenPr(
+            {
+              branch,
+              baseBranch: protectedBranch,
+              title: `Phase ${phase.number}: ${result.phaseName}`,
+              body: 'Auto-generated parallel phase PR (ADR 0014). Closes the phase backlog item.',
+            },
+            runners,
+          );
+          await adminMergeOnGreen(url, runners);
+          return url;
+        },
+      }),
     });
   }
 

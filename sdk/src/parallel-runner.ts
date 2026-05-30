@@ -26,7 +26,7 @@ import type {
   RoadmapPhaseInfo,
 } from './types.js';
 import { scheduleWavesForPhases } from './query/wave-scheduler.js';
-import { Semaphore, resolveConcurrencyCap } from './execution-engine.js';
+import { Semaphore, Mutex, resolveConcurrencyCap } from './execution-engine.js';
 
 /** The orchestration surface the GSD class supplies to the wave loop. */
 export interface ParallelDriverContext {
@@ -37,6 +37,11 @@ export interface ParallelDriverContext {
   resolvePhase: (waveToken: string) => Promise<RoadmapPhaseInfo>;
   /** The EXISTING per-phase rollback/retry driver (GSD.runPhaseWithRollbackRetry). */
   runPhase: (phase: RoadmapPhaseInfo) => Promise<{ result: PhaseRunnerResult; halted: boolean }>;
+  /**
+   * Open + admin-merge the phase's PR after a green local promote (D6). Returns
+   * the PR url. Absent → no PR step (local-only / openPullRequests:false).
+   */
+  promotePhasePr?: (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => Promise<string>;
 }
 
 /**
@@ -57,6 +62,9 @@ export async function runParallelWaves(
   // process-wide singleton in chunk C).
   const cap = resolveConcurrencyCap(ctx.parallelization);
   const semaphore = new Semaphore(cap);
+  // Serialize PR auto-merges in wave order — preserves the single-writer (D2)
+  // property: ordered promotes onto protected, never concurrent.
+  const promoteMutex = new Mutex();
 
   const waves: WaveResult[] = [];
   const allOutcomes: PhaseParallelOutcome[] = [];
@@ -70,7 +78,11 @@ export async function runParallelWaves(
           const phase = await ctx.resolvePhase(waveToken);
           const { result, halted } = await ctx.runPhase(phase);
           const promoted = result.success && !halted;
-          return { phaseNumber: phase.number, result, promoted };
+          let prUrl: string | undefined;
+          if (promoted && ctx.promotePhasePr) {
+            prUrl = await promoteMutex.runExclusive(() => ctx.promotePhasePr!(phase, result));
+          }
+          return { phaseNumber: phase.number, result, promoted, ...(prUrl && { prUrl }) };
         }),
       ),
     );

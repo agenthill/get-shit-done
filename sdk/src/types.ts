@@ -612,6 +612,11 @@ export interface ParallelRunnerOptions extends MilestoneRunnerOptions {
    * Default true.
    */
   openPullRequests?: boolean;
+  /**
+   * Injectable gh/git runners for the PR-per-phase promotion (D6). Tests pass a
+   * fake; production omits it → defaultRunners(projectDir). Internal seam.
+   */
+  prRunners?: { gh: (args: string[]) => Promise<string>; git: (args: string[]) => Promise<string> };
 }
 
 /** Result of a full parallel multi-phase run. */

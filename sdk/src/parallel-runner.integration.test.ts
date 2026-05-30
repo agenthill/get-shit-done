@@ -96,4 +96,36 @@ describe('GSD.runParallel — happy path wave loop (D1)', () => {
     expect(res.phases.every((p) => p.promoted)).toBe(true);
     expect(runSpy).toHaveBeenCalledTimes(2);
   });
+
+  it('opens + admin-merges a PR per green phase, serialized in wave order (D6)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    const gsd = new GSD({ projectDir: dir });
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry')
+      .mockImplementation(async (phase: any) => ({ result: greenResult(phase.number), halted: false }));
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue(twoPhaseRoadmap()),
+    } as never);
+
+    const merges: string[] = [];
+    const fakeRunners = {
+      gh: vi.fn(async (args: string[]) => {
+        if (args[0] === 'pr' && args[1] === 'create') {
+          return `https://x/pull/${args[args.indexOf('--head') + 1]}\n`;
+        }
+        if (args[0] === 'pr' && args[1] === 'merge') merges.push(args[2]);
+        return '';
+      }),
+      git: vi.fn(async () => ''),
+    };
+
+    const res = await gsd.runParallel(['1', '2'], {
+      openPullRequests: true,
+      prRunners: fakeRunners,
+    });
+
+    expect(res.phases.every((p) => p.prUrl)).toBe(true);
+    // One merge per green phase, in wave order (both members of wave 0).
+    expect(merges).toHaveLength(2);
+  });
 });
