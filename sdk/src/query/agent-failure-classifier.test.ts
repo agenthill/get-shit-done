@@ -144,6 +144,91 @@ describe('classifyAgentFailure', () => {
     });
   });
 
+  describe('GROUP-C — content vs runtime-termination provenance', () => {
+    it('a quota-looking word in gate/verify CONTENT (no HTTP/runtime context) is NOT trusted as quota → genuine', () => {
+      // A failing test whose name/message mentions rate-limiting is a GENUINE
+      // failure, not a transient quota event. Pre-fix this was misclassified
+      // transient and burned up to 50 identical re-runs.
+      const body = 'FAIL src/rate-limit.test.ts > enforces rate limit: expected 429 but got 200';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('unknown-failure'); // GENUINE, not quota
+    });
+
+    it('the SAME runtime-termination cause IS trusted as quota (the genuine resume path is preserved)', () => {
+      const body = 'FAIL src/rate-limit.test.ts > enforces rate limit: expected 429 but got 200';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: true });
+      expect(result.class).toBe('quota-exceeded');
+    });
+
+    it('a content quota sentinel WITH HTTP/runtime context IS still trusted as quota (a real API 429 during a gate)', () => {
+      const body = 'gate failed: HTTP 429 Too Many Requests from api.anthropic.com; retry-after: 30';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('quota-exceeded');
+      expect(result.retryAfterSeconds).toBe(30);
+    });
+
+    it('default (no options) trusts the body as a runtime-termination cause (#3095 query contract preserved)', () => {
+      const result = classifyAgentFailure('Your monthly quota has been exhausted.');
+      expect(result.class).toBe('quota-exceeded');
+    });
+
+    it('R3 (C-1): the Claude-subscription kill text on the GATE path (no runtime marker) IS quota → resume', () => {
+      // Reproduces-then-kills C-1: a real EXECUTE quota kill returns a failed
+      // PlanResult (gate signal, fromRuntimeTermination=false) with the human
+      // subscription phrasing and NONE of the HTTP/runtime markers. Pre-R3 the
+      // content gate misread it as genuine → rollback + burn the retry budget.
+      const body = 'Claude AI usage limit reached. Your limit will reset at 4pm.';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('quota-exceeded');
+    });
+
+    it('R3 (C-1): a standalone "your limit will reset at" phrasing (no QUOTA_SENTINEL token) is still quota', () => {
+      const result = classifyAgentFailure('Paused — your limit will reset at midnight UTC.', {
+        fromRuntimeTermination: false,
+      });
+      expect(result.class).toBe('quota-exceeded');
+    });
+
+    it('R3 (ii): a gate transient carrying a quota sentinel + RUNTIME provenance (retry-after / x-ratelimit) still resumes', () => {
+      const body = 'rate limit hit; x-ratelimit-remaining: 0; retry-after: 45';
+      const result = classifyAgentFailure(body, { fromRuntimeTermination: false });
+      expect(result.class).toBe('quota-exceeded');
+      expect(result.retryAfterSeconds).toBe(45);
+    });
+
+    it('R3 (C-2): a genuine failing test merely naming "http"/"anthropic" (no narrow marker) is NOT misread as quota', () => {
+      // C-2: bare `http`/`anthropic` markers were over-broad — a genuine HTTP/
+      // rate-limit TEST emitting them would re-trigger the GROUP-C footgun. With
+      // the narrowed markers, this content stays GENUINE.
+      const httpTest = classifyAgentFailure(
+        'FAIL src/http-client.test.ts > rate limit backoff: expected 429 retry, got none',
+        { fromRuntimeTermination: false },
+      );
+      expect(httpTest.class).toBe('unknown-failure');
+      const anthropicTest = classifyAgentFailure(
+        'FAIL src/anthropic-adapter.test.ts > parses rate limit header: assertion failed',
+        { fromRuntimeTermination: false },
+      );
+      expect(anthropicTest.class).toBe('unknown-failure');
+    });
+
+    it('J1: a genuine gate-path "limit reached" failure (no quota verb) is NOT misread as quota → genuine', () => {
+      // J1: the over-broad `usage limit` / `limit reached` fragments were dropped
+      // from SUBSCRIPTION_QUOTA_PHRASES. A genuine gate-path failure detail that
+      // merely contains "... limit reached ..." with no reset/usage-quota verb is
+      // now classified GENUINE (rolls back + consumes an attempt) instead of
+      // spinning on WAITING.json up to MAX_CONSECUTIVE_TRANSIENT (50) times.
+      const connTest = classifyAgentFailure('connection limit reached for pool', {
+        fromRuntimeTermination: false,
+      });
+      expect(connTest.class).toBe('unknown-failure'); // GENUINE, not quota
+      const retryTest = classifyAgentFailure('retry limit reached after 3 attempts', {
+        fromRuntimeTermination: false,
+      });
+      expect(retryTest.class).toBe('unknown-failure'); // GENUINE, not quota
+    });
+  });
+
   describe('precedence', () => {
     it('quota sentinel wins over classify-handoff sentinel when both present', () => {
       // The runtime bug is a post-completion handler crash; if the underlying

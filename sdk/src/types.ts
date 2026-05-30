@@ -912,6 +912,33 @@ export interface PhaseStepResult {
 }
 
 /**
+ * One phase-attempt's failure record (ADR 0013 option 4, chunk 2). Accumulated
+ * across informed-retry attempts and injected into the executor context of the
+ * next attempt so the planner/executor ADAPTS rather than re-running blind.
+ */
+export interface PhaseFailureContext {
+  /** Attempt number this failure occurred on (1-based). */
+  attempt: number;
+  /** Which gate produced the failure. */
+  signal: 'gate' | 'verify' | 'throw';
+  /** Human-readable detail: gate exit summary / verify gaps / error message. */
+  detail: string;
+}
+
+/**
+ * The checkpoint artifacts the orchestrator needs to roll a failed phase back
+ * (ADR 0013 option 4, chunk 2). PhaseRunner captures this when a phase settles
+ * non-green so the cross-phase driver can call rollbackTier1().
+ */
+export interface PhaseRollbackContext {
+  phaseNumber: string;
+  protectedBranch: string;
+  lastGoodSha: string;
+  snapshotDir: string;
+  integrationBranch: string;
+}
+
+/**
  * Result of a full phase lifecycle run.
  */
 export interface PhaseRunnerResult {
@@ -921,6 +948,26 @@ export interface PhaseRunnerResult {
   success: boolean;
   totalCostUsd: number;
   totalDurationMs: number;
+  /**
+   * Present when the phase settled NON-green under the isolated git engine
+   * (ADR 0013 option 4). Carries the checkpoint artifacts the cross-phase
+   * driver needs to run Tier-1 rollback. Absent on green phases and on the
+   * no-op (shared-cwd) path.
+   */
+  rollbackContext?: PhaseRollbackContext;
+  /**
+   * Set (R4 / GH-1) when a promote FAILED AFTER `merge --no-ff` had already
+   * moved protected off LAST_GOOD (a guard-suite failure or a manifest-write
+   * failure post-merge). The phase-runner has ALREADY recovered a consistent,
+   * clean state — protected reset to LAST_GOOD, integration branch PRESERVED for
+   * recovery — so the driver must NOT run Tier-1 rollback (its branch-delete +
+   * `protected === LAST_GOOD` assert would delete the recoverable work and, on
+   * the moved tree, throw). The driver HALTs (recovery required), writing a
+   * halted ledger, WITHOUT a retry. Carries the recovery detail for the ledger.
+   * Mutually exclusive with rollbackContext (the protected-still-at-LAST_GOOD
+   * case keeps the normal Tier-1 path).
+   */
+  promoteRecoveryHalt?: { detail: string; integrationBranch: string };
 }
 
 /**
@@ -943,4 +990,11 @@ export interface PhaseRunnerOptions {
   model?: string;
   /** Maximum gap closure retries when verification finds gaps. Default: 1. */
   maxGapRetries?: number;
+  /**
+   * Prior-attempt failure context (ADR 0013 option 4, chunk 2). When present,
+   * PhaseRunner prepends a "PRIOR ATTEMPTS FAILED — address these before
+   * proceeding" block to the executor prompt so the executor adapts. The
+   * cross-phase driver accumulates this across informed-retry attempts.
+   */
+  priorFailureContext?: PhaseFailureContext[];
 }

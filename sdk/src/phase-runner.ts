@@ -17,6 +17,8 @@ import type {
   ParsedPlan,
   PhasePlanIndex,
   PlanDisposition,
+  PhaseFailureContext,
+  PhaseRollbackContext,
 } from './types.js';
 import { PhaseStepType, PhaseType, GSDEventType } from './types.js';
 import type { GSDConfig } from './config.js';
@@ -37,9 +39,24 @@ import {
   resolveConcurrencyCap,
   SharedCwdWorktreeManager,
   NoopMergeSerializer,
+  NoopPhaseIntegrationManager,
   type WorktreeManager,
   type MergeSerializer,
+  type PhaseIntegrationManager,
 } from './execution-engine.js';
+import {
+  createPhaseCheckpoint,
+  ensureCheckpointGitignore,
+  integrationBranchFor,
+  doneTagFor,
+  checkpointDirFor,
+} from './query/phase-checkpoint.js';
+import { recordPhasePromotion } from './query/phase-manifest.js';
+import { readPhaseDependsOn } from './query/phase-depends-on.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 // ─── Wave tracker ──────────────────────────────────────────────────────────────
 
@@ -187,6 +204,14 @@ export interface ExecutionEngineFactory {
      * no-op (shared-cwd) engine, whose create() never throws.
      */
     isolated?: boolean;
+    /**
+     * Per-phase branch + promote-on-green collaborator (ADR 0013 option 4).
+     * Present only on the real isolated engine; absent → the no-op path with no
+     * integration branch (the runner substitutes a {@link NoopPhaseIntegrationManager}).
+     */
+    phaseIntegration?: PhaseIntegrationManager;
+    /** Protected branch the phase promotes onto. '' for the no-op path. */
+    protectedBranch?: string;
   };
 }
 
@@ -216,6 +241,31 @@ export class PhaseRunner {
   private readonly logger?: GSDLogger;
   private readonly executionEngineFactory?: ExecutionEngineFactory;
 
+  /**
+   * Active per-phase integration context (ADR 0013 option 4). Set at the FIRST
+   * isolated execute of a phase (checkpoint + integration branch begun); read at
+   * promote-on-green after verify passes. Cleared when the phase settles. Only
+   * the orchestrator touches it; null on the no-op (shared-cwd) path.
+   */
+  private phaseIntegration:
+    | {
+        phaseNumber: string;
+        integrationBranch: string;
+        protectedBranch: string;
+        lastGoodSha: string;
+        baseTag: string;
+        manager: PhaseIntegrationManager;
+      }
+    | null = null;
+
+  /**
+   * Prior-attempt failure context for the CURRENT run (ADR 0013 option 4, chunk
+   * 2). Set from options at the top of run(); read in executeSinglePlan to
+   * prepend a "PRIOR ATTEMPTS FAILED" block to the executor prompt so an
+   * informed retry adapts instead of re-running blind. Reset each run().
+   */
+  private priorFailureContext: PhaseFailureContext[] = [];
+
   constructor(deps: PhaseRunnerDeps) {
     this.projectDir = deps.projectDir;
     this.tools = deps.tools;
@@ -237,6 +287,10 @@ export class PhaseRunner {
     const startTime = Date.now();
     const steps: PhaseStepResult[] = [];
     const callbacks = options?.callbacks ?? {};
+    // Prior-attempt failure context for this run (ADR 0013 option 4, chunk 2):
+    // the cross-phase driver passes it on an informed retry; executeSinglePlan
+    // prepends it to the executor prompt. Reset per run.
+    this.priorFailureContext = options?.priorFailureContext ?? [];
 
     // ── Init: query phase state ──
     let phaseOp: PhaseOpInfo;
@@ -415,14 +469,162 @@ export class PhaseRunner {
       }
     }
 
-    // ── Step 6: Advance ──
-    // Only advance if verify passed — never mark a phase complete when gaps were found.
+    // ── Step 5.5: Promote-on-green (ADR 0013 option 4) ──
+    // The PHASE is the atomic protected-branch unit: protected moves ONLY here,
+    // and ONLY when the phase is green — gate testExit==0 (carried by the execute
+    // step's success, inv-3) AND verifyPassed. A non-green phase does NOTHING to
+    // protected; the integration branch is left at LAST_GOOD-forked state for
+    // chunk 2's rollback. No-op when no isolated phase integration is active.
     const verifyPassed = steps.every(s => s.step !== PhaseStepType.Verify || s.success);
-    if (!halted && verifyPassed) {
+    const executePassed = steps.every(s => s.step !== PhaseStepType.Execute || s.success);
+    const phaseGreen = !halted && verifyPassed && executePassed;
+    // Rollback context captured when a phase settles non-green under the
+    // isolated engine (ADR 0013 option 4, chunk 2): the cross-phase driver
+    // reads it from the result to run Tier-1 rollback. Stays undefined on green
+    // and on the no-op (shared-cwd) path.
+    let rollbackContext: PhaseRollbackContext | undefined;
+    // R4 (GH-1): set when a promote moved protected then failed post-merge and the
+    // runner recovered IN-PLACE (reset protected to LAST_GOOD, integration branch
+    // preserved). Signals the driver to HALT for recovery WITHOUT Tier-1.
+    let promoteRecoveryHalt: PhaseRunnerResult['promoteRecoveryHalt'];
+    if (this.phaseIntegration?.phaseNumber === phaseNumber) {
+      if (phaseGreen) {
+        // Snapshot the context + LAST_GOOD before promote so a failed promote can
+        // capture rollback context and assert protected actually moved.
+        const ctx = this.phaseIntegration;
+        let promoteFailed = false;
+        let promoteFailDetail = '';
+        let promoteThrew = false;
+        // Protected's sha IMMEDIATELY before promote. R4 detects whether THIS
+        // promote's `merge --no-ff` moved protected by comparing after-vs-before —
+        // NOT after-vs-LAST_GOOD: protected may legitimately differ from LAST_GOOD
+        // (a concurrent commit), and only a change caused by this promote means the
+        // merge landed and a post-merge step then threw.
+        const protectedBeforePromote = await this.revParseOrEmpty(ctx.protectedBranch);
+        try {
+          await this.promotePhaseOnGreen(phaseNumber);
+          // GROUP-G: ctx.manager.promote() does `git merge --no-ff` — a merge that
+          // produces a commit moves protected off LAST_GOOD. After a "successful"
+          // promote, verify protected actually moved.
+          const protectedSha = (
+            await execFileAsync('git', ['rev-parse', ctx.protectedBranch], { cwd: this.projectDir })
+          ).stdout.trim();
+          if (protectedSha === ctx.lastGoodSha) {
+            // R5 (GH-3): protected == LAST_GOOD after a SUCCESS promote is only a
+            // failure when the integration branch actually carried commits beyond
+            // LAST_GOOD (then the merge silently no-op'd / a conflict was caught).
+            // A green phase whose integration branch has ZERO net commits beyond
+            // LAST_GOOD (`git merge --no-ff` reports "Already up to date", makes no
+            // commit) is a genuinely-vacuous green phase that promotes
+            // successfully — protected at LAST_GOOD is the CORRECT promoted state,
+            // not a failure. Only count >0-delta integration branches as failed.
+            const intDelta = await this.countCommitsBeyond(ctx.lastGoodSha, ctx.integrationBranch);
+            if (intDelta > 0) {
+              promoteFailed = true;
+              promoteFailDetail = `promote did not move protected ${ctx.protectedBranch} off LAST_GOOD ${ctx.lastGoodSha} despite ${intDelta} integration commit(s)`;
+            }
+            // intDelta === 0 → vacuous green phase, promote succeeds (no-op).
+          }
+        } catch (err) {
+          // A promote failure must NOT be reported as a green phase.
+          promoteFailed = true;
+          promoteThrew = true;
+          promoteFailDetail = err instanceof Error ? err.message : String(err);
+        }
+        if (promoteFailed) {
+          // R4 (GH-1): distinguish whether THIS promote's `merge --no-ff` ALREADY
+          // moved protected. A guard-suite failure or a manifest-write failure
+          // throws AFTER the merge commit landed, so protected ADVANCED past where
+          // it was just before this promote. Running Tier-1 there would delete the
+          // integration branch then assert protected === LAST_GOOD and THROW —
+          // leaving protected advanced, the work unrecoverable, and an uncaught
+          // exception. Compare protected NOW against its pre-promote sha (not
+          // LAST_GOOD — a concurrent commit can move protected legitimately without
+          // this promote landing).
+          const protectedShaNow = await this.revParseOrEmpty(ctx.protectedBranch);
+          const protectedMoved =
+            protectedShaNow !== '' &&
+            protectedBeforePromote !== '' &&
+            protectedShaNow !== protectedBeforePromote;
+          if (promoteThrew && protectedMoved) {
+            // Recover a CLEAN, consistent, HALTED state IN-PLACE: reset protected
+            // back to its pre-promote sha (= LAST_GOOD in the single-writer
+            // autonomous flow — the merge is undone, whether the guard caught a bad
+            // delta or the manifest write failed), leave a clean tree, and PRESERVE
+            // the integration branch so the work is recoverable. Do NOT capture a
+            // Tier-1 rollbackContext (its branch-delete + LAST_GOOD assert would
+            // destroy the work / throw); signal the driver to HALT for recovery.
+            await this.resetProtectedToLastGood(ctx.protectedBranch, protectedBeforePromote);
+            this.logger?.warn(
+              `Phase ${phaseNumber} promote moved protected then failed post-merge — reset protected to ${protectedBeforePromote}, integration branch ${ctx.integrationBranch} preserved for recovery: ${promoteFailDetail}`,
+            );
+            steps.push({
+              step: PhaseStepType.Execute,
+              success: false,
+              durationMs: 0,
+              error: `promote-on-green failed after protected moved (recovered, halt for review): ${promoteFailDetail}`,
+            });
+            promoteRecoveryHalt = {
+              detail: promoteFailDetail,
+              integrationBranch: ctx.integrationBranch,
+            };
+            // KEEP this.phaseIntegration null'd so a subsequent run forks a fresh
+            // checkpoint; the integration branch ref itself survives on disk.
+            this.phaseIntegration = null;
+          } else {
+            // Protected still at LAST_GOOD (pre-merge failure, caught conflict, or
+            // a no-op with integration commits): the normal Tier-1 path is valid.
+            this.logger?.warn(
+              `Phase ${phaseNumber} promote-on-green failed (protected left at LAST_GOOD): ${promoteFailDetail}`,
+            );
+            steps.push({
+              step: PhaseStepType.Execute,
+              success: false,
+              durationMs: 0,
+              error: `promote-on-green failed: ${promoteFailDetail}`,
+            });
+            rollbackContext = {
+              phaseNumber: ctx.phaseNumber,
+              protectedBranch: ctx.protectedBranch,
+              lastGoodSha: ctx.lastGoodSha,
+              snapshotDir: checkpointDirFor(this.projectDir, phaseNumber),
+              integrationBranch: ctx.integrationBranch,
+            };
+          }
+        }
+      } else {
+        // Not green: protected stays at LAST_GOOD. Capture the checkpoint
+        // artifacts so the cross-phase driver can run Tier-1 rollback, THEN drop
+        // the active context so a subsequent run starts a fresh checkpoint.
+        this.logger?.warn(`Phase ${phaseNumber} not green — protected left at LAST_GOOD (no promote)`);
+        const ctx = this.phaseIntegration;
+        rollbackContext = {
+          phaseNumber: ctx.phaseNumber,
+          protectedBranch: ctx.protectedBranch,
+          lastGoodSha: ctx.lastGoodSha,
+          snapshotDir: checkpointDirFor(this.projectDir, phaseNumber),
+          integrationBranch: ctx.integrationBranch,
+        };
+        this.phaseIntegration = null;
+      }
+    }
+
+    // ── Step 6: Advance ──
+    // Only advance if verify passed — never mark a phase complete when gaps were
+    // found. Also skip when a rollbackContext was captured (the phase settled
+    // non-green OR a promote-on-green failure left protected at LAST_GOOD,
+    // GROUP-G fix): advancing would mark the ROADMAP complete for work that never
+    // reached protected. (rollbackContext is only set under the isolated engine;
+    // the no-op shared-cwd path leaves it undefined and advances as before.)
+    if (!halted && verifyPassed && !rollbackContext && !promoteRecoveryHalt) {
       const advanceResult = await this.runAdvanceStep(phaseNumber, sessionOpts, callbacks);
       steps.push(advanceResult);
     } else if (!halted && !verifyPassed) {
       this.logger?.warn(`Skipping advance for phase ${phaseNumber}: verification found gaps`);
+    } else if (!halted && rollbackContext) {
+      this.logger?.warn(`Skipping advance for phase ${phaseNumber}: promote-on-green failed (protected at LAST_GOOD)`);
+    } else if (!halted && promoteRecoveryHalt) {
+      this.logger?.warn(`Skipping advance for phase ${phaseNumber}: promote moved protected then failed (recovered to LAST_GOOD; halt for recovery)`);
     }
 
     const totalDurationMs = Date.now() - startTime;
@@ -452,6 +654,8 @@ export class PhaseRunner {
       success,
       totalCostUsd,
       totalDurationMs,
+      ...(rollbackContext && { rollbackContext }),
+      ...(promoteRecoveryHalt && { promoteRecoveryHalt }),
     };
   }
 
@@ -895,6 +1099,20 @@ export class PhaseRunner {
     const phaseLevel = Number.parseInt(phaseNumber, 10);
     const phaseTag = Number.isFinite(phaseLevel) ? phaseLevel : 0;
 
+    // ── Per-phase integration spine (ADR 0013 option 4) ──
+    // Under the REAL isolated engine that opts into the spine (provides a
+    // phaseIntegration manager + protectedBranch), make the PHASE the atomic
+    // protected-branch unit: checkpoint LAST_GOOD, fork the phase integration
+    // branch off it, and retarget per-plan merges onto it. Protected is left at
+    // LAST_GOOD and only promotes on green (after verify, in run()). Begun ONCE
+    // per phase — gap-closure re-execute reuses the existing integration branch
+    // rather than resetting it (a reset would discard the first execute's merges).
+    // Gated on `phaseIntegration` (not merely `isolated`) so an isolated engine
+    // that does not provide the spine keeps PR #8's per-plan-onto-protected path.
+    if (engine.isolated === true && engine.phaseIntegration) {
+      await this.beginPhaseIntegration(phaseNumber, engine);
+    }
+
     // WaveTracker: emit synthetic WaveStart/WaveComplete at level boundaries so
     // event-stream cardinality stays byte-compatible. Only when parallelizing
     // (parallelization===false emits no wave events, matching prior behaviour).
@@ -1133,6 +1351,203 @@ export class PhaseRunner {
     return { planResults, dispositions };
   }
 
+  // ─── Per-phase integration spine (ADR 0013 option 4) ─────────────────────
+
+  /**
+   * At the first isolated execute of a phase: checkpoint LAST_GOOD (tag +
+   * doc snapshot), ensure the checkpoint dirs are git-ignored, fork the phase
+   * integration branch off LAST_GOOD, and retarget per-plan merges onto it.
+   * Idempotent across gap-closure re-execute: if this phase's integration is
+   * already begun, reuses it (does NOT reset the branch, which would discard the
+   * first execute's merges).
+   */
+  private async beginPhaseIntegration(
+    phaseNumber: string,
+    engine: { phaseIntegration?: PhaseIntegrationManager; protectedBranch?: string },
+  ): Promise<void> {
+    if (this.phaseIntegration?.phaseNumber === phaseNumber) {
+      // Already begun for this phase (gap-closure re-execute) — keep accumulating
+      // on the existing integration branch; do not re-checkpoint or reset.
+      return;
+    }
+
+    const manager = engine.phaseIntegration ?? new NoopPhaseIntegrationManager();
+    const protectedBranch = engine.protectedBranch ?? '';
+    const integrationBranch = integrationBranchFor(phaseNumber);
+
+    // Checkpoint + git-ignore the snapshot dirs BEFORE forking the branch, so the
+    // guard suite's `git add -A` can never stage them.
+    await ensureCheckpointGitignore(this.projectDir);
+    const checkpoint = await createPhaseCheckpoint({
+      projectDir: this.projectDir,
+      phaseNumber,
+      protectedBranch,
+    });
+
+    await manager.begin(integrationBranch, checkpoint.lastGoodSha);
+
+    this.phaseIntegration = {
+      phaseNumber,
+      integrationBranch,
+      protectedBranch,
+      lastGoodSha: checkpoint.lastGoodSha,
+      baseTag: checkpoint.baseTag,
+      manager,
+    };
+  }
+
+  /**
+   * Promote the active phase's integration branch onto protected — ONE guarded
+   * `merge --no-ff` — record the promotion in the manifest, and tag
+   * `gsd/phase-<N>-done`. Called from run() ONLY after the phase goes green
+   * (gate testExit==0 AND verifyPassed). On a non-green phase this is never
+   * called, so protected stays at LAST_GOOD (the integration branch is left in
+   * place for chunk 2's rollback/retry).
+   *
+   * The orchestrator stamps the promotion timestamp here (no clock in the
+   * manifest writer). Single-writer: only this method moves protected.
+   */
+  private async promotePhaseOnGreen(phaseNumber: string): Promise<void> {
+    const ctx = this.phaseIntegration;
+    if (!ctx || ctx.phaseNumber !== phaseNumber) return;
+
+    const headSha = await ctx.manager.promote(
+      ctx.integrationBranch,
+      ctx.protectedBranch,
+      ctx.lastGoodSha,
+    );
+
+    // Parse the phase's cross-phase `depends_on` from the ROADMAP so the manifest
+    // records the dependency edges chunk 3's Tier-2 cascade classifier scopes a
+    // reverted predecessor to. Best-effort: a parse failure leaves [] (no edges →
+    // the classifier can only ever decide no-cascade for this phase, never
+    // cascade on a guess).
+    let dependsOn: string[] = [];
+    try {
+      dependsOn = await readPhaseDependsOn(this.projectDir, phaseNumber);
+    } catch {
+      dependsOn = [];
+    }
+
+    // GROUP-H fix: the merge has ALREADY moved protected. The manifest entry is
+    // the cascade's SOURCE OF TRUTH — a Tier-2 cascade can never attribute to a
+    // phase absent from the manifest. So the manifest write is LOAD-BEARING: if
+    // it throws (now that protected has advanced), the phase is on protected but
+    // unattributable, which is a recovery-needed inconsistency — THROW so the
+    // caller (run() Step 5.5) does NOT report a clean success (GROUP-G catch then
+    // fails the phase / captures rollback context). The tag is a SEPARATE,
+    // best-effort concern: a tag-write failure must not lose the manifest entry.
+    try {
+      await recordPhasePromotion({
+        projectDir: this.projectDir,
+        phaseNumber,
+        baseTag: ctx.baseTag,
+        baseSha: ctx.lastGoodSha,
+        headSha,
+        // Orchestrator stamps the clock (the manifest writer has none).
+        promotedAt: new Date().toISOString(),
+        dependsOn,
+      });
+    } catch (err) {
+      throw new PhaseRunnerError(
+        `Phase ${phaseNumber} promoted onto ${ctx.protectedBranch} (@ ${headSha}) but the manifest write FAILED — ` +
+          `the phase is on protected yet unattributable to a Tier-2 cascade. Recovery required: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        phaseNumber,
+        PhaseStepType.Advance,
+        err instanceof Error ? err : undefined,
+      );
+    }
+
+    // Tag the promoted protected HEAD. Force so a re-promote (resume) re-pins.
+    // Best-effort + separate from the manifest: the manifest entry (above) is the
+    // cascade's source of truth; a tag-write failure must not orphan it or fail
+    // the phase. Log and continue.
+    try {
+      await execFileAsync(
+        'git',
+        ['tag', '-f', '-a', doneTagFor(phaseNumber), '-m', `gsd phase ${phaseNumber} promoted @ ${headSha}`, headSha],
+        { cwd: this.projectDir },
+      );
+    } catch (err) {
+      this.logger?.warn(
+        `Phase ${phaseNumber} done-tag write failed (manifest entry recorded; promotion stands): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    this.phaseIntegration = null;
+  }
+
+  /**
+   * `git rev-parse <ref>` trimmed, or '' on any git error (R4). Used to read
+   * protected's sha when deciding whether a failed promote already moved it.
+   */
+  private async revParseOrEmpty(ref: string): Promise<string> {
+    try {
+      return (await execFileAsync('git', ['rev-parse', ref], { cwd: this.projectDir })).stdout.trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Count commits on `ref` beyond `baseSha` (`git rev-list baseSha..ref`) (R5).
+   * 0 when ref has no net commits past LAST_GOOD (a vacuous green phase whose
+   * `merge --no-ff` is a no-op). Returns 0 on any git error (a missing ref
+   * cannot have contributed commits — treated as the no-op case).
+   */
+  private async countCommitsBeyond(baseSha: string, ref: string): Promise<number> {
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['rev-list', '--count', `${baseSha}..${ref}`],
+        { cwd: this.projectDir },
+      );
+      const n = Number.parseInt(stdout.trim(), 10);
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Recover protected to LAST_GOOD after a promote moved it then failed
+   * post-merge (R4 / GH-1). Checkout protected, hard-reset it to LAST_GOOD (undo
+   * the merge commit), and clean any residue so the tree is consistent. The
+   * integration branch is deliberately LEFT in place for recovery. Best-effort
+   * per step (this runs in a failure path); the caller signals a HALT regardless.
+   */
+  private async resetProtectedToLastGood(protectedBranch: string, lastGoodSha: string): Promise<void> {
+    const git = (args: string[]) =>
+      execFileAsync('git', args, { cwd: this.projectDir }).catch(() => undefined);
+    // Abort any in-flight merge/revert state first so the reset is unobstructed.
+    await git(['merge', '--abort']);
+    await git(['checkout', protectedBranch]);
+    await git(['reset', '--hard', lastGoodSha]);
+    await git(['clean', '-fd']);
+  }
+
+  /**
+   * Render the "PRIOR ATTEMPTS FAILED" block prepended to the executor prompt on
+   * an informed retry (ADR 0013 option 4, chunk 2). Lists every accumulated
+   * prior-attempt failure (attempt #, signal, detail) so the executor adapts.
+   */
+  private renderPriorFailureBlock(): string {
+    const lines = this.priorFailureContext.map(
+      (f) => `- Attempt ${f.attempt} failed (${f.signal}): ${f.detail}`,
+    );
+    return [
+      '## PRIOR ATTEMPTS FAILED — address these before proceeding',
+      '',
+      'This phase has already failed and been rolled back. The protected branch',
+      'is back at its last-good state. Do NOT repeat the prior approach; the',
+      'failures below recur on a blind re-run. Diagnose and fix the root cause of',
+      'each before re-implementing:',
+      '',
+      ...lines,
+    ].join('\n');
+  }
+
   /** Synthesize a failed PlanResult for a plan blocked by a failed ancestor. */
   private synthesizeBlockedResult(planId: string, blockedBy: string[]): PlanResult {
     return {
@@ -1186,7 +1601,15 @@ export class PhaseRunner {
 
       const phaseType = PhaseType.Execute;
       const contextFiles = await this.contextEngine.resolveContextFiles(phaseType);
-      const prompt = await this.promptFactory.buildPrompt(phaseType, parsedPlan, contextFiles, phaseOp.phase_dir);
+      const builtPrompt = await this.promptFactory.buildPrompt(phaseType, parsedPlan, contextFiles, phaseOp.phase_dir);
+
+      // ADR 0013 option 4 (chunk 2): on an informed retry, PREPEND the
+      // accumulated prior-attempt failure context so the executor addresses the
+      // known failures before re-running. A blind re-run would fail identically;
+      // this block is the whole point of the auto-retry override.
+      const prompt = this.priorFailureContext.length > 0
+        ? `${this.renderPriorFailureBlock()}\n\n${builtPrompt}`
+        : builtPrompt;
 
       return await runPhaseStepSession(
         prompt,

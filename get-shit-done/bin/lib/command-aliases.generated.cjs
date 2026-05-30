@@ -679,6 +679,13 @@ const NON_FAMILY_COMMAND_ALIASES = [
     "mutation": false
   },
   {
+    "canonical": "phase.uncomplete",
+    "aliases": [
+      "phase uncomplete"
+    ],
+    "mutation": true
+  },
+  {
     "canonical": "progress.bar",
     "aliases": [
       "progress bar"
@@ -689,6 +696,13 @@ const NON_FAMILY_COMMAND_ALIASES = [
     "canonical": "requirements.mark-complete",
     "aliases": [
       "requirements mark-complete"
+    ],
+    "mutation": true
+  },
+  {
+    "canonical": "requirements.mark-incomplete",
+    "aliases": [
+      "requirements mark-incomplete"
     ],
     "mutation": true
   },

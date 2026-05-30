@@ -583,3 +583,46 @@ describe('PhaseRunner DAG engine — wall-clock harness (test-dominated gate)', 
     expect(newMakespan).toBeLessThan(perPlanGateMakespan);
   });
 });
+
+// ─── Informed-retry context injection (ADR 0013 option 4, chunk 2) ───────────
+
+describe('PhaseRunner prepends prior-failure context to the executor prompt', () => {
+  beforeEach(() => mockSession.mockReset());
+
+  it('prepends the PRIOR ATTEMPTS block to the execute-step prompt when priorFailureContext is set', async () => {
+    // Capture the prompt the execute session receives.
+    let executePrompt = '';
+    mockSession.mockImplementation(async (prompt, step) => {
+      if (step === PhaseStepType.Execute) executePrompt = prompt as string;
+      return okResult();
+    });
+
+    const { deps } = makeDeps([planInfo({ id: '01' })]);
+    await new PhaseRunner(deps).run('1', {
+      priorFailureContext: [
+        { attempt: 1, signal: 'gate', detail: 'gate exit 1: assertion X failed' },
+        { attempt: 2, signal: 'verify', detail: 'verification found gap Y' },
+      ],
+    });
+
+    // The block leads the prompt and lists every prior failure verbatim.
+    expect(executePrompt).toMatch(/PRIOR ATTEMPTS FAILED — address these before proceeding/);
+    expect(executePrompt).toMatch(/Attempt 1 failed \(gate\): gate exit 1: assertion X failed/);
+    expect(executePrompt).toMatch(/Attempt 2 failed \(verify\): verification found gap Y/);
+    // The built prompt ('p' from the mocked buildPrompt) follows the block.
+    expect(executePrompt).toMatch(/proceeding[\s\S]*\bp\b/);
+  });
+
+  it('does NOT prepend the block on a first attempt (no priorFailureContext)', async () => {
+    let executePrompt = '';
+    mockSession.mockImplementation(async (prompt, step) => {
+      if (step === PhaseStepType.Execute) executePrompt = prompt as string;
+      return okResult();
+    });
+
+    const { deps } = makeDeps([planInfo({ id: '01' })]);
+    await new PhaseRunner(deps).run('1');
+
+    expect(executePrompt).not.toMatch(/PRIOR ATTEMPTS FAILED/);
+  });
+});

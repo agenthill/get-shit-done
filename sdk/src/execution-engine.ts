@@ -323,6 +323,13 @@ export class NoopMergeSerializer implements MergeSerializer {
  */
 export class GitMergeSerializer implements MergeSerializer {
   private readonly mutex = new Mutex();
+  /**
+   * Branch per-plan deltas merge ONTO. Defaults to the protected branch (PR #8
+   * behaviour). The phase-integration spine (ADR 0013 option 4) retargets this
+   * to the phase's integration branch via {@link setMergeTarget}, so work
+   * accumulates off-protected and only promotes on green.
+   */
+  private mergeTarget: string;
 
   constructor(
     private readonly repoDir: string,
@@ -334,7 +341,24 @@ export class GitMergeSerializer implements MergeSerializer {
      */
     private readonly runGate: (planIds: string[]) => Promise<number>,
     private readonly bulkDeleteThreshold = 5,
-  ) {}
+  ) {
+    this.mergeTarget = protectedBranch;
+  }
+
+  /**
+   * Retarget the branch per-plan merges land on (the per-phase integration
+   * branch). The orchestrator must have checked that branch out in `repoDir`
+   * before any merge runs — `git merge` integrates into the working-tree HEAD,
+   * and `baseTip` is snapshot from this target.
+   */
+  setMergeTarget(branch: string): void {
+    this.mergeTarget = branch;
+  }
+
+  /** The branch per-plan merges currently target. */
+  getMergeTarget(): string {
+    return this.mergeTarget;
+  }
 
   private git(args: string[]) {
     return execFileAsync('git', args, { cwd: this.repoDir });
@@ -342,9 +366,10 @@ export class GitMergeSerializer implements MergeSerializer {
 
   async merge(planId: string, branch: string): Promise<MergeOutcome> {
     return this.mutex.runExclusive(async () => {
-      // Snapshot the protected tip BEFORE merging so the guard suite can restore
-      // from a known-good single-plan-delta baseline.
-      const baseTip = (await this.git(['rev-parse', this.protectedBranch])).stdout.trim();
+      // Snapshot the merge-target tip BEFORE merging so the guard suite can
+      // restore from a known-good single-plan-delta baseline. Under the phase
+      // spine this is the integration branch; on the PR #8 path it is protected.
+      const baseTip = (await this.git(['rev-parse', this.mergeTarget])).stdout.trim();
 
       // Merge the plan's own delta. Because a descendant branch already contains
       // its ancestors' commits (fork-off-predecessor), a descendant merged after
@@ -359,6 +384,18 @@ export class GitMergeSerializer implements MergeSerializer {
       await this.applyGuardSuite(baseTip);
       return { planId, merged: true };
     });
+  }
+
+  /**
+   * Run the guard suite against an arbitrary just-merged delta (diffed from
+   * `baseTip` to HEAD). Public entry point reused by the phase-promote step —
+   * promoting an integration branch onto protected is itself a merge whose
+   * single-delta (LAST_GOOD..protected-HEAD) must pass the same bulk-delete /
+   * STATE-restore / resurrection guards so a promote can never strand prior
+   * work.
+   */
+  async runGuardSuite(baseTip: string): Promise<void> {
+    return this.applyGuardSuite(baseTip);
   }
 
   /**
@@ -460,5 +497,99 @@ export class GitMergeSerializer implements MergeSerializer {
   async gate(planIds: string[]): Promise<GateOutcome> {
     const testExit = await this.runGate(planIds);
     return { testExit };
+  }
+}
+
+// ─── Phase integration manager (per-phase branch + promote-on-green) ──────────
+
+/**
+ * Owns the per-phase branch mechanics of the PHASEGATE-CORE spine (ADR 0013
+ * option 4): fork the phase's integration branch off LAST_GOOD, retarget plan
+ * merges onto it, and PROMOTE it onto protected on green. The protected branch
+ * is the atomic unit — it moves only on a successful {@link promote}, and the
+ * common failure path is a no-op (the integration branch is left in place;
+ * protected provably never moved).
+ *
+ * The orchestrator (phase-runner) owns checkpoint/tag/manifest writes; this
+ * collaborator owns only the git branch/checkout/merge plumbing so it can reuse
+ * the {@link GitMergeSerializer}'s guard suite for the promote merge.
+ */
+export interface PhaseIntegrationManager {
+  /**
+   * Fork `integrationBranch` off `lastGoodSha` and check it out in the repo so
+   * subsequent per-plan merges accumulate onto it (NOT onto protected).
+   */
+  begin(integrationBranch: string, lastGoodSha: string): Promise<void>;
+  /**
+   * Promote the integration branch onto `protectedBranch` with a guarded
+   * `merge --no-ff`. Returns the new protected HEAD sha. Only called on green.
+   */
+  promote(integrationBranch: string, protectedBranch: string, lastGoodSha: string): Promise<string>;
+}
+
+/**
+ * No-op integration manager for the shared-cwd path: there is no integration
+ * branch and no promote — protected never moves through this manager. Default
+ * when no git engine is injected.
+ */
+export class NoopPhaseIntegrationManager implements PhaseIntegrationManager {
+  async begin(): Promise<void> {
+    /* shared-cwd: no integration branch */
+  }
+  async promote(): Promise<string> {
+    return '';
+  }
+}
+
+/**
+ * Git-backed per-phase integration + promote.
+ *
+ *  - {@link begin} forks the integration branch off LAST_GOOD (force-resets it
+ *    if a prior run left one) and checks it out, then retargets the serializer's
+ *    merges onto it. Plan deltas now accumulate off-protected.
+ *  - {@link promote} checks out protected and merges the integration branch with
+ *    `--no-ff`, then re-runs the guard suite sourced from LAST_GOOD (so a promote
+ *    can never strand prior work), and returns the new protected HEAD. Called by
+ *    the orchestrator only after gate+verify both pass.
+ *
+ * Single-writer: only the orchestrator drives these, sequentially, between
+ * phases — never concurrent with the per-plan merge mutex.
+ */
+export class GitPhaseIntegrationManager implements PhaseIntegrationManager {
+  constructor(
+    private readonly repoDir: string,
+    /** The serializer whose merge-target we retarget + whose guard suite we reuse. */
+    private readonly serializer: GitMergeSerializer,
+  ) {}
+
+  private git(args: string[]) {
+    return execFileAsync('git', args, { cwd: this.repoDir });
+  }
+
+  async begin(integrationBranch: string, lastGoodSha: string): Promise<void> {
+    // Create-or-reset the integration branch at LAST_GOOD and check it out. -B is
+    // idempotent across a resume/retry of the same phase (force-points an
+    // existing branch back at LAST_GOOD). Per-plan merges now land here.
+    await this.git(['checkout', '-B', integrationBranch, lastGoodSha]);
+    this.serializer.setMergeTarget(integrationBranch);
+  }
+
+  async promote(
+    integrationBranch: string,
+    protectedBranch: string,
+    lastGoodSha: string,
+  ): Promise<string> {
+    // Move to protected (still at LAST_GOOD) and merge the integration branch.
+    await this.git(['checkout', protectedBranch]);
+    // baseTip = LAST_GOOD: the protected tip before promotion. The guard suite's
+    // single-delta diff (lastGoodSha..HEAD) is exactly the whole phase's net
+    // delta, so bulk-delete/state/resurrection guards apply to the promotion.
+    await this.git(['merge', '--no-ff', '--no-edit', integrationBranch]);
+    await this.serializer.runGuardSuite(lastGoodSha);
+    // Restore the serializer's merge target to protected so a subsequent phase
+    // that has not yet called begin() cannot accidentally merge onto a stale
+    // integration branch.
+    this.serializer.setMergeTarget(protectedBranch);
+    return (await this.git(['rev-parse', 'HEAD'])).stdout.trim();
   }
 }

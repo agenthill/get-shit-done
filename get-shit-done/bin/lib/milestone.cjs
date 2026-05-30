@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const { escapeRegex, getMilestonePhaseFilter, extractOneLinerFromBody, output, error } = require('./core.cjs');
 const { platformWriteSync, platformEnsureDir } = require('./shell-command-projection.cjs');
-const { planningPaths } = require('./planning-workspace.cjs');
+const { planningPaths, withPlanningLock } = require('./planning-workspace.cjs');
 const { extractFrontmatter } = require('./frontmatter.cjs');
 const { writeStateMd, stateReplaceFieldWithFallback } = require('./state.cjs');
 const { formatGsdSlash, resolveRuntime } = require('./runtime-slash.cjs');
@@ -87,6 +87,94 @@ function cmdRequirementsMarkComplete(cwd, reqIdsRaw, raw) {
     not_found: notFound,
     total: reqIds.length,
   }, raw, `${updated.length}/${reqIds.length} requirements marked complete`);
+}
+
+// ─── requirements mark-incomplete (ADR 0013 option 4, chunk 2) ───────────────
+
+/**
+ * Inverse of cmdRequirementsMarkComplete — re-flips requirement IDs back to
+ * pending when a phase is rolled back (Tier-1, chunk 2). Reverses both edits:
+ *   - Checkbox: `- [x] **REQ-ID**` → `- [ ] **REQ-ID**`.
+ *   - Traceability table: `| REQ-ID | ... | Complete |` → `| REQ-ID | ... | Pending |`.
+ *
+ * The forward mark-complete write is lock-free; this inverse holds the planning
+ * lock across read→write (same as cmdPhaseComplete's REQUIREMENTS write) so a
+ * concurrent forward flip cannot clobber the re-flip.
+ */
+function cmdRequirementsMarkIncomplete(cwd, reqIdsRaw, raw) {
+  if (!reqIdsRaw || reqIdsRaw.length === 0) {
+    error('requirement IDs required. Usage: requirements mark-incomplete REQ-01,REQ-02 or REQ-01 REQ-02');
+  }
+
+  const reqIds = reqIdsRaw
+    .join(' ')
+    .replace(/[\[\]]/g, '')
+    .split(/[,\s]+/)
+    .map(r => r.trim())
+    .filter(Boolean);
+
+  if (reqIds.length === 0) {
+    error('no valid requirement IDs found');
+  }
+
+  const reqPath = planningPaths(cwd).requirements;
+  if (!fs.existsSync(reqPath)) {
+    output({ updated: false, reason: 'REQUIREMENTS.md not found', ids: reqIds }, raw, 'no requirements file');
+    return;
+  }
+
+  const updated = [];
+  const alreadyPending = [];
+  const notFound = [];
+
+  withPlanningLock(cwd, () => {
+    let reqContent = fs.readFileSync(reqPath, 'utf-8');
+
+    for (const reqId of reqIds) {
+      let found = false;
+      const reqEscaped = escapeRegex(reqId);
+
+      // Checkbox: - [x] **REQ-ID** → - [ ] **REQ-ID**
+      const checkboxPattern = new RegExp(`(-\\s*\\[)x(\\]\\s*\\*\\*${reqEscaped}\\*\\*)`, 'gi');
+      const afterCheckbox = reqContent.replace(checkboxPattern, '$1 $2');
+      if (afterCheckbox !== reqContent) {
+        reqContent = afterCheckbox;
+        found = true;
+      }
+
+      // Traceability table: | REQ-ID | ... | Complete | → | REQ-ID | ... | Pending |
+      const tablePattern = new RegExp(`(\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|)\\s*Complete\\s*(\\|)`, 'gi');
+      const afterTable = reqContent.replace(tablePattern, '$1 Pending $2');
+      if (afterTable !== reqContent) {
+        reqContent = afterTable;
+        found = true;
+      }
+
+      if (found) {
+        updated.push(reqId);
+      } else {
+        const pendingCheckbox = new RegExp(`-\\s*\\[ \\]\\s*\\*\\*${reqEscaped}\\*\\*`, 'i');
+        const pendingTable = new RegExp(`\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|\\s*(?:Pending|In Progress)\\s*\\|`, 'i');
+        if (pendingCheckbox.test(reqContent) || pendingTable.test(reqContent)) {
+          alreadyPending.push(reqId);
+        } else {
+          notFound.push(reqId);
+        }
+      }
+    }
+
+    if (updated.length > 0) {
+      platformWriteSync(reqPath, reqContent);
+    }
+  });
+
+  output({
+    updated: updated.length > 0,
+    marked_incomplete: updated,
+    already_pending: alreadyPending,
+    not_found: notFound,
+    total: reqIds.length,
+  }, raw, `${updated.length}/${reqIds.length} requirements marked incomplete`);
 }
 
 function cmdMilestoneComplete(cwd, version, options, raw) {
@@ -309,6 +397,7 @@ function cmdPhasesClear(cwd, raw, args) {
 
 module.exports = {
   cmdRequirementsMarkComplete,
+  cmdRequirementsMarkIncomplete,
   cmdMilestoneComplete,
   cmdPhasesClear,
 };

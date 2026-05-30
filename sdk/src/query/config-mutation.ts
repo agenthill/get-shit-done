@@ -603,6 +603,7 @@ export const configNewProject: QueryHandler = async (args, projectDir, workstrea
     'base_branch',
     'sdk_worktree_execution',
     'sdk_test_command',
+    'sdk_max_phase_attempts',
   ]);
 
   const filteredTopLevel: Record<string, unknown> = {};

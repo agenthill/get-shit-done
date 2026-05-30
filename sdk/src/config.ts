@@ -41,6 +41,15 @@ export interface GitConfig {
    * returns exit 124 (inconclusive ≠ pass).
    */
   sdk_test_command?: string | null;
+  /**
+   * ADR 0013 option 4 (autonomous cross-phase + rollback). Maximum total
+   * attempts for a single phase before the autonomous driver HALTS for a human.
+   * Each GENUINE (non-transient) failure rolls the phase back (Tier-1) and
+   * re-runs it with the accumulated prior-failure context injected, up to this
+   * cap. Transient/quota failures resume the same phase via WAITING.json and do
+   * NOT consume an attempt. Absent/null → default 5.
+   */
+  sdk_max_phase_attempts?: number | null;
 }
 
 export interface WorkflowConfig {

@@ -1716,6 +1716,105 @@ function cmdPhaseComplete(cwd, phaseNum, raw) {
   output(result, raw);
 }
 
+// ─── phase uncomplete (ADR 0013 option 4, chunk 2) ───────────────────────────
+
+/**
+ * Inverse of cmdPhaseComplete's ROADMAP mutations — undoes a phase's completion
+ * marks when it is rolled back (Tier-1). ROADMAP-complete is trusted over disk
+ * (roadmap.cjs forces diskStatus='complete' on a `[x]`), so a stale `[x]` would
+ * mask a reverted phase; this handler is mandatory for rollback correctness.
+ *
+ * Reverses exactly the three ROADMAP edits cmdPhaseComplete makes, under the
+ * planning lock:
+ *   1. Checkbox `- [x] Phase N: ... (completed DATE)` → `- [ ] Phase N: ...`.
+ *   2. Progress-table row: Status Complete→Pending, plan cell M/N→0/N, clear date.
+ *   3. `**Plans:** M/N plans complete` → `**Plans:** 0/N plans complete`.
+ *
+ * Does NOT touch STATE.md (the rollback engine restores it from the checkpoint
+ * snapshot) and does NOT renumber phases. REQUIREMENTS re-flip is handled by
+ * cmdRequirementsMarkIncomplete.
+ */
+function cmdPhaseUncomplete(cwd, phaseNum, raw) {
+  if (!phaseNum) {
+    error('phase number required for phase uncomplete');
+  }
+
+  const roadmapPath = path.join(planningDir(cwd), 'ROADMAP.md');
+  if (!fs.existsSync(roadmapPath)) {
+    output({ uncompleted_phase: phaseNum, roadmap_updated: false, changes: [] }, raw);
+    return;
+  }
+
+  const changes = [];
+
+  withPlanningLock(cwd, () => {
+    let roadmapContent = fs.readFileSync(roadmapPath, 'utf-8');
+    const phaseEscaped = phaseMarkdownRegexSource(phaseNum);
+
+    // 1. Checkbox: uncheck + strip the trailing ` (completed YYYY-MM-DD)`.
+    const checkboxPattern = new RegExp(
+      `(-\\s*\\[)x(\\]\\s*.*Phase\\s+${phaseEscaped}[:\\s][^\\n]*)`,
+      'i'
+    );
+    const afterCheckbox = roadmapContent.replace(checkboxPattern, (_m, pre, rest) => {
+      const cleaned = rest.replace(/\s*\(completed \d{4}-\d{2}-\d{2}\)/i, '');
+      return `${pre} ${cleaned}`;
+    });
+    if (afterCheckbox !== roadmapContent) {
+      roadmapContent = afterCheckbox;
+      changes.push('checkbox');
+    }
+
+    // 2. Progress table: Complete→Pending, M/N→0/N, clear completed date.
+    const tableRowPattern = new RegExp(
+      `^(\\|\\s*${phaseEscaped}\\.?\\s[^|]*(?:\\|[^\\n]*))$`,
+      'im'
+    );
+    const afterTable = roadmapContent.replace(tableRowPattern, (fullRow) => {
+      const cells = fullRow.split('|').slice(1, -1);
+      let planIdx = -1, statusIdx = -1, dateIdx = -1;
+      if (cells.length === 5) {
+        planIdx = 2; statusIdx = 3; dateIdx = 4;
+      } else if (cells.length === 4) {
+        planIdx = 1; statusIdx = 2; dateIdx = 3;
+      } else {
+        return fullRow;
+      }
+      const planMatch = cells[planIdx].match(/(\d+)\s*\/\s*(\d+)/);
+      cells[planIdx] = planMatch ? ` 0/${planMatch[2]} ` : cells[planIdx];
+      cells[statusIdx] = ' Pending     ';
+      cells[dateIdx] = ' - ';
+      return '|' + cells.join('|') + '|';
+    });
+    if (afterTable !== roadmapContent) {
+      roadmapContent = afterTable;
+      changes.push('progress_table');
+    }
+
+    // 3. **Plans:** M/N plans complete → **Plans:** 0/N plans complete.
+    const planCountPattern = new RegExp(
+      `(#{2,4}\\s*Phase\\s+${phaseEscaped}[\\s\\S]*?\\*\\*Plans:\\*\\*\\s*)(\\d+)/(\\d+)[^\\n]*`,
+      'i'
+    );
+    const afterPlanCount = roadmapContent.replace(
+      planCountPattern,
+      (_m, pre, _done, total) => `${pre}0/${total} plans complete`
+    );
+    if (afterPlanCount !== roadmapContent) {
+      roadmapContent = afterPlanCount;
+      changes.push('plan_count');
+    }
+
+    platformWriteSync(roadmapPath, roadmapContent);
+  });
+
+  output({
+    uncompleted_phase: phaseNum,
+    roadmap_updated: changes.length > 0,
+    changes,
+  }, raw);
+}
+
 module.exports = {
   cmdPhasesList,
   cmdPhaseNextDecimal,
@@ -1728,4 +1827,5 @@ module.exports = {
   cmdPhaseInsert,
   cmdPhaseRemove,
   cmdPhaseComplete,
+  cmdPhaseUncomplete,
 };
