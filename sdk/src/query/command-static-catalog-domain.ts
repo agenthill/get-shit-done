@@ -23,6 +23,7 @@ import { phaseMvpMode, taskIsBehaviorAdding, userStoryValidate } from './mvp.js'
 import { worktreeCleanupWave, worktreeReapOrphans } from './worktree.js';
 import { promptBudget } from './prompt-budget.js';
 import { conflictGraph } from './conflict-graph.js';
+import { validationDerive, validationCheck } from './validation.js';
 
 export const DOMAIN_STATIC_CATALOG: ReadonlyArray<readonly [string, QueryHandler]> = [
   ['agent-skills', agentSkills],
@@ -117,4 +118,10 @@ export const DOMAIN_STATIC_CATALOG: ReadonlyArray<readonly [string, QueryHandler
   // ── conflict-graph (#13 gap 1) — concurrency schedule from files_modified ──
   ['conflict-graph', conflictGraph],
   ['conflict graph', conflictGraph],
+  // Nyquist validation map: derive VALIDATION.md from RESEARCH § Validation
+  // Architecture; check the RESEARCH ⊆ VALIDATION ⊆ PLAN subset chain (#15).
+  ['validation.derive', validationDerive],
+  ['validation derive', validationDerive],
+  ['validation.check', validationCheck],
+  ['validation check', validationCheck],
 ] as const;

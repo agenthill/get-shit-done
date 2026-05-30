@@ -276,6 +276,23 @@ node gsd-tools.cjs validate context
 (`ok` / `warn` / `critical` at the 60 % / 70 % thresholds), and a
 `suggestion` string. The same data backs `/gsd-health --context`.
 
+### Nyquist validation map (SDK-only)
+
+Derive and cross-check the per-phase validation map from its single source of
+truth — `RESEARCH.md` § Validation Architecture. These verbs are SDK-only;
+invoke via `gsd-sdk query`.
+
+```bash
+# Project RESEARCH § Validation Architecture into a populated VALIDATION.md
+# Per-Task Verification Map. Returns { rows, content }; the planner stamps
+# task ids (Task ID column is emitted as TBD-by-planner). Backs plan-phase 5.5.
+gsd-sdk query validation.derive <phase>
+
+# Read-only drift gate: assert RESEARCH §Validation behaviors ⊆ VALIDATION rows
+# ⊆ PLAN <automated> commands. Returns { aligned, findings } (WARNINGs on drift).
+gsd-sdk query validation.check <phase>
+```
+
 ---
 
 ## Template Commands
