@@ -1,0 +1,6 @@
+---
+type: Added
+pr: 19
+---
+<!-- docs-exempt: Chunk A is code-only; user-facing docs for runParallel land in Chunk C (ADR 0014). -->
+**`GSD.runParallel(phaseNumbers, options)` — parallel multi-phase wave executor (Chunk A of ADR 0014, issue #13 gap 2).** Drains N independent backlog phases in concurrency waves scheduled by the shipped `conflict-graph` verb: hard-disjoint phases share a wave (parallel within), conflicting phases serialize across waves. Each wave member runs through the EXISTING per-phase rollback/retry driver (`runPhaseWithRollbackRetry` — checkpoint + Tier-1/Tier-2 + promote-on-green), and each green phase promotes as its own auto-merged PR (D6: push integration branch → `gh pr create` → admin-merge on green), with PR auto-merges serialized in wave order behind a `Mutex` to preserve the single-writer property. New modules: `query/wave-scheduler.ts` (in-process adapter over `conflictGraph`), `pr-merge.ts` (`pushBranchAndOpenPr` + `adminMergeOnGreen`, injectable runners), `parallel-runner.ts` (`runParallelWaves`). Implements D1 (wave loop) + D6 (PR-per-phase auto-merge). Chunk A of 3; B (per-phase base SHA / wave-scoped sole-writer / skip-dependents / rollback reuse) and C (nested global budget / config / `/gsd-execute-parallel` command / docs) follow.
