@@ -46,6 +46,7 @@ See **[CONTRIBUTING.md — "Proposing an ADR or PRD"](../../CONTRIBUTING.md#prop
 | [0011-review-default-reviewers-prd.md](0011-review-default-reviewers-prd.md) | PRD for review.default_reviewers feature (#3464) | Reference |
 | [0012-command-routing-hub.md](0012-command-routing-hub.md) | CommandRoutingHub as single dispatch seam for CJS command families | Accepted |
 | [0013-dynamic-workflow-parallelization.md](0013-dynamic-workflow-parallelization.md) | Dynamic-workflow parallelization of GSD execution (read-only fan-out + Agent-tool/SDK execution) | Accepted |
+| [0014-parallel-multi-phase-execution.md](0014-parallel-multi-phase-execution.md) | Parallel multi-phase execution — conflict-graph waves + worktree-per-phase + auto-promote PRs (#13 gap 2) | Proposed |
 | [3524-cjs-sdk-hard-seam.md](3524-cjs-sdk-hard-seam.md) | CJS↔SDK hard seam — single canonical owner per responsibility (#3524) | Proposed |
 | [3660-runtime-artifact-layout-module.md](3660-runtime-artifact-layout-module.md) | Runtime Artifact Layout Module owns per-runtime artifact placement | Proposed |
 
