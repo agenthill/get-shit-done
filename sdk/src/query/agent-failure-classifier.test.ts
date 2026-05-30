@@ -211,6 +211,22 @@ describe('classifyAgentFailure', () => {
       );
       expect(anthropicTest.class).toBe('unknown-failure');
     });
+
+    it('J1: a genuine gate-path "limit reached" failure (no quota verb) is NOT misread as quota → genuine', () => {
+      // J1: the over-broad `usage limit` / `limit reached` fragments were dropped
+      // from SUBSCRIPTION_QUOTA_PHRASES. A genuine gate-path failure detail that
+      // merely contains "... limit reached ..." with no reset/usage-quota verb is
+      // now classified GENUINE (rolls back + consumes an attempt) instead of
+      // spinning on WAITING.json up to MAX_CONSECUTIVE_TRANSIENT (50) times.
+      const connTest = classifyAgentFailure('connection limit reached for pool', {
+        fromRuntimeTermination: false,
+      });
+      expect(connTest.class).toBe('unknown-failure'); // GENUINE, not quota
+      const retryTest = classifyAgentFailure('retry limit reached after 3 attempts', {
+        fromRuntimeTermination: false,
+      });
+      expect(retryTest.class).toBe('unknown-failure'); // GENUINE, not quota
+    });
   });
 
   describe('precedence', () => {

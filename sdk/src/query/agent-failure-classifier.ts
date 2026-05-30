@@ -63,20 +63,24 @@ const CLASSIFY_HANDOFF_SENTINEL = 'classifyhandoffifneeded is not defined';
  * it as GENUINE → rollback + burn 5 informed-retry attempts re-hitting the same
  * quota → HALT, instead of a WAITING.json resume (the C-1 HIGH regression).
  *
- * These phrasings are unambiguous human-subscription quota signals: a genuine
- * failing test is vanishingly unlikely to emit "your limit will reset at" or
- * "usage limit reached". They are therefore TRUSTED on the gate path WITHOUT
- * requiring a co-occurring runtime marker — biasing toward RESUME, justified by
- * the cost asymmetry (a real quota pause is common and WAITING.json exists to
- * survive it; a rarer false-positive self-limits at MAX_CONSECUTIVE_TRANSIENT
- * and corrupts nothing). When matched they resolve to quota-exceeded regardless
- * of provenance.
+ * This list is deliberately restricted to UNAMBIGUOUS subscription-quota
+ * signals — phrasings a genuine failing test is vanishingly unlikely to emit.
+ * It does NOT include the over-broad generic fragments `usage limit`
+ * (redundant — already in QUOTA_SENTINELS for the runtime path) or
+ * `limit reached` (generic): on the gate path the latter mis-trusted genuine
+ * failures like "connection limit reached for pool", "retry limit reached after
+ * 3 attempts", or "rate limit reached for cache", routing them to a WAITING.json
+ * quota-resume and burning up to MAX_CONSECUTIVE_TRANSIENT (50) full phase
+ * executions before halting. The narrowed members below all carry an explicit
+ * reset/usage-quota verb, so each is TRUSTED on the gate path WITHOUT requiring
+ * a co-occurring runtime marker — biasing toward RESUME, justified by the cost
+ * asymmetry (a real quota pause is common and WAITING.json exists to survive it;
+ * a rarer false-positive self-limits at MAX_CONSECUTIVE_TRANSIENT and corrupts
+ * nothing). When matched they resolve to quota-exceeded regardless of provenance.
  */
 const SUBSCRIPTION_QUOTA_PHRASES: ReadonlyArray<string> = [
   'usage limit reached',
-  'usage limit',
   'limit will reset',
-  'limit reached',
   'limit resets at',
 ];
 
