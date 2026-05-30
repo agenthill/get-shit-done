@@ -91,6 +91,42 @@ export function scanSequentialMaxPhaseFromDirs(dirNames: string[]): number {
   return maxPhase;
 }
 
+/**
+ * Resolve the directory-name prefix for a NEW phase, matching the convention
+ * already on disk instead of applying `project_code` unconditionally (#11).
+ *
+ * - Existing phase dirs are already prefixed (`<CODE>-NN-slug`) → return
+ *   `<projectCode>-` so the new dir stays prefixed.
+ * - Existing phase dirs are bare (`NN-slug`) → return '' so the new dir stays
+ *   bare, even when `project_code` is set (a project that adopted bare phases
+ *   before opting into `project_code` keeps its convention).
+ * - No existing phase dirs (first phase / greenfield) → preserve legacy
+ *   behavior: prefix iff `project_code` is set.
+ *
+ * Mixed layouts resolve toward the prefixed convention: any prefixed dir on
+ * disk means the project intends prefixes, so the new dir is prefixed.
+ *
+ * @param dirNames - directory names already present in the phases dir
+ * @param projectCode - configured `project_code` ('' when unset)
+ */
+export function resolvePhasePrefix(dirNames: string[], projectCode: string): string {
+  if (!projectCode) return '';
+
+  const prefixedPattern = /^[A-Z][A-Z0-9]*-\d+[A-Z]?(?:\.\d+)*-/i;
+  const barePattern = /^\d+[A-Z]?(?:\.\d+)*-/;
+
+  let hasPrefixed = false;
+  let hasBare = false;
+  for (const dirName of dirNames) {
+    if (prefixedPattern.test(dirName)) hasPrefixed = true;
+    else if (barePattern.test(dirName)) hasBare = true;
+  }
+
+  if (hasPrefixed) return `${projectCode}-`;
+  if (hasBare) return '';
+  return `${projectCode}-`;
+}
+
 export function computeNextSequentialPhaseId(milestoneContent: string, dirNames: string[]): number {
   return Math.max(
     scanSequentialMaxPhaseFromMilestone(milestoneContent),

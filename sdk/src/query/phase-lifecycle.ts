@@ -56,6 +56,7 @@ import {
   extractOneLinerFromBody,
   generatePhaseSlug,
   parseMultiwordArg,
+  resolvePhasePrefix,
 } from './phase-lifecycle-policy.js';
 import {
   archiveDirectories,
@@ -140,10 +141,11 @@ export const phaseAdd: QueryHandler = async (args, projectDir, workstream) => {
   // for the description (which is joined above).
   const customId = customIdArg;
 
-  // Optional project code prefix (e.g., 'CK' -> 'CK-01-foundation')
+  // Optional project code prefix (e.g., 'CK' -> 'CK-01-foundation').
+  // #11: the actual prefix is resolved per-call inside computePhaseFields
+  // against the on-disk convention, not unconditionally from project_code.
   const projectCode = (config.project_code as string) || '';
   assertSafeProjectCode(projectCode);
-  const prefix = projectCode ? `${projectCode}-` : '';
 
   // ── Helper: compute newPhaseId / dirName / computedPhaseEntry from raw ROADMAP content ──
   // Extracted as a local async function so it can be called both inside the
@@ -153,6 +155,7 @@ export const phaseAdd: QueryHandler = async (args, projectDir, workstream) => {
     const milestoneContent = await extractCurrentMilestone(rawRoadmapContent, projectDir);
     const phasesDir = planningPaths(projectDir, workstream).phases;
     const dirNames = await listDirectories(phasesDir);
+    const prefix = resolvePhasePrefix(dirNames, projectCode);
 
     const nextSequentialPhaseId = computeNextSequentialPhaseId(milestoneContent, dirNames);
     const { phaseId: resolvedPhaseId, dirName: resolvedDirName } = computePhaseDirectory(
@@ -289,9 +292,10 @@ export const phaseAddBatch: QueryHandler = async (args, projectDir, workstream) 
     config = JSON.parse(await readFile(planningPaths(projectDir, workstream).config, 'utf-8'));
   } catch { /* use defaults */ }
 
+  // #11: prefix is resolved against the on-disk convention inside the lock,
+  // not unconditionally from project_code.
   const projectCode = (config.project_code as string) || '';
   assertSafeProjectCode(projectCode);
-  const prefix = projectCode ? `${projectCode}-` : '';
 
   const added: Array<{
     phase_number: string | number;
@@ -307,9 +311,11 @@ export const phaseAddBatch: QueryHandler = async (args, projectDir, workstream) 
     const content = await extractCurrentMilestone(rawContent, projectDir);
     let maxPhase = 0;
 
+    const phasesOnDisk = planningPaths(projectDir, workstream).phases;
+    const dirNames = await listDirectories(phasesOnDisk);
+    const prefix = resolvePhasePrefix(dirNames, projectCode);
+
     if (config.phase_naming !== 'custom') {
-      const phasesOnDisk = planningPaths(projectDir, workstream).phases;
-      const dirNames = await listDirectories(phasesOnDisk);
       maxPhase = computeNextSequentialPhaseId(content, dirNames) - 1;
     }
 
@@ -430,9 +436,10 @@ export const phaseInsert: QueryHandler = async (args, projectDir, workstream) =>
     const phasesDir = planningPaths(projectDir, workstream).phases;
     const normalizedBase = normalizePhaseName(afterPhase);
     const decimalSet = new Set<number>();
+    let dirs: string[] = [];
 
     try {
-      const dirs = await listDirectories(phasesDir);
+      dirs = await listDirectories(phasesDir);
       for (const suffix of collectDecimalSuffixesFromDirNames(normalizedBase, dirs)) {
         decimalSet.add(suffix);
       }
@@ -444,14 +451,15 @@ export const phaseInsert: QueryHandler = async (args, projectDir, workstream) =>
     }
     decimalPhase = computeNextDecimalPhase(normalizedBase, decimalSet).next;
 
-    // Optional project code prefix
+    // Optional project code prefix. #11: resolved against the on-disk
+    // convention, not unconditionally from project_code.
     let insertConfig: Record<string, unknown> = {};
     try {
       insertConfig = JSON.parse(await readFile(planningPaths(projectDir, workstream).config, 'utf-8'));
     } catch { /* use defaults */ }
     const projectCode = (insertConfig.project_code as string) || '';
     assertSafeProjectCode(projectCode);
-    const pfx = projectCode ? `${projectCode}-` : '';
+    const pfx = resolvePhasePrefix(dirs, projectCode);
     dirName = `${pfx}${decimalPhase}-${slug}`;
     assertSafePhaseDirName(dirName);
     const dirPath = join(phasesDir, dirName);
@@ -595,17 +603,20 @@ export const phaseScaffold: QueryHandler = async (args, projectDir, workstream) 
       throw new GSDError('phase and name required for phase-dir scaffold', ErrorClassification.Validation);
     }
     const slug = generatePhaseSlug(name);
-    // #3287: apply project_code prefix to stay consistent with phase.add/phase.insert
+    // #3287: apply project_code prefix to stay consistent with phase.add/phase.insert.
+    // #11: the prefix is resolved against the on-disk convention, not
+    // unconditionally from project_code.
     let scaffoldConfig: Record<string, unknown> = {};
     try {
       scaffoldConfig = JSON.parse(await readFile(planningPaths(projectDir, workstream).config, 'utf-8'));
     } catch { /* use defaults */ }
     const scaffoldProjectCode = (scaffoldConfig.project_code as string) || '';
     assertSafeProjectCode(scaffoldProjectCode);
-    const scaffoldPrefix = scaffoldProjectCode ? `${scaffoldProjectCode}-` : '';
+    const phasesParent = planningPaths(projectDir, workstream).phases;
+    const scaffoldDirNames = await listDirectories(phasesParent);
+    const scaffoldPrefix = resolvePhasePrefix(scaffoldDirNames, scaffoldProjectCode);
     const dirNameNew = `${scaffoldPrefix}${padded}-${slug}`;
     assertSafePhaseDirName(dirNameNew, 'scaffold phase directory');
-    const phasesParent = planningPaths(projectDir, workstream).phases;
     await mkdir(phasesParent, { recursive: true });
     const dirPath = join(phasesParent, dirNameNew);
     await ensureDirectoryWithGitkeep(dirPath);

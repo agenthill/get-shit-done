@@ -32,7 +32,7 @@ import { getMilestonePhaseFilter } from './state.js';
 import { roadmapGetPhase, getMilestoneInfo, extractCurrentMilestone, extractPhasesFromSection } from './roadmap.js';
 import { determinePhaseStatus } from './progress.js';
 import { planningPaths, normalizePhaseName, toPosixPath, resolveAgentsDir, detectRuntime } from './helpers.js';
-import { generatePhaseSlug, assertSafeProjectCode } from './phase-lifecycle-policy.js';
+import { generatePhaseSlug, assertSafeProjectCode, resolvePhasePrefix } from './phase-lifecycle-policy.js';
 import type { QueryHandler } from './utils.js';
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
@@ -146,19 +146,36 @@ function detectNestedSubdir(base: string, info: { inside: boolean; worktreeRoot:
  * the first-touch creation path used by /gsd-discuss-phase and /gsd-plan-phase
  * stays consistent with the prefix produced by `phase.add` / `phase.insert`.
  *
+ * #11: the prefix is resolved against the convention already on disk
+ * (`existingDirNames`) rather than unconditionally from project_code, so a
+ * first-touch mkdir on a project with bare `NN-slug` phases stays bare.
+ *
  * Returns null when phaseNumber or phaseName cannot be determined.
  */
 function computeExpectedPhaseDirName(
   phaseNumber: string | null,
   phaseName: string | null,
   projectCode: string,
+  existingDirNames: string[],
 ): string | null {
   if (!phaseNumber || !phaseName) return null;
   const paddedNum = normalizePhaseName(phaseNumber);
   const slug = generatePhaseSlug(phaseName);
   if (!slug) return null;
-  const prefix = projectCode ? `${projectCode}-` : '';
+  const prefix = resolvePhasePrefix(existingDirNames, projectCode);
   return `${prefix}${paddedNum}-${slug}`;
+}
+
+/** Read the phase directory names already on disk; returns [] when absent. */
+function readPhaseDirNames(phasesDir: string): string[] {
+  if (!existsSync(phasesDir)) return [];
+  try {
+    return readdirSync(phasesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
 }
 
 async function shouldDropArchivedPhaseMatch(
@@ -546,7 +563,7 @@ export const initPlanPhase: QueryHandler = async (args, projectDir, workstream) 
   assertSafeProjectCode(rawProjectCode);
   const expectedPhaseDirName = phaseDir
     ? null // directory already exists — no need to create
-    : computeExpectedPhaseDirName(phaseNumber, phaseName, rawProjectCode);
+    : computeExpectedPhaseDirName(phaseNumber, phaseName, rawProjectCode, readPhaseDirNames(paths.phases));
   const expectedPhaseDir = expectedPhaseDirName
     ? toPosixPath(relative(projectDir, join(paths.phases, expectedPhaseDirName)))
     : null;
@@ -871,7 +888,7 @@ export const initPhaseOp: QueryHandler = async (args, projectDir, workstream) =>
   assertSafeProjectCode(rawProjectCode);
   const expectedPhaseDirName = phaseDir
     ? null // directory already exists — no need to create
-    : computeExpectedPhaseDirName(phaseNumber, phaseName, rawProjectCode);
+    : computeExpectedPhaseDirName(phaseNumber, phaseName, rawProjectCode, readPhaseDirNames(paths.phases));
   const expectedPhaseDir = expectedPhaseDirName
     ? toPosixPath(relative(projectDir, join(paths.phases, expectedPhaseDirName)))
     : null;
