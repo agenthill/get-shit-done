@@ -291,6 +291,14 @@ gsd-sdk query validation.derive <phase>
 # Read-only drift gate: assert RESEARCH §Validation behaviors ⊆ VALIDATION rows
 # ⊆ PLAN <automated> commands. Returns { aligned, findings } (WARNINGs on drift).
 gsd-sdk query validation.check <phase>
+
+# Fail-closed reconciliation of an executor's BELIEVED state against ground truth
+# before SUMMARY.md / a PR body (#18). Checks claimed SHAs against `git log`,
+# the push against `git ls-remote --heads origin`, and the PR against
+# `gh pr list --head` (never `gh pr view`). Returns
+# { ok, shasVerified, verifiedShas, pushed, remoteSha, pr, discrepancies }.
+# `ok: false` ⇒ report the failure, not a success; write only verifiedShas / pr.url.
+gsd-sdk query report.reconcile --branch <b> --claimed-shas a,b,c [--claimed-pushed] [--claimed-pr <n|url>]
 ```
 
 ---

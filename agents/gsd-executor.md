@@ -409,6 +409,10 @@ The verb owns the canonical predicate (tdd="true" frontmatter AND `<behavior>` b
 <task_commit_protocol>
 After each task completes (verification passed, done criteria met), commit immediately.
 
+**Git-mutation serialization (MANDATORY — #18). A partial-batch rollback once discarded ~1h of committed work:**
+1. **One `git` command per tool call.** NEVER place a `git add`, `git commit`, `git reset`, or any other git mutation in the same parallel tool-call batch as another command (another `git` call, a `/tmp` helper script, a `cp`, a build). In this harness, when ANY one call in a parallel batch errors (denied permission, unresolved module, path outside the sandbox), the ENTIRE batch is cancelled and rolled back — silently discarding the commits the other calls in that batch already produced. Issue each git mutation as its own isolated tool call and wait for it to return before issuing the next.
+2. **Commit each task atomically and immediately on GREEN, before starting the next task.** Never accumulate multi-task uncommitted work that a single cancelled batch can wipe. The unit of durable progress is one committed task; do not proceed to task N+1 with task N's work uncommitted.
+
 **0a. cwd-drift assertion (worktree mode only, MANDATORY before staging — #3097):**
 A prior Bash call may have `cd`'d out of the worktree into the main repo. When that happens
 `[ -f .git ]` is false (main repo's `.git` is a directory), silently skipping all worktree guards.
@@ -541,7 +545,7 @@ back, those deletions appear on the main branch, destroying prior-wave work (#20
 - `git clean` (any flags — `-f`, `-fd`, `-fdx`, `-n`, etc.)
 - `git rm` on files not explicitly created by the current task
 - `git checkout -- .` or `git restore .` (blanket working-tree resets that discard files)
-- `git reset --hard` except inside the `<worktree_branch_check>` step at agent startup
+- `git reset` (soft OR hard) as a recovery mechanism. **Fix-forward only (#18).** If a tool-call batch was cancelled and you suspect commits were rolled back, DO NOT `git reset` to "get back to a clean state" and re-do the work — that is exactly the loop that lost ~1h of work and produced phantom SHAs. Instead: run `git log --oneline -10` and `git status --short` to read the ACTUAL current state from ground truth, then continue forward from wherever the real HEAD is (re-commit only what `git status` shows as genuinely uncommitted). `git reset --hard` remains permitted ONLY inside the `<worktree_branch_check>` step at agent startup.
 - `git update-ref refs/heads/<protected>` (where protected is `main`, `master`,
   `develop`, `trunk`, or `release/*`). This is an absolute prohibition (#2924).
   If you discover that your worktree HEAD is attached to a protected branch and your
@@ -595,6 +599,8 @@ Use the Write tool to create files — never use `Bash(cat << 'EOF')` or heredoc
 
 **Frontmatter:** phase, plan, subsystem, tags, dependency graph (requires/provides/affects), tech-stack (added/patterns), key-files (created/modified), decisions, metrics (duration, completed date).
 
+**Commit SHAs come from ground truth, not memory (#18).** When recording per-task commit hashes, read them from `git log --oneline` / `git rev-parse` at write time — never from an in-memory value captured many tool calls earlier, which may name a commit a cancelled batch rolled back. The `<self_check>` reconciliation below is the fail-closed gate that catches any phantom SHA before the SUMMARY is trusted.
+
 **Title:** `# Phase [X] Plan [Y]: [Name] Summary`
 
 **One-liner must be substantive:**
@@ -643,17 +649,27 @@ Omit section if nothing found.
 <self_check>
 After writing SUMMARY.md, verify claims before proceeding.
 
-**1. Check created files exist:**
+**1. Ground-truth state reconciliation (MANDATORY — fail-closed, #18).**
+Before you trust ANY SHA / push / PR claim in SUMMARY.md or your completion report, reconcile your BELIEVED state against ground truth. Never report a SHA from memory, a push you assumed succeeded, or a PR number you read from an unrelated `gh pr view`. Run:
+```bash
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+gsd-sdk query report.reconcile \
+  --branch "$BRANCH" \
+  --claimed-shas "<comma-separated SHAs you recorded per task>" \
+  ${CLAIMED_PUSHED:+--claimed-pushed} \
+  ${CLAIMED_PR:+--claimed-pr "$CLAIMED_PR"}
+```
+The verb derives the real state from `git log --format=%H <branch>` (SHAs), `git ls-remote --heads origin <branch>` (push), and `gh pr list --head <branch>` (PR — never `gh pr view`), and returns `{ ok, shasVerified, verifiedShas, pushed, remoteSha, pr, discrepancies }`.
+
+- **Write ONLY the `verifiedShas` and the confirmed `pr.url` into SUMMARY.md and the completion report.** A claimed SHA absent from `verifiedShas` is a phantom (rolled back / never committed) — drop it, never echo it.
+- **If `ok` is `false`:** do NOT write a success report. Append the `discrepancies` to SUMMARY.md under `## Self-Check: FAILED`, fix-forward (re-commit genuinely uncommitted work — see the fix-forward rule in `<destructive_git_prohibition>`; never `git reset` to recover), then re-run the reconciliation. Only a run with `ok: true` may claim success.
+
+**2. Check created files exist:**
 ```bash
 [ -f "path/to/file" ] && echo "FOUND: path/to/file" || echo "MISSING: path/to/file"
 ```
 
-**2. Check commits exist:**
-```bash
-git log --oneline --all | grep -q "{hash}" && echo "FOUND: {hash}" || echo "MISSING: {hash}"
-```
-
-**3. Append result to SUMMARY.md:** `## Self-Check: PASSED` or `## Self-Check: FAILED` with missing items listed.
+**3. Append result to SUMMARY.md:** `## Self-Check: PASSED` (only when reconciliation returned `ok: true` and all files exist) or `## Self-Check: FAILED` with the discrepancies / missing items listed.
 
 Do NOT skip. Do NOT proceed to state updates if self-check fails.
 </self_check>
