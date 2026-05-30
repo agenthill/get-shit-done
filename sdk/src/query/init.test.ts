@@ -491,6 +491,51 @@ describe('initPlanPhase', () => {
     });
   });
 
+  // #11: first-touch expected_phase_dir must match the on-disk convention,
+  // not apply project_code unconditionally.
+  describe('expected_phase_dir naming convention (#11)', () => {
+    it('stays BARE when existing dirs are bare even with project_code set', async () => {
+      // Set project_code and add a ROADMAP-only phase (no on-disk dir yet).
+      await writeFile(join(tmpDir, '.planning', 'config.json'), JSON.stringify({
+        model_profile: 'balanced',
+        project_code: 'vpmcp',
+        workflow: { research: true, plan_check: true, verifier: true, nyquist_validation: true },
+      }));
+      await writeFile(join(tmpDir, '.planning', 'ROADMAP.md'), [
+        '# Roadmap', '', '## v3.0: SDK-First Migration', '',
+        '### Phase 9: Foundation', '', '**Goal:** Build foundation', '',
+        '### Phase 11: New Work', '', '**Goal:** Do new work', '',
+      ].join('\n'));
+
+      const result = await initPlanPhase(['11'], tmpDir);
+      const data = result.data as Record<string, unknown>;
+      // existing dirs (09-foundation, 10-read-only-queries) are bare → bare
+      expect(data.expected_phase_dir).toContain('11-new-work');
+      expect(data.expected_phase_dir).not.toContain('vpmcp-11-new-work');
+    });
+
+    it('stays PREFIXED when existing dirs are already prefixed', async () => {
+      // Replace bare fixture dirs with prefixed ones.
+      await rm(join(tmpDir, '.planning', 'phases', '09-foundation'), { recursive: true, force: true });
+      await rm(join(tmpDir, '.planning', 'phases', '10-read-only-queries'), { recursive: true, force: true });
+      await mkdir(join(tmpDir, '.planning', 'phases', 'vpmcp-09-foundation'), { recursive: true });
+      await writeFile(join(tmpDir, '.planning', 'config.json'), JSON.stringify({
+        model_profile: 'balanced',
+        project_code: 'vpmcp',
+        workflow: { research: true, plan_check: true, verifier: true, nyquist_validation: true },
+      }));
+      await writeFile(join(tmpDir, '.planning', 'ROADMAP.md'), [
+        '# Roadmap', '', '## v3.0: SDK-First Migration', '',
+        '### Phase 9: Foundation', '', '**Goal:** Build foundation', '',
+        '### Phase 11: New Work', '', '**Goal:** Do new work', '',
+      ].join('\n'));
+
+      const result = await initPlanPhase(['11'], tmpDir);
+      const data = result.data as Record<string, unknown>;
+      expect(data.expected_phase_dir).toContain('vpmcp-11-new-work');
+    });
+  });
+
   // #2769: extractReqIds must accept all bold/colon variants of the
   // Requirements header. The forms render identically in markdown but differ
   // textually; the previous regex only matched **Requirements**: (colon

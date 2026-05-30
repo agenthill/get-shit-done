@@ -454,6 +454,65 @@ describe('phaseAdd', () => {
     expect(data.phase_number).toBe(47);
   });
 
+  // ── #11: match existing phase-dir naming convention, not project_code alone ──
+
+  it('#11: stays BARE when existing dirs are bare even with project_code set', async () => {
+    const { phaseAdd } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: '# Roadmap\n\n## Current Milestone: v5.0\n\nSome content\n',
+      state: MINIMAL_STATE,
+      config: { model_profile: 'balanced', phase_naming: 'sequential', project_code: 'vpmcp' },
+      phases: ['01-foo', '02-bar'],
+    });
+
+    const result = await phaseAdd(['baz'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+
+    // Convention on disk is bare NN-slug → new dir must be 03-baz, NOT vpmcp-03-baz
+    expect(data.phase_number).toBe(3);
+    expect(data.directory).toContain('03-baz');
+    expect(data.directory).not.toContain('vpmcp-03-baz');
+    const phasesDir = join(tmpDir, '.planning', 'phases');
+    expect(existsSync(join(phasesDir, '03-baz', '.gitkeep'))).toBe(true);
+    expect(existsSync(join(phasesDir, 'vpmcp-03-baz'))).toBe(false);
+  });
+
+  it('#11: stays PREFIXED when existing dirs are already prefixed', async () => {
+    const { phaseAdd } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: '# Roadmap\n\n## Current Milestone: v5.0\n\nSome content\n',
+      state: MINIMAL_STATE,
+      config: { model_profile: 'balanced', phase_naming: 'sequential', project_code: 'vpmcp' },
+      phases: ['vpmcp-01-foo'],
+    });
+
+    const result = await phaseAdd(['bar'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+
+    // Convention on disk is prefixed → new dir must be vpmcp-02-bar
+    expect(data.phase_number).toBe(2);
+    expect(data.directory).toContain('vpmcp-02-bar');
+    const phasesDir = join(tmpDir, '.planning', 'phases');
+    expect(existsSync(join(phasesDir, 'vpmcp-02-bar', '.gitkeep'))).toBe(true);
+  });
+
+  it('#11: first phase is PREFIXED when project_code set and no dirs exist (greenfield)', async () => {
+    const { phaseAdd } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      roadmap: '# Roadmap\n\n## Current Milestone: v5.0\n\nSome content\n',
+      state: MINIMAL_STATE,
+      config: { model_profile: 'balanced', phase_naming: 'sequential', project_code: 'vpmcp' },
+      phases: [],
+    });
+
+    const result = await phaseAdd(['first'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+
+    // No dirs on disk → preserve legacy behavior: prefix because project_code is set
+    expect(data.phase_number).toBe(1);
+    expect(data.directory).toContain('vpmcp-01-first');
+  });
+
   // ── Symptom A: --dry-run flag (#3226) ─────────────────────────────────
 
   it('--dry-run returns JSON result without creating any files or modifying ROADMAP', async () => {
@@ -705,6 +764,42 @@ describe('phaseInsert', () => {
 
     await expect(phaseInsert([], tmpDir)).rejects.toThrow('after-phase and description required');
   });
+
+  // ── #11: match existing phase-dir naming convention ──
+
+  it('#11: inserted dir stays BARE when existing dirs are bare even with project_code set', async () => {
+    const { phaseInsert } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      config: { model_profile: 'balanced', phase_naming: 'sequential', project_code: 'vpmcp' },
+      phases: ['09-foundation', '10-read-only-queries'],
+    });
+
+    const result = await phaseInsert(['10', 'Urgent Fix'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+
+    expect(data.phase_number).toBe('10.1');
+    expect(data.directory).toContain('10.1-urgent-fix');
+    expect(data.directory).not.toContain('vpmcp-10.1-urgent-fix');
+    const phasesDir = join(tmpDir, '.planning', 'phases');
+    expect(existsSync(join(phasesDir, '10.1-urgent-fix'))).toBe(true);
+    expect(existsSync(join(phasesDir, 'vpmcp-10.1-urgent-fix'))).toBe(false);
+  });
+
+  it('#11: inserted dir stays PREFIXED when existing dirs are already prefixed', async () => {
+    const { phaseInsert } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      config: { model_profile: 'balanced', phase_naming: 'sequential', project_code: 'vpmcp' },
+      phases: ['vpmcp-09-foundation', 'vpmcp-10-read-only-queries'],
+    });
+
+    const result = await phaseInsert(['10', 'Urgent Fix'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+
+    expect(data.phase_number).toBe('10.1');
+    expect(data.directory).toContain('vpmcp-10.1-urgent-fix');
+    const phasesDir = join(tmpDir, '.planning', 'phases');
+    expect(existsSync(join(phasesDir, 'vpmcp-10.1-urgent-fix'))).toBe(true);
+  });
 });
 
 // ─── phaseScaffold ──────────────────────────────────────────────────────
@@ -773,6 +868,39 @@ describe('phaseScaffold', () => {
     expect(data.created).toBe(true);
     const dir = data.directory as string;
     expect(dir).toContain('15-new-module');
+  });
+
+  // ── #11: match existing phase-dir naming convention ──
+
+  it('#11: phase-dir stays BARE when existing dirs are bare even with project_code set', async () => {
+    const { phaseScaffold } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      config: { model_profile: 'balanced', phase_naming: 'sequential', project_code: 'vpmcp' },
+      phases: ['01-foo', '02-bar'],
+    });
+
+    const result = await phaseScaffold(['phase-dir', '15', 'New Module'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+
+    expect(data.created).toBe(true);
+    const dir = data.directory as string;
+    expect(dir).toContain('15-new-module');
+    expect(dir).not.toContain('vpmcp-15-new-module');
+  });
+
+  it('#11: phase-dir stays PREFIXED when existing dirs are already prefixed', async () => {
+    const { phaseScaffold } = await import('./phase-lifecycle.js');
+    await setupTestProject(tmpDir, {
+      config: { model_profile: 'balanced', phase_naming: 'sequential', project_code: 'vpmcp' },
+      phases: ['vpmcp-01-foo'],
+    });
+
+    const result = await phaseScaffold(['phase-dir', '15', 'New Module'], tmpDir);
+    const data = result.data as Record<string, unknown>;
+
+    expect(data.created).toBe(true);
+    const dir = data.directory as string;
+    expect(dir).toContain('vpmcp-15-new-module');
   });
 
   it('returns already_exists for existing file', async () => {
@@ -1761,6 +1889,50 @@ describe('collectDecimalSuffixesFromDirNames — CR-3267 finding 3: alphanumeric
     const result = collectDecimalSuffixesFromDirNames('3', dirs);
     expect(result.has(1)).toBe(true);
     expect(result.has(2)).toBe(true);
+  });
+});
+
+// ─── resolvePhasePrefix (#11: match on-disk convention, not project_code alone) ──
+
+describe('resolvePhasePrefix', () => {
+  it('returns empty when project_code is unset, regardless of dirs', async () => {
+    const { resolvePhasePrefix } = await import('./phase-lifecycle-policy.js');
+    expect(resolvePhasePrefix(['vpmcp-01-foo'], '')).toBe('');
+    expect(resolvePhasePrefix([], '')).toBe('');
+  });
+
+  it('returns empty (bare) when existing dirs are bare even with project_code set', async () => {
+    const { resolvePhasePrefix } = await import('./phase-lifecycle-policy.js');
+    expect(resolvePhasePrefix(['01-foo', '02-bar'], 'vpmcp')).toBe('');
+  });
+
+  it('returns the prefix when existing dirs are already prefixed', async () => {
+    const { resolvePhasePrefix } = await import('./phase-lifecycle-policy.js');
+    expect(resolvePhasePrefix(['vpmcp-01-foo'], 'vpmcp')).toBe('vpmcp-');
+  });
+
+  it('returns the prefix for greenfield (no phase dirs) when project_code set', async () => {
+    const { resolvePhasePrefix } = await import('./phase-lifecycle-policy.js');
+    expect(resolvePhasePrefix([], 'vpmcp')).toBe('vpmcp-');
+  });
+
+  it('resolves a mixed layout toward the prefixed convention', async () => {
+    const { resolvePhasePrefix } = await import('./phase-lifecycle-policy.js');
+    expect(resolvePhasePrefix(['01-foo', 'vpmcp-02-bar'], 'vpmcp')).toBe('vpmcp-');
+  });
+
+  it('ignores non-phase directories when classifying', async () => {
+    const { resolvePhasePrefix } = await import('./phase-lifecycle-policy.js');
+    // .gitkeep-only / unrelated dirs do not match either pattern → treated as greenfield
+    expect(resolvePhasePrefix(['archive', 'notes'], 'vpmcp')).toBe('vpmcp-');
+    // bare phase dir among unrelated dirs → bare
+    expect(resolvePhasePrefix(['archive', '01-foo'], 'vpmcp')).toBe('');
+  });
+
+  it('classifies decimal phase dirs correctly', async () => {
+    const { resolvePhasePrefix } = await import('./phase-lifecycle-policy.js');
+    expect(resolvePhasePrefix(['10.1-hotfix'], 'vpmcp')).toBe('');
+    expect(resolvePhasePrefix(['vpmcp-10.1-hotfix'], 'vpmcp')).toBe('vpmcp-');
   });
 });
 
