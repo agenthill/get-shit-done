@@ -50,6 +50,7 @@ import { readRollbackLedger, writeRollbackLedger } from './query/rollback-ledger
 import { readPhaseManifest } from './query/phase-manifest.js';
 import { classifyCascade } from './query/tier2-cascade-classifier.js';
 import { readPhaseDependsOn } from './query/phase-depends-on.js';
+import { relPlanningPath } from './workstream-utils.js';
 import { GitMergeSerializer } from './execution-engine.js';
 import { stateSignalWaiting, stateSignalResume } from './query/state-mutation.js';
 
@@ -421,6 +422,54 @@ export class GSD {
         return found;
       },
       runPhase: (phase) => this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts),
+      onWaveStart: async () => {
+        // D3: ensure the working tree is on protected before this wave's phases
+        // build their engines, so each captures the current protected HEAD as
+        // its per-phase base SHA (a prior wave's promotes have advanced it, and
+        // may have parked the tree on an integration branch). Best-effort: a
+        // fresh repo with no protected ref yet is a no-op.
+        await execFileAsync('git', ['checkout', protectedBranch], {
+          cwd: this.projectDir,
+        }).catch(() => undefined);
+      },
+      assertLedgersClean: async () => {
+        // D2: the orchestrator is the SOLE writer of these ledgers at wave scope.
+        // A present-but-conflicted ledger on protected after a wave means a phase
+        // mutated it mid-wave — fail closed. A missing ledger (never created) is
+        // not a violation. FIX 3: derive the ledger paths through the same
+        // workstream-scoping helper the rest of the SDK uses (relPlanningPath →
+        // `.planning` for a root run, `.planning/workstreams/<ws>` under a
+        // workstream) so a workstream run inspects the ledgers that actually
+        // exist, not the absent root paths (which `catch{continue}` silently
+        // passed). `git show <ref>:<rel>` needs the project-RELATIVE form.
+        const planningRel = relPlanningPath(this.workstream);
+        for (const doc of [`${planningRel}/ROADMAP.md`, `${planningRel}/STATE.md`]) {
+          let stdout: string;
+          try {
+            ({ stdout } = await execFileAsync(
+              'git',
+              ['show', `${protectedBranch}:${doc}`],
+              { cwd: this.projectDir },
+            ));
+          } catch {
+            continue; // doc absent on protected → nothing to assert
+          }
+          if (/^<{7}|^={7}|^>{7}/m.test(stdout)) {
+            throw new Error(
+              `D2 violation: ${doc} on ${protectedBranch} contains conflict markers after a wave — a phase-agent mutated an orchestrator-owned ledger`,
+            );
+          }
+        }
+      },
+      resolveDependsOn: async (phaseNumber) => {
+        // D4: a phase's direct ROADMAP depends_on edges. Best-effort — a missing
+        // ROADMAP / unparseable section yields no edges (every phase independent).
+        try {
+          return await readPhaseDependsOn(this.projectDir, phaseNumber, this.workstream);
+        } catch {
+          return [];
+        }
+      },
       ...(openPrs && {
         promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
           const branch = integrationBranchFor(phase.number);
