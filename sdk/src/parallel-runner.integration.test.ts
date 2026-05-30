@@ -294,4 +294,52 @@ describe('GSD.runParallel — happy path wave loop (D1)', () => {
     expect(p3.promoted).toBe(true);
     expect(res.success).toBe(false);
   });
+
+  it('a failed phase leaves no integration branch after the wave (Tier-1 reuse)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    const git = gitIn(dir);
+    const gsd = new GSD({ projectDir: dir });
+    // Do NOT stub runPhaseWithRollbackRetry — exercise the REAL driver so its
+    // existing Tier-1 rollback path fires. Stub the inner runPhase to settle
+    // non-green WITH a rollback context the real driver acts on via rollbackTier1.
+    const { createPhaseCheckpoint, ensureCheckpointGitignore, integrationBranchFor } = await import(
+      './query/phase-checkpoint.js'
+    );
+    await ensureCheckpointGitignore(dir);
+    const cp = await createPhaseCheckpoint({ projectDir: dir, phaseNumber: '1', protectedBranch: 'main' });
+    await git(['checkout', '-B', integrationBranchFor('1'), cp.lastGoodSha]);
+    await writeFile(join(dir, 'work.txt'), 'w\n');
+    await git(['add', '-A']);
+    await git(['commit', '-q', '--no-verify', '-m', 'int work']);
+    await git(['checkout', 'main']);
+
+    vi.spyOn(gsd as any, 'runPhase').mockResolvedValue({
+      phaseNumber: '1',
+      phaseName: 'A',
+      steps: [{ step: PhaseStepType.Execute, success: false, durationMs: 1 }],
+      success: false,
+      totalCostUsd: 0,
+      totalDurationMs: 1,
+      rollbackContext: {
+        phaseNumber: '1',
+        protectedBranch: 'main',
+        lastGoodSha: cp.lastGoodSha,
+        snapshotDir: cp.snapshotDir,
+        integrationBranch: integrationBranchFor('1'),
+      },
+    });
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue(twoPhaseRoadmap()),
+    } as never);
+
+    const res = await gsd.runParallel(['1', '2'], { openPullRequests: false });
+    // Tier-1 fired (reused, not reimplemented): integration branch deleted,
+    // protected still at LAST_GOOD.
+    await expect(
+      git(['rev-parse', '--verify', `refs/heads/${integrationBranchFor('1')}`]),
+    ).rejects.toThrow();
+    expect((await git(['rev-parse', 'main'])).stdout.trim()).toBe(cp.lastGoodSha);
+    expect(res.phases.find((p) => p.phaseNumber === '1')!.promoted).toBe(false);
+  });
 });
