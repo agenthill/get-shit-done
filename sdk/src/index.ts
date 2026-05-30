@@ -27,7 +27,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo, PhaseFailureContext } from './types.js';
+import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo, PhaseFailureContext, ParallelRunnerOptions, ParallelRunnerResult } from './types.js';
 import { GSDEventType, PhaseStepType } from './types.js';
 import { parsePlan, parsePlanFile } from './plan-parser.js';
 import { loadConfig } from './config.js';
@@ -39,7 +39,10 @@ import { PhaseRunner } from './phase-runner.js';
 import type { ExecutionEngineFactory } from './phase-runner.js';
 import { ContextEngine } from './context-engine.js';
 import { PromptFactory } from './phase-prompt.js';
-import { detectRuntime } from './query/helpers.js';
+import { detectRuntime, normalizePhaseName } from './query/helpers.js';
+import { runParallelWaves } from './parallel-runner.js';
+import { pushBranchAndOpenPr, adminMergeOnGreen, defaultRunners } from './pr-merge.js';
+import { integrationBranchFor } from './query/phase-checkpoint.js';
 import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
 import { classifyAgentFailure } from './query/agent-failure-classifier.js';
 import { rollbackTier1, cascadeRollbackTier2, resumeIncompleteRollback } from './query/rollback-engine.js';
@@ -375,6 +378,66 @@ export class GSD {
       totalCostUsd,
       totalDurationMs,
     };
+  }
+
+  /**
+   * Run N independent backlog phases in concurrency waves (ADR 0014). Schedules
+   * the phases via `conflict-graph` (hard-disjoint within a wave) and fans out
+   * one phase-agent per wave member through the SAME per-phase rollback/retry
+   * driver `run()` uses — reusing checkpoint + Tier-1/Tier-2 + promote-on-green.
+   * Parallel within a wave, sequential across waves.
+   */
+  async runParallel(
+    phaseNumbers: string[],
+    options?: ParallelRunnerOptions,
+  ): Promise<ParallelRunnerResult> {
+    const tools = this.createTools();
+    const config = await loadConfig(this.projectDir, this.workstream);
+    const maxPhaseAttempts = config.git?.sdk_max_phase_attempts ?? 5;
+
+    // Resolve roadmap metadata once; the wave loop looks phases up by token. The
+    // conflict-graph waves carry NORMALIZED tokens (`'1'` → `'01'`), so index the
+    // roadmap by normalized number to reconcile against the wave member token.
+    const analysis = await tools.roadmapAnalyze();
+    const byNormalized = new Map(
+      analysis.phases.map((p) => [normalizePhaseName(p.number), p] as const),
+    );
+
+    // D6: PR-per-phase promotion. On by default; tests / non-remote repos pass
+    // `openPullRequests: false` to stop at the local promote-on-green.
+    const openPrs = options?.openPullRequests !== false;
+    const protectedBranch = await this.resolveProtectedBranch(config);
+    const runners = options?.prRunners ?? defaultRunners(this.projectDir);
+
+    return runParallelWaves(phaseNumbers, options, {
+      projectDir: this.projectDir,
+      ...(this.workstream && { workstream: this.workstream }),
+      parallelization: config.parallelization !== false,
+      resolvePhase: async (waveToken) => {
+        const found = byNormalized.get(normalizePhaseName(waveToken));
+        if (!found) {
+          throw new Error(`Phase ${waveToken} not found in ROADMAP for parallel run`);
+        }
+        return found;
+      },
+      runPhase: (phase) => this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts),
+      ...(openPrs && {
+        promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
+          const branch = integrationBranchFor(phase.number);
+          const url = await pushBranchAndOpenPr(
+            {
+              branch,
+              baseBranch: protectedBranch,
+              title: `Phase ${phase.number}: ${result.phaseName}`,
+              body: 'Auto-generated parallel phase PR (ADR 0014). Closes the phase backlog item.',
+            },
+            runners,
+          );
+          await adminMergeOnGreen(url, runners);
+          return url;
+        },
+      }),
+    });
   }
 
   /**
@@ -895,6 +958,10 @@ export type { LogLevel, LogEntry, GSDLoggerOptions } from './logger.js';
 // S03: Phase lifecycle state machine
 export { PhaseRunner, PhaseRunnerError } from './phase-runner.js';
 export type { PhaseRunnerDeps, VerificationOutcome } from './phase-runner.js';
+
+// ADR 0014: parallel multi-phase execution
+export { runParallelWaves } from './parallel-runner.js';
+export type { ParallelDriverContext } from './parallel-runner.js';
 
 // S05: Transports
 export { CLITransport } from './cli-transport.js';

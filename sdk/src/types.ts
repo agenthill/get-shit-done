@@ -582,6 +582,53 @@ export interface MilestoneRunnerResult {
   totalDurationMs: number;
 }
 
+// ─── ADR 0014: parallel multi-phase execution ────────────────────────────────
+
+/** Per-phase outcome inside a wave. */
+export interface PhaseParallelOutcome {
+  phaseNumber: string;
+  /** The PhaseRunnerResult the rollback/retry driver settled on. */
+  result: PhaseRunnerResult;
+  /** True when the phase went green, promoted, and (if remote) auto-merged. */
+  promoted: boolean;
+  /** PR url when a PR was opened (D6); undefined on failure or local-only. */
+  prUrl?: string;
+  /** Set when this phase was SKIPPED because a depends_on predecessor failed (D4). */
+  skippedReason?: string;
+}
+
+/** Result of one wave (parallel within, sequential across). */
+export interface WaveResult {
+  waveIndex: number;
+  phases: PhaseParallelOutcome[];
+}
+
+/** Options for a parallel multi-phase run. Superset of MilestoneRunnerOptions. */
+export interface ParallelRunnerOptions extends MilestoneRunnerOptions {
+  /**
+   * When true, the orchestrator opens + admin-merges a PR per green phase (D6).
+   * When false, promotion stops at the local protected-branch merge (the
+   * existing GSD.run promote-on-green) — useful for tests / non-remote repos.
+   * Default true.
+   */
+  openPullRequests?: boolean;
+  /**
+   * Injectable gh/git runners for the PR-per-phase promotion (D6). Tests pass a
+   * fake; production omits it → defaultRunners(projectDir). Internal seam.
+   */
+  prRunners?: { gh: (args: string[]) => Promise<string>; git: (args: string[]) => Promise<string> };
+}
+
+/** Result of a full parallel multi-phase run. */
+export interface ParallelRunnerResult {
+  success: boolean;
+  waves: WaveResult[];
+  /** Every phase outcome, flattened in execution order. */
+  phases: PhaseParallelOutcome[];
+  totalCostUsd: number;
+  totalDurationMs: number;
+}
+
 /**
  * Milestone execution started.
  */
