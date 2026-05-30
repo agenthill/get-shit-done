@@ -568,16 +568,18 @@ In that case: **skip validation-strategy creation entirely**. Do **not** expect 
 grep -l "## Validation Architecture" "${PHASE_DIR}"/*-RESEARCH.md 2>/dev/null || true
 ```
 
-**If found:**
-1. Read template: `~/.claude/get-shit-done/templates/VALIDATION.md`
-2. Write to `${PHASE_DIR}/${PADDED_PHASE}-VALIDATION.md` (use Write tool)
-3. Fill frontmatter: `{N}` → phase number, `{phase-slug}` → slug, `{date}` → current date
-4. Verify:
+**If found:** Derive a POPULATED Per-Task Verification Map from RESEARCH § Validation Architecture (single source of truth) instead of copying the blank template:
+```bash
+gsd-sdk query validation.derive "${PHASE}" --raw
+```
+1. If the result has a non-empty `rows` array: Write its `content` field to `${PHASE_DIR}/${PADDED_PHASE}-VALIDATION.md` (use Write tool). The Task ID column is stamped `TBD-by-planner` — the planner replaces it with the owning task id during planning.
+2. If `rows` is empty (`reason` explains why — e.g. no parseable `Phase Requirements → Test Map` table): fall back to the blank template — read `~/.claude/get-shit-done/templates/VALIDATION.md`, Write it to `${PHASE_DIR}/${PADDED_PHASE}-VALIDATION.md`, and fill frontmatter: `{N}` → phase number, `{phase-slug}` → slug, `{date}` → current date.
+3. Verify:
 ```bash
 test -f "${PHASE_DIR}/${PADDED_PHASE}-VALIDATION.md" && echo "VALIDATION_CREATED=true" || echo "VALIDATION_CREATED=false"
 ```
-5. If `VALIDATION_CREATED=false`: STOP — do not proceed to Step 6
-6. If `commit_docs`: `commit "docs(phase-${PHASE}): add validation strategy"`
+4. If `VALIDATION_CREATED=false`: STOP — do not proceed to Step 6
+5. If `commit_docs`: `commit "docs(phase-${PHASE}): add validation strategy"`
 
 **If not found:** Warn and continue — plans may fail Dimension 8.
 

@@ -98,6 +98,13 @@ No `gsd-tools.cjs` mirror — agents use these instead of shell `ls`/`find`/`gre
 - `**plan.task-structure**` `<path-to-PLAN.md>` — wave, `depends_on`, task/checkpoint counts via `parsePlan()`.
 - `**requirements.extract-from-plans**` `<phase>` — deduped `requirements:` frontmatter across plans.
 
+## Nyquist validation map (SDK-only)
+
+No `gsd-tools.cjs` mirror. The Nyquist validation map has one source of truth — `RESEARCH.md` § Validation Architecture (the `### Phase Requirements → Test Map` table). These verbs project it and cross-check it instead of hand-copying it into `VALIDATION.md` and each `PLAN.md` `<verification>` (`validation.ts`):
+
+- `**validation.derive**` `<phase>` — parse RESEARCH § Validation Architecture and return `{ rows, content }`, where `content` is a POPULATED `VALIDATION.md` Per-Task Verification Map (Task ID / Requirement / Behavior / Test Type / Command / status). Task ids are unknown at derive time, so the Task ID column is stamped `TBD-by-planner`. Empty `rows` + `reason` when the section/table is absent (never throws on a missing section). Backs `plan-phase.md` step 5.5.
+- `**validation.check**` `<phase>` — read-only drift gate: assert RESEARCH §Validation behaviors ⊆ VALIDATION rows ⊆ PLAN `<automated>` commands. Returns `{ aligned, findings }` with `WARNING`-severity findings naming each drift; never throws on drift.
+
 ## State extensions (Phase 3)
 
 Handlers for `**state.signal-waiting`**, `**state.signal-resume**`, `**state.validate**`, `**state.sync**` (supports `--verify` dry-run), and `**state.prune**` live in `state-mutation.ts`, with dotted and `state …` space aliases in `index.ts`.
