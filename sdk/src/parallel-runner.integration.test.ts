@@ -128,4 +128,55 @@ describe('GSD.runParallel — happy path wave loop (D1)', () => {
     // One merge per green phase, in wave order (both members of wave 0).
     expect(merges).toHaveLength(2);
   });
+
+  it('captures a fresh base SHA per wave (D3): wave 1 forks off wave 0 promotes', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    const git = gitIn(dir);
+    const base0 = (await git(['rev-parse', 'HEAD'])).stdout.trim();
+    const gsd = new GSD({ projectDir: dir });
+
+    const seenHeads: string[] = [];
+    const seenBranches: string[] = [];
+    // Driver stub: record where the engine would fork off (the working-tree HEAD
+    // and its branch at runPhase time), then advance protected (the promote) and
+    // leave the working tree parked on a NON-protected integration branch — the
+    // state a real per-phase promote leaves behind. Without the D3 wave-start
+    // hook re-checking-out protected, wave 1 would fork off this stale branch.
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry').mockImplementation(async (phase: any) => {
+      seenHeads.push((await git(['rev-parse', 'HEAD'])).stdout.trim());
+      seenBranches.push((await git(['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim());
+      // Advance protected (the promote commit).
+      await git(['checkout', '-q', 'main']);
+      await writeFile(join(dir, `phase-${phase.number}.txt`), 'x\n');
+      await git(['add', '-A']);
+      await git(['commit', '-q', '--no-verify', '-m', `promote ${phase.number}`]);
+      // Park the working tree off protected, as a real promote leaves it.
+      await git(['checkout', '-q', '-B', `gsd-int-${phase.number}`]);
+      return { result: greenResult(phase.number), halted: false };
+    });
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue(twoPhaseRoadmap()),
+    } as never);
+    // Force two waves: make phase 2 hard-conflict with phase 1.
+    await writeFile(
+      join(dir, '.planning', 'phases', '02-b', '02-PLAN.md'),
+      `---\nphase: 02-b\nfiles_modified:\n  - src/a.ts\n---\n<objective>O</objective>\n<tasks><task type="auto"><name>T</name></task></tasks>\n`,
+    );
+    await git(['add', '-A']);
+    await git(['commit', '-q', '--no-verify', '-m', 'conflict']);
+    const mainAfterConflict = (await git(['rev-parse', 'main'])).stdout.trim();
+
+    const res = await gsd.runParallel(['1', '2'], { openPullRequests: false });
+    expect(res.waves).toHaveLength(2);
+    // Wave 0's phase forked off the (conflict-advanced) protected HEAD, not base0.
+    expect(seenHeads[0]).toBe(mainAfterConflict);
+    expect(seenHeads[0]).not.toBe(base0);
+    // D3: wave 1's phase forked off protected AS IT STANDS AFTER wave 0's promote
+    // — the wave-start hook re-checked-out protected, so it did NOT inherit the
+    // stale non-protected branch wave 0 parked on.
+    expect(seenBranches[1]).toBe('main');
+    expect(seenHeads[1]).not.toBe(seenHeads[0]); // protected advanced by wave 0's promote
+    expect(seenHeads[1]).not.toBe(mainAfterConflict); // forked off wave 0's promote, not the pre-wave base
+  });
 });

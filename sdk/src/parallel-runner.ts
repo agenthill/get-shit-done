@@ -42,6 +42,14 @@ export interface ParallelDriverContext {
    * the PR url. Absent → no PR step (local-only / openPullRequests:false).
    */
   promotePhasePr?: (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => Promise<string>;
+  /**
+   * Called once at the START of each wave (D3): re-checks-out the protected
+   * branch so this wave's phases build their engines off the protected HEAD AS
+   * IT STANDS after the prior wave's promotes — each phase captures its OWN base
+   * SHA at wave-member start, not a stale global LAST_GOOD left by an earlier
+   * wave parking the working tree on an integration branch.
+   */
+  onWaveStart?: (waveIndex: number) => Promise<void>;
 }
 
 /**
@@ -72,6 +80,9 @@ export async function runParallelWaves(
 
   for (let waveIndex = 0; waveIndex < schedule.waves.length; waveIndex++) {
     const members = schedule.waves[waveIndex]!;
+    // D3: re-seed the per-phase base SHA at the wave boundary so this wave's
+    // phases fork off protected as the prior wave's promotes left it.
+    if (ctx.onWaveStart) await ctx.onWaveStart(waveIndex);
     const outcomes = await Promise.all(
       members.map((waveToken) =>
         semaphore.run(async (): Promise<PhaseParallelOutcome> => {

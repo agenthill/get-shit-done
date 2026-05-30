@@ -421,6 +421,16 @@ export class GSD {
         return found;
       },
       runPhase: (phase) => this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts),
+      onWaveStart: async () => {
+        // D3: ensure the working tree is on protected before this wave's phases
+        // build their engines, so each captures the current protected HEAD as
+        // its per-phase base SHA (a prior wave's promotes have advanced it, and
+        // may have parked the tree on an integration branch). Best-effort: a
+        // fresh repo with no protected ref yet is a no-op.
+        await execFileAsync('git', ['checkout', protectedBranch], {
+          cwd: this.projectDir,
+        }).catch(() => undefined);
+      },
       ...(openPrs && {
         promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
           const branch = integrationBranchFor(phase.number);
