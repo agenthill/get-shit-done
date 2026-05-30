@@ -24,6 +24,7 @@ import { worktreeCleanupWave, worktreeReapOrphans } from './worktree.js';
 import { promptBudget } from './prompt-budget.js';
 import { conflictGraph } from './conflict-graph.js';
 import { validationDerive, validationCheck } from './validation.js';
+import { reportReconcile } from './report-reconcile.js';
 
 export const DOMAIN_STATIC_CATALOG: ReadonlyArray<readonly [string, QueryHandler]> = [
   ['agent-skills', agentSkills],
@@ -124,4 +125,8 @@ export const DOMAIN_STATIC_CATALOG: ReadonlyArray<readonly [string, QueryHandler
   ['validation derive', validationDerive],
   ['validation.check', validationCheck],
   ['validation check', validationCheck],
+  // Fail-closed ground-truth reconciliation of an executor's self-reported
+  // state (SHAs/push/PR) before SUMMARY.md / PR (#18). Read-only.
+  ['report.reconcile', reportReconcile],
+  ['report reconcile', reportReconcile],
 ] as const;
