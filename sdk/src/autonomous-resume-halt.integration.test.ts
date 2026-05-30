@@ -279,6 +279,46 @@ describe('Autonomous crash-resume HALT — never auto-advance after a resumed Ti
     }
   });
 
+  it('J2: a settled TIER-1 cap-halt ledger (status:halted, NO tier, NO steps) → GSD.run RE-ATTEMPTS (the phase loop runs)', async () => {
+    // J2: the settled-halt gate is scoped to `tier === 2` ONLY. A bare Tier-1
+    // cap-reached halt ledger ({status:'halted', attempt_count, failure_context},
+    // NO `tier`, NO `steps` — the shape written at the cap-reached branch in
+    // index.ts) leaves protected at LAST_GOOD with nothing promoted-then-reverted,
+    // so a deliberate fresh GSD.run may RE-ATTEMPT (the pre-E-2 Tier-1 behavior)
+    // rather than refusing until ROLLBACK.json is manually cleared. This is the
+    // distinguisher from the Tier-2 case above (which stays sticky-halted).
+    const { dir } = await setupTwoPromotedPhases();
+    try {
+      // A settled Tier-1 cap-halt ledger: status halted, NO tier, NO steps.
+      await writeFile(
+        join(dir, '.planning', 'ROLLBACK.json'),
+        JSON.stringify({
+          failed_phase: '3',
+          attempt_count: 5,
+          failure_context: [{ attempt: 5, signal: 'genuine', detail: 'still red' }],
+          status: 'halted',
+        }),
+      );
+
+      const gsd = new GSD({ projectDir: dir });
+      vi.spyOn(gsd, 'createTools').mockReturnValue({
+        // Return empty after the first call so the loop terminates quickly.
+        roadmapAnalyze: vi.fn().mockResolvedValueOnce(phase3Info()).mockResolvedValue({ phases: [] }),
+      } as never);
+      const runPhaseSpy = vi.spyOn(gsd, 'runPhase').mockImplementation((async () => ({
+        phaseNumber: '3', phaseName: 'Ship', steps: [], success: true, totalCostUsd: 0, totalDurationMs: 1,
+      })) as never);
+
+      const result = await gsd.run('ship it');
+
+      // Re-attempted: the phase executor WAS invoked (a Tier-1 halt is NOT sticky).
+      expect(runPhaseSpy).toHaveBeenCalled();
+      expect(result.success).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('E-2: an ABSENT ROLLBACK.json → GSD.run proceeds normally (the phase executor runs)', async () => {
     // The other side of the E-2 gate: an absent ledger is NOT a halt — the driver
     // must proceed and run the phase loop (this is the common no-rollback path).

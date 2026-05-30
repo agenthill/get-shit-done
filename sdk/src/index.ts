@@ -266,11 +266,20 @@ export class GSD {
       // resumeIncompleteRollback only acts on an INCOMPLETE steps journal, so on a
       // fresh GSD.run that ledger yields halt:false and the phase loop would
       // AUTO-ADVANCE past a Tier-2 halt — violating "never auto-advance after
-      // Tier-2". Gate on the SETTLED HALT directly: a present ledger whose
-      // status is 'halted' (or tier===2) HALTS regardless of the steps journal.
-      // An ABSENT ledger (null) proceeds; a 'retrying' ledger is NOT a halt (the
-      // crash-resume replay / informed-retry path below handles it).
-      if (existingLedger && (existingLedger.status === 'halted' || existingLedger.tier === 2)) {
+      // Tier-2". Gate on the SETTLED Tier-2 HALT directly: a present ledger whose
+      // tier===2 HALTS regardless of the steps journal.
+      //
+      // J2: gate on `tier === 2` ONLY — do NOT also catch `status === 'halted'`.
+      // A Tier-2 cascade reverted PROMOTED predecessor work and is halt-worthy
+      // until a human reviews + clears the ledger (sticky). A bare Tier-1 cap-halt
+      // (`{status:'halted'}`, NO `tier`, written at the cap-reached branch below)
+      // and the R4 promote-recovery-halt both leave protected at LAST_GOOD with
+      // nothing promoted-then-reverted, so a deliberate fresh GSD.run may
+      // re-attempt (the pre-E-2 Tier-1 behavior) rather than refusing until
+      // ROLLBACK.json is manually cleared. An ABSENT ledger (null) proceeds; a
+      // 'retrying' ledger is NOT a halt (the crash-resume replay / informed-retry
+      // path below handles it).
+      if (existingLedger && existingLedger.tier === 2) {
         haltedByResume = true;
       }
 
