@@ -454,6 +454,15 @@ export class GSD {
           }
         }
       },
+      resolveDependsOn: async (phaseNumber) => {
+        // D4: a phase's direct ROADMAP depends_on edges. Best-effort — a missing
+        // ROADMAP / unparseable section yields no edges (every phase independent).
+        try {
+          return await readPhaseDependsOn(this.projectDir, phaseNumber, this.workstream);
+        } catch {
+          return [];
+        }
+      },
       ...(openPrs && {
         promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
           const branch = integrationBranchFor(phase.number);

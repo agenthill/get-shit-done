@@ -237,4 +237,61 @@ describe('GSD.runParallel — happy path wave loop (D1)', () => {
       /D2 violation.*ROADMAP\.md/,
     );
   });
+
+  it('skips only the depends_on closure of a failed phase; unrelated phases proceed (D4)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    const git = gitIn(dir);
+    // Three phases: 1 (fails), 2 (depends on 1 → skipped), 3 (independent → runs).
+    await mkdir(join(dir, '.planning', 'phases', '03-c'), { recursive: true });
+    const plan = (ph: string, f: string) =>
+      `---\nphase: ${ph}\nfiles_modified:\n  - ${f}\n---\n<objective>O</objective>\n<tasks><task type="auto"><name>T</name></task></tasks>\n`;
+    await writeFile(join(dir, '.planning', 'phases', '03-c', '03-PLAN.md'), plan('03-c', 'src/c.ts'));
+    // ROADMAP declares phase 2 depends on phase 1.
+    await writeFile(
+      join(dir, '.planning', 'ROADMAP.md'),
+      '### Phase 1: A\n### Phase 2: B\n**Depends on:** Phase 1\n### Phase 3: C\n',
+    );
+    await git(['add', '-A']);
+    await git(['commit', '-q', '--no-verify', '-m', 'roadmap deps']);
+
+    const gsd = new GSD({ projectDir: dir });
+    const ran: string[] = [];
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry').mockImplementation(async (phase: any) => {
+      ran.push(phase.number);
+      if (phase.number === '1') {
+        return {
+          result: {
+            ...greenResult('1'),
+            success: false,
+            steps: [{ step: PhaseStepType.Execute, success: false, durationMs: 1 }],
+          },
+          halted: true,
+        };
+      }
+      return { result: greenResult(phase.number), halted: false };
+    });
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue({
+        phases: [
+          { number: '1', disk_status: 'pending', roadmap_complete: false, phase_name: 'A' },
+          { number: '2', disk_status: 'pending', roadmap_complete: false, phase_name: 'B' },
+          { number: '3', disk_status: 'pending', roadmap_complete: false, phase_name: 'C' },
+        ],
+      }),
+    } as never);
+
+    const res = await gsd.runParallel(['1', '2', '3'], { openPullRequests: false });
+    // Phase 1 ran and failed; phase 2 (depends on 1) was SKIPPED, never ran;
+    // phase 3 (independent) ran and promoted.
+    expect(ran).toContain('1');
+    expect(ran).not.toContain('2');
+    expect(ran).toContain('3');
+    const p2 = res.phases.find((p) => p.phaseNumber === '2')!;
+    expect(p2.skippedReason).toMatch(/depends_on.*\b1\b/);
+    expect(p2.promoted).toBe(false);
+    const p3 = res.phases.find((p) => p.phaseNumber === '3')!;
+    expect(p3.promoted).toBe(true);
+    expect(res.success).toBe(false);
+  });
 });

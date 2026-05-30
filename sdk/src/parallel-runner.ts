@@ -27,6 +27,7 @@ import type {
 } from './types.js';
 import { scheduleWavesForPhases } from './query/wave-scheduler.js';
 import { Semaphore, Mutex, resolveConcurrencyCap } from './execution-engine.js';
+import { canonicalizePhaseId } from './query/phase-depends-on.js';
 
 /** The orchestration surface the GSD class supplies to the wave loop. */
 export interface ParallelDriverContext {
@@ -59,6 +60,12 @@ export interface ParallelDriverContext {
    * under concurrency. Throws (fails closed) on a detected violation.
    */
   assertLedgersClean?: () => Promise<void>;
+  /**
+   * Resolve a phase's direct `depends_on` (ROADMAP edges, canonical phase tokens)
+   * — used to skip the closure of a failed predecessor (D4). Absent → no
+   * skip-dependents (every phase runs; D4 reduces to continue-independents).
+   */
+  resolveDependsOn?: (phaseNumber: string) => Promise<string[]>;
 }
 
 /**
@@ -87,24 +94,80 @@ export async function runParallelWaves(
   const allOutcomes: PhaseParallelOutcome[] = [];
   let success = true;
 
+  // ── D4 skip-dependents bookkeeping ────────────────────────────────────────
+  // `failed` accumulates the canonical ids of phases that did NOT promote (a
+  // genuine failure OR a skip — a skipped phase is itself a failed predecessor
+  // for ITS dependents, so multi-hop chains propagate). `settled` holds one
+  // deferred per scheduled phase: a dependent awaits its predecessors' settlement
+  // before deciding to run or skip, so a same-wave dependent (conflict-graph
+  // schedules by files only, not depends_on) still observes its predecessor's
+  // outcome rather than racing it.
+  const failed = new Set<string>();
+  const settled = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+  for (const wave of schedule.waves) {
+    for (const token of wave) {
+      const id = canonicalizePhaseId(token) || token;
+      if (!settled.has(id)) {
+        let resolve!: () => void;
+        const promise = new Promise<void>((r) => { resolve = r; });
+        settled.set(id, { promise, resolve });
+      }
+    }
+  }
+  const markSettled = (id: string) => settled.get(id)?.resolve();
+
   for (let waveIndex = 0; waveIndex < schedule.waves.length; waveIndex++) {
     const members = schedule.waves[waveIndex]!;
     // D3: re-seed the per-phase base SHA at the wave boundary so this wave's
     // phases fork off protected as the prior wave's promotes left it.
     if (ctx.onWaveStart) await ctx.onWaveStart(waveIndex);
     const outcomes = await Promise.all(
-      members.map((waveToken) =>
-        semaphore.run(async (): Promise<PhaseParallelOutcome> => {
+      members.map(async (waveToken): Promise<PhaseParallelOutcome> => {
+        const memberId = canonicalizePhaseId(waveToken) || waveToken;
+
+        // D4: resolve this phase's direct depends_on and await any in-run
+        // predecessor's settlement BEFORE acquiring a semaphore slot — so a
+        // dependent never holds a permit while blocking on a predecessor that
+        // also needs one (which would deadlock under a small cap).
+        const deps = ctx.resolveDependsOn
+          ? (await ctx.resolveDependsOn(waveToken)).map((d) => canonicalizePhaseId(d) || d)
+          : [];
+        // Only wait on predecessors that are part of THIS run (scheduled) — an
+        // out-of-run dependency is the caller's contract to have landed.
+        await Promise.all(
+          deps.filter((d) => settled.has(d)).map((d) => settled.get(d)!.promise),
+        );
+        const blocking = deps.filter((d) => failed.has(d));
+        if (blocking.length > 0) {
+          const skippedReason = `skipped: depends_on failed phase(s) ${blocking.join(', ')}`;
+          failed.add(memberId); // a skipped phase blocks its own dependents in turn
+          markSettled(memberId);
+          const phaseInfo = await ctx.resolvePhase(waveToken).catch(() => undefined);
+          const phaseNumber = phaseInfo?.number ?? waveToken;
+          const result: PhaseRunnerResult = {
+            phaseNumber,
+            phaseName: phaseInfo?.phase_name ?? phaseNumber,
+            steps: [],
+            success: false,
+            totalCostUsd: 0,
+            totalDurationMs: 0,
+          };
+          return { phaseNumber, result, promoted: false, skippedReason };
+        }
+
+        return semaphore.run(async (): Promise<PhaseParallelOutcome> => {
           const phase = await ctx.resolvePhase(waveToken);
           const { result, halted } = await ctx.runPhase(phase);
           const promoted = result.success && !halted;
+          if (!promoted) failed.add(memberId);
+          markSettled(memberId);
           let prUrl: string | undefined;
           if (promoted && ctx.promotePhasePr) {
             prUrl = await promoteMutex.runExclusive(() => ctx.promotePhasePr!(phase, result));
           }
           return { phaseNumber: phase.number, result, promoted, ...(prUrl && { prUrl }) };
-        }),
-      ),
+        });
+      }),
     );
     waves.push({ waveIndex, phases: outcomes });
     allOutcomes.push(...outcomes);
