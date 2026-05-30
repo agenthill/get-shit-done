@@ -119,6 +119,25 @@ function shaMatches(claimed: string, realFull: string): boolean {
 }
 
 /**
+ * Reject a branch value that could smuggle a flag into a git/gh argv. A value
+ * beginning with `-` is the classic argument-injection vector — for `git
+ * ls-remote` it reaches `--upload-pack=<cmd>` (remote command execution), and for
+ * `git log` a `--all` would make EVERY repo commit "verified", defeating this
+ * verb's own fail-closed purpose. Defense-in-depth alongside the
+ * `--end-of-options` separators below: any value that reaches a runner is a plain
+ * ref token. Enforced inside `reconcileReport` so unit-tested callers are guarded
+ * too, not only the CLI handler.
+ */
+function assertSafeBranch(branch: string): void {
+  if (!branch || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch)) {
+    throw new GSDError(
+      `report.reconcile: unsafe branch name ${JSON.stringify(branch)} — must match /^[A-Za-z0-9][A-Za-z0-9._/-]*$/ (no leading '-', no argv-flag smuggling)`,
+      ErrorClassification.Validation,
+    );
+  }
+}
+
+/**
  * Reconcile an executor's believed state against ground truth.
  *
  * Pure over the injected runners — no global state, no network of its own. The
@@ -127,10 +146,11 @@ function shaMatches(claimed: string, realFull: string): boolean {
  */
 export function reconcileReport(input: ReconcileInput, runners: ReconcileRunners): ReconcileResult {
   const { branch, claimedShas, claimedPushed, claimedPr } = input;
+  assertSafeBranch(branch);
   const discrepancies: string[] = [];
 
   // ── 1. SHA ground truth: `git log --format=%H <branch>` ──
-  const logResult = runners.git(['log', '--format=%H', branch]);
+  const logResult = runners.git(['log', '--format=%H', '--end-of-options', branch]);
   let shasVerified = false;
   let verifiedShas: string[] = [];
   if (logResult.exitCode !== 0) {
@@ -151,7 +171,7 @@ export function reconcileReport(input: ReconcileInput, runners: ReconcileRunners
   }
 
   // ── 2. Push ground truth: `git ls-remote --heads origin <branch>` ──
-  const lsRemote = runners.git(['ls-remote', '--heads', 'origin', branch]);
+  const lsRemote = runners.git(['ls-remote', '--heads', '--end-of-options', 'origin', branch]);
   let pushed = false;
   let remoteSha: string | null = null;
   if (lsRemote.exitCode === 0 && lsRemote.stdout.trim() !== '') {

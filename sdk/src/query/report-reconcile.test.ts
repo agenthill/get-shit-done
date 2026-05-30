@@ -51,8 +51,8 @@ function makeRunners(opts: {
 const BRANCH = 'fix/issue-18-executor-serialize-verify';
 // Real commits that exist on the branch's `git log` in the happy path.
 const REAL_SHAS = ['9ffa652aaaa', 'd96b763bbbb', '9eb5122cccc'];
-const GIT_LOG_KEY = `log --format=%H ${BRANCH}`;
-const LS_REMOTE_KEY = `ls-remote --heads origin ${BRANCH}`;
+const GIT_LOG_KEY = `log --format=%H --end-of-options ${BRANCH}`;
+const LS_REMOTE_KEY = `ls-remote --heads --end-of-options origin ${BRANCH}`;
 const GH_PR_KEY = `pr list --head ${BRANCH} --json number,url`;
 
 // ─── Falsifier 1: phantom SHA (claimed, not in git log) ───────────────────────
@@ -82,7 +82,7 @@ describe('reconcileReport — phantom SHA detection (#18 falsifier 1)', () => {
     expect(result.discrepancies.some(d => d.includes('4f1f389'))).toBe(true);
 
     // Exact argv assertion: the reconciler read ground truth from git log.
-    expect(calls).toContainEqual({ bin: 'git', args: ['log', '--format=%H', BRANCH] });
+    expect(calls).toContainEqual({ bin: 'git', args: ['log', '--format=%H', '--end-of-options', BRANCH] });
   });
 
   it('confirms every claimed SHA when all exist in the log', () => {
@@ -128,7 +128,7 @@ describe('reconcileReport — push confirmation (#18 falsifier 2)', () => {
     expect(result.discrepancies.some(d => /push/i.test(d))).toBe(true);
 
     // Exact argv: push is confirmed via ls-remote against origin, not in-memory.
-    expect(calls).toContainEqual({ bin: 'git', args: ['ls-remote', '--heads', 'origin', BRANCH] });
+    expect(calls).toContainEqual({ bin: 'git', args: ['ls-remote', '--heads', '--end-of-options', 'origin', BRANCH] });
   });
 
   it('reports pushed:true with the remote SHA when the ref exists', () => {
@@ -247,5 +247,32 @@ describe('reconcileReport — composite verdict', () => {
     expect(result.ok).toBe(false);
     expect(result.shasVerified).toBe(false);
     expect(result.discrepancies.some(d => /ground truth|git log/i.test(d))).toBe(true);
+  });
+});
+
+// ─── Argv-injection guard (#18 security hardening) ────────────────────────────
+
+describe('reconcileReport — argv-injection guard', () => {
+  it('rejects a branch that smuggles a git flag (ls-remote --upload-pack RCE vector)', () => {
+    const { runners, calls } = makeRunners({});
+    expect(() =>
+      reconcileReport({ branch: '--upload-pack=touch./pwned', claimedShas: [] }, runners),
+    ).toThrow(/unsafe branch/i);
+    // Must fail BEFORE issuing any git/gh command — no runner reached.
+    expect(calls).toEqual([]);
+  });
+
+  it('rejects a bare leading-dash branch and an empty branch', () => {
+    const { runners } = makeRunners({});
+    expect(() => reconcileReport({ branch: '-x', claimedShas: [] }, runners)).toThrow(/unsafe branch/i);
+    expect(() => reconcileReport({ branch: '', claimedShas: [] }, runners)).toThrow(/unsafe branch/i);
+  });
+
+  it('accepts a normal slashed feature-branch name', () => {
+    const { runners } = makeRunners({
+      gitReplies: { [GIT_LOG_KEY]: { stdout: REAL_SHAS.join('\n') } },
+    });
+    // BRANCH = "fix/issue-18-..." passes the guard and reaches the runner.
+    expect(() => reconcileReport({ branch: BRANCH, claimedShas: ['9ffa652'] }, runners)).not.toThrow();
   });
 });
