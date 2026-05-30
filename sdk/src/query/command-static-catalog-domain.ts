@@ -22,6 +22,7 @@ import { writeProfile, generateClaudeProfile, generateDevPreferences, generateCl
 import { phaseMvpMode, taskIsBehaviorAdding, userStoryValidate } from './mvp.js';
 import { worktreeCleanupWave, worktreeReapOrphans } from './worktree.js';
 import { promptBudget } from './prompt-budget.js';
+import { conflictGraph } from './conflict-graph.js';
 
 export const DOMAIN_STATIC_CATALOG: ReadonlyArray<readonly [string, QueryHandler]> = [
   ['agent-skills', agentSkills],
@@ -113,4 +114,7 @@ export const DOMAIN_STATIC_CATALOG: ReadonlyArray<readonly [string, QueryHandler
   ['user-story.validate', userStoryValidate],
   ['user-story validate', userStoryValidate],
   ['prompt-budget', promptBudget],
+  // ── conflict-graph (#13 gap 1) — concurrency schedule from files_modified ──
+  ['conflict-graph', conflictGraph],
+  ['conflict graph', conflictGraph],
 ] as const;
