@@ -179,4 +179,62 @@ describe('GSD.runParallel — happy path wave loop (D1)', () => {
     expect(seenHeads[1]).not.toBe(seenHeads[0]); // protected advanced by wave 0's promote
     expect(seenHeads[1]).not.toBe(mainAfterConflict); // forked off wave 0's promote, not the pre-wave base
   });
+
+  it('keeps ROADMAP.md / STATE.md uncorrupted across a concurrent wave (D2)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    const git = gitIn(dir);
+    const gsd = new GSD({ projectDir: dir });
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry').mockImplementation(async (phase: any) => {
+      // A phase "promotes" a STATE.md update the orchestrator serializes. (Only
+      // phase 1 mutates git so the two concurrent wave members don't collide on
+      // the shared repo index — real phase-agents work in isolated branches.)
+      if (phase.number === '1') {
+        await writeFile(join(dir, '.planning', 'STATE.md'), 'status: ready\nphase-1\n');
+        await git(['add', '-A']);
+        await git(['commit', '-q', '--no-verify', '-m', 'p1']);
+      }
+      return { result: greenResult(phase.number), halted: false };
+    });
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue(twoPhaseRoadmap()),
+    } as never);
+
+    const res = await gsd.runParallel(['1', '2'], { openPullRequests: false });
+    // No merge conflict markers ever land in the ledgers.
+    const { stdout: state } = await git(['show', 'HEAD:.planning/STATE.md']);
+    expect(state).not.toMatch(/^<{7}|^={7}|^>{7}/m);
+    expect(res.success).toBe(true);
+  });
+
+  it('fails closed when a phase mutates an orchestrator-owned ledger mid-wave (D2 tripwire)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    const git = gitIn(dir);
+    const gsd = new GSD({ projectDir: dir });
+    // One phase-agent corrupts ROADMAP.md with conflict markers and promotes it
+    // onto protected — the wave-scoped sole-writer invariant is violated. The
+    // tripwire must catch it after the wave settles and fail closed. (Only phase
+    // 1 mutates git so the two concurrent wave members don't collide on the
+    // shared repo index — real phase-agents work in isolated integration
+    // branches; the corrupted protected ledger is what the tripwire inspects.)
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry').mockImplementation(async (phase: any) => {
+      if (phase.number === '1') {
+        await writeFile(
+          join(dir, '.planning', 'ROADMAP.md'),
+          '<<<<<<< HEAD\n### Phase 1: A\n=======\n### Phase 1: A bad\n>>>>>>> theirs\n',
+        );
+        await git(['add', '-A']);
+        await git(['commit', '-q', '--no-verify', '-m', 'corrupt 1']);
+      }
+      return { result: greenResult(phase.number), halted: false };
+    });
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue(twoPhaseRoadmap()),
+    } as never);
+
+    await expect(gsd.runParallel(['1', '2'], { openPullRequests: false })).rejects.toThrow(
+      /D2 violation.*ROADMAP\.md/,
+    );
+  });
 });

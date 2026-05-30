@@ -50,6 +50,15 @@ export interface ParallelDriverContext {
    * wave parking the working tree on an integration branch.
    */
   onWaveStart?: (waveIndex: number) => Promise<void>;
+  /**
+   * Called after a wave settles (D2 tripwire): verifies the orchestrator-owned
+   * ledgers (ROADMAP.md / STATE.md) carry no conflict markers on protected — the
+   * orchestrator is the sole writer of those files at wave scope. The
+   * GitMergeSerializer guard already restores them on a per-plan merge; this is
+   * the regression assertion that the single-writer invariant held end-to-end
+   * under concurrency. Throws (fails closed) on a detected violation.
+   */
+  assertLedgersClean?: () => Promise<void>;
 }
 
 /**
@@ -99,6 +108,9 @@ export async function runParallelWaves(
     );
     waves.push({ waveIndex, phases: outcomes });
     allOutcomes.push(...outcomes);
+    // D2 tripwire: after the wave settles, assert no wave member's promote left a
+    // conflict marker in an orchestrator-owned ledger. Fails closed.
+    if (ctx.assertLedgersClean) await ctx.assertLedgersClean();
     if (outcomes.some((o) => !o.promoted)) success = false;
   }
 

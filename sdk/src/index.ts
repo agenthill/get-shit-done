@@ -431,6 +431,29 @@ export class GSD {
           cwd: this.projectDir,
         }).catch(() => undefined);
       },
+      assertLedgersClean: async () => {
+        // D2: the orchestrator is the SOLE writer of these ledgers at wave scope.
+        // A present-but-conflicted ledger on protected after a wave means a phase
+        // mutated it mid-wave — fail closed. A missing ledger (never created) is
+        // not a violation.
+        for (const doc of ['.planning/ROADMAP.md', '.planning/STATE.md']) {
+          let stdout: string;
+          try {
+            ({ stdout } = await execFileAsync(
+              'git',
+              ['show', `${protectedBranch}:${doc}`],
+              { cwd: this.projectDir },
+            ));
+          } catch {
+            continue; // doc absent on protected → nothing to assert
+          }
+          if (/^<{7}|^={7}|^>{7}/m.test(stdout)) {
+            throw new Error(
+              `D2 violation: ${doc} on ${protectedBranch} contains conflict markers after a wave — a phase-agent mutated an orchestrator-owned ledger`,
+            );
+          }
+        }
+      },
       ...(openPrs && {
         promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
           const branch = integrationBranchFor(phase.number);
