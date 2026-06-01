@@ -11,7 +11,7 @@
  * the controlled roadmap; `runPhaseWithRollbackRetry` is spied on the instance so
  * the loop's fan-out/settle behavior is what runs.
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -22,6 +22,7 @@ import { PhaseStepType } from './types.js';
 import type { PhaseRunnerResult, RoadmapAnalysis } from './types.js';
 import { scheduleWavesForPhases } from './query/wave-scheduler.js';
 import { planningPaths } from './query/helpers.js';
+import { resetGlobalBudgetForTest } from './global-budget.js';
 
 const execFileAsync = promisify(execFile);
 const gitIn = (dir: string) => (args: string[]) => execFileAsync('git', args, { cwd: dir });
@@ -68,6 +69,14 @@ function twoPhaseRoadmap(): RoadmapAnalysis {
 }
 
 let dirs: string[] = [];
+// BLOCKER 2: the process-wide getGlobalBudget() singleton is created by the
+// FIRST runParallel and otherwise carried across EVERY subsequent test, so a
+// prior test's drained/odd permit count leaked into the next and flaked the D2
+// tripwire tests ('promise resolved instead of rejecting') under contamination.
+// Reset it before EVERY test so each starts from a fresh, full budget.
+beforeEach(() => {
+  resetGlobalBudgetForTest();
+});
 afterEach(async () => {
   for (const d of dirs) await rm(d, { recursive: true, force: true });
   dirs = [];
@@ -504,12 +513,16 @@ function relativeUnder(root: string, abs: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 // M1 — ADR 0014 measure of success (RELEASE GATE).
 //
-// One consolidated falsifier asserting ALL FIVE ADR decisions in a single run.
-// It MUST fail if the command falls back to sequential, mis-schedules waves,
-// ignores the budget, mis-isolates a failure, or co-writes a ledger.
+// One consolidated end-to-end run that exercises all five ADR decisions
+// together. It is the genuine FALSIFIER for D1 (real concurrency in a wave), D4
+// (failure isolates only the depends_on closure), and D6 (a PR per green phase).
+// D2, D3, and the HARD D5 sub-cap binding are NOT falsified inside this fixture
+// — its dep-blocking + worktreeOpMutex + fake-PR-promote shape makes those
+// assertions tautological here — so each is covered by a DEDICATED falsifier and
+// carried here only as a labelled regression/sanity check (see the per-block
+// NOTEs). It MUST fail if the command falls back to sequential, mis-schedules
+// waves, or mis-isolates a failure.
 // ─────────────────────────────────────────────────────────────────────────────
-
-import { resetGlobalBudgetForTest } from './global-budget.js';
 
 /** A fake gh/git runner pair matching the real pr-merge.ts call shape. */
 function fakePrRunners(merges: string[], heads: string[]) {
@@ -525,7 +538,7 @@ function fakePrRunners(merges: string[], heads: string[]) {
 }
 
 describe('ADR 0014 measure of success (release gate)', () => {
-  it('D1+D2+D3+D4+D5: disjoint phases run concurrently in wave 0; a sharer is sequenced later; a failure isolates its depends_on closure; the budget caps in-flight; ledgers stay clean', async () => {
+  it('D1+D4+D6 (falsified) + D2/D3/D5 (regression checks): disjoint phases run concurrently in wave 0; a sharer is sequenced later; a failure isolates its depends_on closure; a PR promotes per green phase; ledgers stay clean', async () => {
     const dir = await setupRepo();
     dirs.push(dir);
     const git = gitIn(dir);
@@ -556,12 +569,32 @@ describe('ADR 0014 measure of success (release gate)', () => {
 
     const gsd = new GSD({ projectDir: dir });
     // Fresh budget so a prior test's permit count cannot leak in; size it ABOVE
-    // the sub-cap of 2 so the OBSERVED cap of 2 is proven to come from the phase
+    // the sub-cap of 2 so any in-flight bound is proven to come from the phase
     // sub-cap (D5 wiring), not from the global budget itself.
     resetGlobalBudgetForTest(8);
 
     const merges: string[] = [];
-    // D5/D1 concurrency tracker + D3 per-phase base-SHA capture.
+    // D1 concurrency tracker + D3 per-phase base-SHA capture.
+    //
+    // DETERMINISTIC concurrency barrier (BLOCKER 2): the D1 proof must not depend
+    // on a setTimeout overlap winning a jitter race. Wave 0's RUNNABLE set is
+    // {43,44,45} (47 is dep-blocked on the failed 43; 46 hard-conflicts 43 → a
+    // later wave); the sub-cap is 2, so at most 2 bodies coexist. The barrier
+    // holds every arriving body until `barrierTarget` (2) are SIMULTANEOUSLY
+    // in-flight, then releases all — so `maxInFlight` reaches 2 reliably, not by
+    // luck. A short timeout race is a pure LIVENESS guard (never the success
+    // path): if fewer than 2 ever coexist — a genuine concurrency regression —
+    // the timeout releases the lone body and maxInFlight stays 1, correctly
+    // FAILING the `> 1` assertion below rather than hanging the suite.
+    const barrierTarget = 2;
+    let arrived = 0;
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((r) => { releaseBarrier = r; });
+    const awaitBarrier = async () => {
+      arrived++;
+      if (arrived >= barrierTarget) releaseBarrier();
+      await Promise.race([barrier, new Promise((r) => setTimeout(r, 1000))]);
+    };
     let inFlight = 0;
     let maxInFlight = 0;
     const baseShaByPhase = new Map<string, string>();
@@ -570,7 +603,7 @@ describe('ADR 0014 measure of success (release gate)', () => {
       maxInFlight = Math.max(maxInFlight, inFlight);
       // D3: capture the base SHA each phase forks off at wave-member start.
       baseShaByPhase.set(phase.number, (await git(['rev-parse', 'HEAD'])).stdout.trim());
-      await new Promise((r) => setTimeout(r, 15)); // overlap so concurrency is real
+      await awaitBarrier(); // hold in-flight until the expected count coexist
       inFlight--;
       if (phase.number === '43') {
         return {
@@ -605,18 +638,33 @@ describe('ADR 0014 measure of success (release gate)', () => {
     expect(waveOf('45')).toBe(0);
     // (D1) the src/a.ts-sharer 46 is provably scheduled to a LATER wave than 43.
     expect(waveOf('46')).toBeGreaterThan(waveOf('43'));
-    // (D1) concurrency actually happened — more than one phase was in flight at once.
+    // (D1) concurrency actually happened — the barrier held two phase bodies
+    // SIMULTANEOUSLY in-flight, so this is deterministic (not a timer-overlap
+    // race). A sequential-fallback run could never reach 2.
     expect(maxInFlight).toBeGreaterThan(1);
 
-    // ── (D5) the phase sub-cap (max_concurrent_phases:2) bounded in-flight phases.
-    // FALSIFIER: if the budget/sub-cap were ignored, wave 0's disjoint members
-    // (43,44,45,47) would all run at once → maxInFlight=4.
-    expect(maxInFlight).toBeLessThanOrEqual(2);
+    // ── (D5) NOTE — the HARD sub-cap binding is NOT asserted here. This fixture
+    // confounds it two ways: (1) 47 is dep-blocked on the failed 43 and 46 is a
+    // later wave, so wave 0's RUNNABLE set is only {43,44,45}; (2) the
+    // orchestrator's worktreeOpMutex (index.ts addDetachedWorktreeAt) serializes
+    // `git worktree add`, structurally holding overlap at 2 regardless of the
+    // sub-cap. Proof: raising max_concurrent_phases to 999 here leaves
+    // maxInFlight unchanged at 2 — i.e. `expect(maxInFlight).toBeLessThanOrEqual(2)`
+    // would be TAUTOLOGICAL. The genuine, mutation-checked end-to-end sub-cap
+    // binding lives in the dedicated D5 falsifier below
+    // ('binds the phase sub-cap end-to-end'), which removes both confounders.
+    // Here D5 contributes only the (D1) concurrency-occurred signal above.
 
-    // ── (D3) per-phase base SHA captured at wave start. Every phase that ran
-    // forked off a real protected SHA (non-empty, 40-hex).
+    // ── (D3) NOTE — per-phase base-SHA capture is a regression/sanity check, not
+    // a D3 falsifier: this run promotes via fake PR runners that never advance
+    // protected, so wave N+1's captured SHA does not genuinely DIFFER from wave
+    // N's. The `^[0-9a-f]{40}$` shape match is always-true on any real repo and
+    // the `has('47')` check is a D4 skip-path proxy, not D3. D3's actual binding
+    // (wave N+1 forks off wave N's PROMOTED HEAD) is falsified by the dedicated
+    // tests: the local-promote D3 test (~line 134) and the multi-wave
+    // origin-sync Gap A test (~line 800). Kept here as cheap regression coverage.
     for (const [, sha] of baseShaByPhase) expect(sha).toMatch(/^[0-9a-f]{40}$/);
-    // 47 was skipped (never ran) so it captured no base SHA — proves the skip path.
+    // 47 was skipped (never ran) so it captured no base SHA — D4 skip-path proxy.
     expect(baseShaByPhase.has('47')).toBe(false);
 
     // ── (D4) failure isolation: 43 failed → its depends_on dependent 47 is SKIPPED;
@@ -631,8 +679,13 @@ describe('ADR 0014 measure of success (release gate)', () => {
     // ── (D6) a PR auto-merged per green phase (44,45,46 — not 43, not 47).
     expect(merges.length).toBeGreaterThanOrEqual(3);
 
-    // ── (D2) the orchestrator was the sole writer: ROADMAP/STATE on protected
-    // carry no conflict markers after the run (assertLedgersClean did not throw).
+    // ── (D2) NOTE — sole-writer regression check, NOT the D2 tripwire falsifier:
+    // no M1 wave member mutates an orchestrator-owned ledger, so this "no conflict
+    // markers on protected" assertion is always-true within this run. The D2
+    // tripwire's actual falsifier (a phase corrupts a ledger mid-wave → the run
+    // FAILS CLOSED) lives in the dedicated tests: the root-path tripwire (~line
+    // 212) and the workstream-scoped tripwire (~line 457). Kept here so a
+    // regression that DID let a marker through would still trip the gate.
     const { stdout: roadmap } = await git(['show', 'HEAD:.planning/ROADMAP.md']);
     expect(roadmap).not.toMatch(/^<{7}[\s\S]*?^={7}$[\s\S]*?^>{7}/m);
 
@@ -640,6 +693,99 @@ describe('ADR 0014 measure of success (release gate)', () => {
     // radius (independents promoted). Sequential-fallback or a non-isolating run
     // would either hang, abort siblings, or report success.
     expect(res.success).toBe(false);
+  }, 15000);
+
+  // ── D5 — HARD sub-cap binding, falsified END-TO-END through GSD.runParallel.
+  //
+  // BLOCKER 3: the M1 block above can NOT bind the sub-cap (its 47-dep-blocked /
+  // 46-later-wave / fake-PR shape + worktreeOpMutex hold overlap at 2 regardless
+  // of the cap). This dedicated falsifier removes BOTH confounders so the ONLY
+  // thing that can bound in-flight phases is `max_concurrent_phases`:
+  //   • a CLEAN fixture of FOUR fully-disjoint phases (43,44,45,47 on a,b,c,d) →
+  //     one wave, four phases all eligible at once, NO dep-blocking;
+  //   • a deterministic barrier that holds each phase body in-flight until the
+  //     EXPECTED concurrent count coexist, so the worktreeOpMutex (which only
+  //     serializes the `git worktree add` ENTRY, not the body) cannot mask the
+  //     steady-state in-flight count.
+  // The global budget is sized ABOVE the wave size (8) so the OBSERVED bound is
+  // proven to come from the phase sub-cap, not the budget.
+  //
+  // MUTATION CHECK (verified manually, recorded here): raising
+  // max_concurrent_phases from 3 to 999 raises maxInFlight from 3 to 4 (the full
+  // disjoint wave) → the `toBe(3)` assertion FAILS. Restoring it to 3 passes.
+  // This is the genuine falsifier the M1 `toBeLessThanOrEqual(2)` only pretended
+  // to be.
+  it('binds the phase sub-cap end-to-end: max_concurrent_phases caps simultaneous in-flight phases (D5)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    const git = gitIn(dir);
+    const SUB_CAP = 3;
+    const WAVE_SIZE = 4;
+    await writeFile(
+      join(dir, '.planning', 'config.json'),
+      JSON.stringify({
+        parallelization: { enabled: true, phase_level: true, max_concurrent_phases: SUB_CAP },
+      }),
+    );
+    // Four FULLY DISJOINT phases (distinct files, NO depends_on) → all in wave 0,
+    // all eligible at once. Absent the sub-cap, all four would run together.
+    const plan = (ph: string, f: string) =>
+      `---\nphase: ${ph}\nfiles_modified:\n  - ${f}\n---\n<objective>O</objective>\n<tasks><task type="auto"><name>T</name></task></tasks>\n`;
+    for (const [d, ph, f] of [
+      ['43-x', '43-x', 'src/a.ts'], ['44-y', '44-y', 'src/b.ts'],
+      ['45-z', '45-z', 'src/c.ts'], ['47-v', '47-v', 'src/d.ts'],
+    ] as const) {
+      await mkdir(join(dir, '.planning', 'phases', d), { recursive: true });
+      await writeFile(join(dir, '.planning', 'phases', d, `${ph.split('-')[0]}-PLAN.md`), plan(ph, f));
+    }
+    await writeFile(
+      join(dir, '.planning', 'ROADMAP.md'),
+      '### Phase 43: X\n### Phase 44: Y\n### Phase 45: Z\n### Phase 47: V\n',
+    );
+    await git(['add', '-A']);
+    await git(['commit', '-q', '--no-verify', '-m', 'disjoint fixtures']);
+
+    const gsd = new GSD({ projectDir: dir });
+    resetGlobalBudgetForTest(8); // ABOVE the wave size → not the binding factor.
+
+    // Barrier holds every body in-flight until `expected` coexist, then releases
+    // all. The worktreeOpMutex serializes ENTRY into the body but not the held
+    // window, so the steady-state in-flight count reflects the sub-cap alone. The
+    // timeout is a pure liveness guard: if the cap admits FEWER than `expected`
+    // (a regression), the lone bodies drain on the timeout and maxInFlight lands
+    // below `expected`, FAILING the assertion rather than hanging.
+    const expected = Math.min(SUB_CAP, WAVE_SIZE);
+    let arrived = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((r) => { release = r; });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry').mockImplementation(async (phase: any) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      arrived++;
+      if (arrived >= expected) release();
+      await Promise.race([barrier, new Promise((r) => setTimeout(r, 1500))]);
+      inFlight--;
+      return { result: greenResult(phase.number), halted: false };
+    });
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue({
+        phases: ['43', '44', '45', '47'].map((n) => ({
+          number: n, disk_status: 'pending', roadmap_complete: false, phase_name: n,
+        })),
+      }),
+    } as never);
+
+    const res = await gsd.runParallel(['43', '44', '45', '47'], { openPullRequests: false });
+
+    // One wave, all four disjoint phases scheduled together.
+    expect(res.waves).toHaveLength(1);
+    expect(res.waves[0].phases).toHaveLength(WAVE_SIZE);
+    // FALSIFIER: in-flight phases are bounded by the sub-cap EXACTLY. Removing or
+    // raising the sub-cap lets all 4 coexist → maxInFlight=4 → this FAILS.
+    expect(maxInFlight).toBe(SUB_CAP);
+    expect(res.phases.every((p) => p.promoted)).toBe(true);
   }, 15000);
 });
 
