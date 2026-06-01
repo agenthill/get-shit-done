@@ -470,15 +470,31 @@ export class GSD {
         // may have parked the tree on an integration branch). Best-effort: a
         // fresh repo with no protected ref yet is a no-op.
         //
-        // NOTE (completed in PR-2): under openPullRequests:true, promotion lands
-        // on ORIGIN/protected via the per-phase PR admin-merge, so local protected
-        // goes stale between waves. PR-2 (the /gsd-execute-parallel command) adds
-        // the origin-sync here (fetch + ff-only align) and tests it via M1. The
-        // openPullRequests:false path advances local protected by the local merge,
-        // so this local checkout already suffices for it (and for these tests).
+        // Gap A (multi-wave PR-promote correctness): under openPullRequests:true,
+        // promotion lands on ORIGIN/protected via each phase's PR admin-merge, so
+        // local protected goes stale between waves — wave N+1 would fork off the
+        // PRE-wave-N base and silently lose wave N's promoted output. Sync local
+        // protected to origin (fetch + fast-forward) BEFORE the checkout so wave
+        // N+1 bases off the promoted state. Both steps are best-effort: a repo
+        // with no `origin` remote (openPullRequests:false / non-remote / these
+        // tests) no-ops the fetch and the ff-only merge, leaving the local
+        // checkout — which already suffices, since that path advances LOCAL
+        // protected by the orchestrator's local merge.
+        if (openPrs) {
+          await execFileAsync('git', ['fetch', 'origin', protectedBranch], {
+            cwd: this.projectDir,
+          }).catch(() => undefined);
+        }
         await execFileAsync('git', ['checkout', protectedBranch], {
           cwd: this.projectDir,
         }).catch(() => undefined);
+        if (openPrs) {
+          await execFileAsync(
+            'git',
+            ['merge', '--ff-only', `origin/${protectedBranch}`],
+            { cwd: this.projectDir },
+          ).catch(() => undefined);
+        }
       },
       assertLedgersClean: async () => {
         // D2: the orchestrator is the SOLE writer of these ledgers at wave scope.
@@ -880,11 +896,13 @@ export class GSD {
           failure_context: failureContext,
           status: 'retrying',
         });
-        // Re-establish a fresh per-phase worktree off the current protected/wave
-        // base for the informed-retry attempt (the discarded branch is recreated by
-        // the next runPhase's beginPhaseIntegration). addDetachedWorktreeAt only
-        // touches refs + creates the linked worktree dir — it does not check out or
-        // mutate the shared projectDir working tree.
+        // Re-establish a fresh per-phase worktree for the informed-retry attempt
+        // (the discarded branch is recreated by the next runPhase's
+        // beginPhaseIntegration). addDetachedWorktreeAt forks off the shared
+        // projectDir's `rev-parse HEAD` — immediately re-pinned to the phase's
+        // wave base by beginPhaseIntegration, so the transient HEAD it detaches at
+        // is not load-bearing. It only touches refs + creates the linked worktree
+        // dir — it does not check out or mutate the shared projectDir working tree.
         await this.addDetachedWorktreeAt(phaseDir);
         continue;
       }
@@ -958,11 +976,11 @@ export class GSD {
         failure_context: failureContext,
         status: 'retrying',
       });
-      // Chunk C PR-1: Tier-1 above removed this phase's worktree (to delete its
-      // integration branch). Re-establish it off the now-restored protected/
-      // LAST_GOOD HEAD so the informed-retry attempt runs in isolation again.
-      // Sequential path (phaseDir undefined) → no-op.
-      if (phaseDir) await this.addDetachedWorktreeAt(phaseDir);
+      // NOTE: this tail is reached ONLY on the sequential / shared-projectDir
+      // Tier-1 path — every phaseDir-set (parallel Design-B) failure returns or
+      // `continue`s in the `if (phaseDir)` block above, so phaseDir is provably
+      // undefined here. The parallel path re-establishes its worktree at its own
+      // `continue` site; no worktree re-add is needed (or reachable) here.
     }
   }
 
