@@ -518,7 +518,13 @@ export class GSD {
           } catch {
             continue; // doc absent on protected → nothing to assert
           }
-          if (/^<{7}|^={7}|^>{7}/m.test(stdout)) {
+          // Anchor on a FULL ordered conflict hunk (`<<<<<<<` … `=======` …
+          // `>>>>>>>`), not any one marker line alone: a standalone `=======`
+          // line is a valid Markdown Setext-H1 underline and must NOT
+          // false-positive. The `=======` separator is required to be a line of
+          // EXACTLY seven `=` (`^={7}$`), and it must sit between the start/end
+          // markers in order. `[\s\S]*?` lazily spans the intervening hunk lines.
+          if (/^<{7}[\s\S]*?^={7}$[\s\S]*?^>{7}/m.test(stdout)) {
             throw new Error(
               `D2 violation: ${doc} on ${protectedBranch} contains conflict markers after a wave — a phase-agent mutated an orchestrator-owned ledger`,
             );
