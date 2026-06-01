@@ -36,6 +36,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { checkResearchGate } from './research-gate.js';
 import { buildPlanDag, type PlanDag, type DagNode } from './plan-dag.js';
 import {
+  Semaphore,
   SharedCwdWorktreeManager,
   NoopMergeSerializer,
   NoopPhaseIntegrationManager,
@@ -1114,11 +1115,13 @@ export class PhaseRunner {
     dag: PlanDag,
   ): Promise<{ planResults: PlanResult[]; dispositions: PlanDisposition[] }> {
     const parallel = resolvePlanLevelParallel(this.config);
-    // ADR 0014 D5: plan dispatch acquires from the ONE process-wide agent budget
-    // shared with cross-phase wave dispatch (parallel-runner), so N phases × M
-    // plans cannot oversubscribe CPU/API. The budget is sized at the global cap
-    // (min(16, cores−2)); a single-phase sequential run still observes it.
-    const semaphore = getGlobalBudget();
+    // ADR 0014 D5: when parallel, plan dispatch acquires from the ONE process-wide
+    // agent budget shared with cross-phase wave dispatch (parallel-runner), so N
+    // phases × M plans cannot oversubscribe CPU/API. When parallelization is
+    // disabled, fall back to a private sequential semaphore (cap 1) so plans run
+    // strictly one-at-a-time — the shared budget is sized at the global cap and
+    // would NOT enforce sequential ordering.
+    const semaphore = parallel ? getGlobalBudget() : new Semaphore(1);
 
     // Build (or default) the git-direct execution engine. The no-op engine runs
     // every plan in the shared project cwd with no merge step — today's SDK path.
