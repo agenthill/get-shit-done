@@ -68,7 +68,7 @@ export function formatStateLoadRawStdout(data: unknown): string {
     `branching_strategy=${c.branching_strategy}`,
     `phase_branch_template=${c.phase_branch_template}`,
     `milestone_branch_template=${c.milestone_branch_template}`,
-    `parallelization=${c.parallelization}`,
+    `parallelization=${formatParallelization(c.parallelization)}`,
     `research=${c.research}`,
     `plan_checker=${c.plan_checker}`,
     `verifier=${c.verifier}`,
@@ -77,4 +77,18 @@ export function formatStateLoadRawStdout(data: unknown): string {
     `state_exists=${stateExists}`,
   ];
   return lines.join('\n');
+}
+
+/**
+ * Render the `parallelization` config value. The flat boolean form
+ * (`true`/`false`) prints as-is; the nested-object form (ADR 0014:
+ * `{ enabled, phase_level, max_concurrent_phases }`) projects its fields rather
+ * than stringifying to `[object Object]`.
+ */
+function formatParallelization(value: unknown): string {
+  if (value !== null && typeof value === 'object') {
+    const p = value as Record<string, unknown>;
+    return `enabled=${p.enabled} phase_level=${p.phase_level} max_concurrent_phases=${p.max_concurrent_phases}`;
+  }
+  return String(value);
 }

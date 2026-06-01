@@ -523,6 +523,8 @@ The `features.*` namespace is a dynamic key pattern — new feature flags can be
 | `parallelization.skip_checkpoints` | boolean | `true` | Skip checkpoints during parallel execution |
 | `parallelization.max_concurrent_agents` | number | `3` | Maximum simultaneous agents |
 | `parallelization.min_plans_for_parallel` | number | `2` | Minimum plans to trigger parallel execution |
+| `parallelization.phase_level` | boolean | `false` | **ADR 0014.** Opt into cross-phase wave parallelism (`GSD.runParallel` / `/gsd-execute-parallel`). When `true` (with `git.sdk_worktree_execution` + Claude runtime), N independent backlog phases run concurrently in conflict-graph waves; each green phase promotes as its own auto-merged PR. Default `false` preserves sequential phase execution |
+| `parallelization.max_concurrent_phases` | number | `3` | **ADR 0014.** Sub-cap on in-flight phase-agents in a parallel wave, enforced on top of the single global agent budget (`min(16, cores−2)`) shared across phase + plan dispatch, so N phases × M plans cannot oversubscribe CPU/API |
 
 > **Pre-commit hooks and parallel execution**: When parallelization is enabled, executor agents commit with `--no-verify` to avoid build lock contention (e.g., cargo lock fights in Rust projects). The orchestrator validates hooks once after each wave completes. STATE.md writes are protected by file-level locking to prevent concurrent write corruption. If you need hooks to run per-commit, set `parallelization.enabled: false`.
 

@@ -13,4 +13,4 @@ Dynamic-workflow fork of the GSD toolkit. The TypeScript SDK is under `sdk/` (ES
 - Reproduce on the PR base before attributing any failure to your change.
 
 ## Changesets
-- Each PR needs a `.changeset/*.md` with `type:` (Added/Fixed/Changed) and `pr:` (PR number). An `Added` type trips the docs-required lint — add `<!-- docs-exempt: ... -->` if docs land separately.
+- Each PR needs a `.changeset/*.md` with `type:` (Added/Fixed/Changed) and `pr:` (PR number). The `{Added, Changed, Deprecated, Removed}` types trip the docs-required lint (`scripts/lint-docs-required.cjs`) — add `<!-- docs-exempt: ... -->` if docs land separately.

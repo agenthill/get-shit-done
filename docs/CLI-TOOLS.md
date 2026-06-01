@@ -82,6 +82,20 @@ Overlaps on the known shared-write hotspots `ROADMAP.md`, `STATE.md`, and `regis
 
 **Golden parity:** Policy and CJS↔SDK test categories are documented under **Golden parity** in [QUERY-HANDLERS.md](../sdk/src/query/QUERY-HANDLERS.md).
 
+### Parallel multi-phase execution (ADR 0014)
+
+```bash
+# Run N independent backlog phases concurrently in conflict-graph waves.
+# Schedules via conflict-graph (hard-disjoint within a wave), fans out one
+# phase-agent per wave member through the standard lifecycle in an isolated
+# worktree, and promotes each green phase as its own auto-merged PR (serialized
+# in wave order). Wave N+1 starts only after wave N settles.
+/gsd-execute-parallel 43 44 45        # command surface
+GSD.runParallel(['43','44','45'])     # SDK entrypoint (sdk/src/index.ts)
+```
+
+Gated by `git.sdk_worktree_execution` + Claude runtime + `parallelization.phase_level: true`. Reuses the per-phase checkpoint + Tier-1/Tier-2 rollback machinery (the orchestrator is the sole writer of `ROADMAP.md`/`STATE.md` across a wave). On a phase failure, siblings finish and only the failed phase's `depends_on` closure is skipped. Returns `{ success, waves, phases, totalCostUsd, totalDurationMs }`.
+
 ---
 
 ## State Commands

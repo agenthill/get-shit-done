@@ -52,6 +52,18 @@ export interface GitConfig {
   sdk_max_phase_attempts?: number | null;
 }
 
+/**
+ * ADR 0014 nested parallelization config (D5). `enabled` is the master switch
+ * (the flat `parallelization: false` form is still accepted for back-compat).
+ * `phase_level` opts into cross-phase wave parallelism (GSD.runParallel).
+ * `max_concurrent_phases` sub-budgets the ONE global agent semaphore.
+ */
+export interface ParallelizationConfig {
+  enabled?: boolean;
+  phase_level?: boolean;
+  max_concurrent_phases?: number;
+}
+
 export interface WorkflowConfig {
   research: boolean;
   plan_check: boolean;
@@ -102,7 +114,7 @@ export interface HooksConfig {
 export interface GSDConfig {
   model_profile: string;
   commit_docs: boolean;
-  parallelization: boolean;
+  parallelization: boolean | ParallelizationConfig;
   search_gitignored: boolean;
   brave_search: boolean;
   firecrawl: boolean;
@@ -228,4 +240,34 @@ export async function loadConfig(projectDir: string, workstream?: string): Promi
  */
 function mergeDefaults(parsed: Record<string, unknown>): GSDConfig {
   return canonicalMergeDefaults(parsed) as unknown as GSDConfig;
+}
+
+// ─── ADR 0014 parallelization resolvers (D5) ───────────────────────────────────
+//
+// `parallelization` is `true` by default in the manifest (a plain boolean) and
+// stays that way so existing flat-boolean / string-projection consumers
+// (init.ts, state-project-load.ts, config.test.ts) are unchanged. A user opts
+// into cross-phase parallelism by writing the NESTED object form in config.json:
+//   { "parallelization": { "enabled": true, "phase_level": true, "max_concurrent_phases": 5 } }
+// These resolvers accept EITHER form, so the manifest default need not change.
+
+/** Read `parallelization.phase_level` (ADR 0014 D5). Flat-boolean form → false. */
+export function resolvePhaseLevelParallelism(config: GSDConfig): boolean {
+  const p = config.parallelization as boolean | ParallelizationConfig;
+  return typeof p === 'object' && p !== null ? p.phase_level === true : false;
+}
+
+/** Read `parallelization.max_concurrent_phases` (ADR 0014 D5). Default 3. */
+export function resolveMaxConcurrentPhases(config: GSDConfig): number {
+  const p = config.parallelization as boolean | ParallelizationConfig;
+  const n = typeof p === 'object' && p !== null ? p.max_concurrent_phases : undefined;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : 3;
+}
+
+/** True unless parallelization is explicitly disabled (flat `false` or `enabled:false`). */
+export function resolvePlanLevelParallel(config: GSDConfig): boolean {
+  const p = config.parallelization as boolean | ParallelizationConfig;
+  if (p === false) return false;
+  if (typeof p === 'object' && p !== null) return p.enabled !== false;
+  return true;
 }

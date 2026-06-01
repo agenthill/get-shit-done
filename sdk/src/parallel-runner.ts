@@ -26,14 +26,15 @@ import type {
   RoadmapPhaseInfo,
 } from './types.js';
 import { scheduleWavesForPhases } from './query/wave-scheduler.js';
-import { Semaphore, Mutex, resolveConcurrencyCap } from './execution-engine.js';
+import { Semaphore, Mutex } from './execution-engine.js';
 import { canonicalizePhaseId } from './query/phase-depends-on.js';
 
 /** The orchestration surface the GSD class supplies to the wave loop. */
 export interface ParallelDriverContext {
   projectDir: string;
   workstream?: string;
-  parallelization: boolean;
+  /** Sub-cap on in-flight phases (D5 max_concurrent_phases). */
+  maxConcurrentPhases: number;
   /** Resolve a phase's roadmap metadata by wave token (reconciles normalization). */
   resolvePhase: (waveToken: string) => Promise<RoadmapPhaseInfo>;
   /**
@@ -120,10 +121,20 @@ export async function runParallelWaves(
   const startTime = Date.now();
   const schedule = await scheduleWavesForPhases(phaseNumbers, ctx.projectDir, ctx.workstream);
 
-  // One nested global Semaphore caps in-flight phase-agents (D5 lifts it to a
-  // process-wide singleton in chunk C).
-  const cap = resolveConcurrencyCap(ctx.parallelization);
-  const semaphore = new Semaphore(cap);
+  // ADR 0014 D5: the ONE global agent budget bounds total LEAF (plan) dispatch —
+  // every plan across every concurrent phase acquires from it inside
+  // phase-runner.runPlanDag, so N phases × M plans never oversubscribe CPU/API.
+  // The phase sub-cap (`max_concurrent_phases`) bounds how many phase bodies run
+  // at once. A phase is an ORCHESTRATOR, not an agent: it dispatches no agent of
+  // its own, only its plans do. So a wave member acquires the phase sub-cap ONLY
+  // — it must NOT also hold a global permit for its whole body, or it would hold
+  // one permit while its plans contend for the SAME pool (hold-and-wait). When
+  // min(max_concurrent_phases, waveSize) ≥ globalCap, that self-deadlocks: phase
+  // bodies drain the pool and no permit remains for any plan. Bounding the global
+  // budget at the leaf keeps it a real, observable bound on concurrent agent
+  // dispatch (the per-plan acquire in runPlanDag enforces it) without the hold.
+  const phaseSubCap = new Semaphore(Math.max(1, ctx.maxConcurrentPhases));
+  const acquireSlot = <T>(fn: () => Promise<T>): Promise<T> => phaseSubCap.run(fn);
   // Serialize PR auto-merges in wave order — preserves the single-writer (D2)
   // property: ordered promotes onto protected, never concurrent.
   const promoteMutex = new Mutex();
@@ -242,7 +253,7 @@ export async function runParallelWaves(
           return { phaseNumber, result, promoted: false, skippedReason };
         }
 
-        return semaphore.run(async (): Promise<PhaseParallelOutcome> => {
+        return acquireSlot(async (): Promise<PhaseParallelOutcome> => {
           // FIX 2: a thrown/rejected resolvePhase or runPhase must NOT reject the
           // wave's Promise.all — that would abort concurrent siblings, record no
           // outcome, and make the post-wave assertLedgersClean unreachable. Catch

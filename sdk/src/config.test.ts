@@ -275,3 +275,33 @@ describe('loadConfig', () => {
     expect(CONFIG_DEFAULTS).toEqual(before);
   });
 });
+
+import {
+  resolvePhaseLevelParallelism,
+  resolveMaxConcurrentPhases,
+  resolvePlanLevelParallel,
+} from './config.js';
+
+describe('ADR 0014 parallelization.phase_level / max_concurrent_phases', () => {
+  it('defaults phase_level off and max_concurrent_phases to the nested default', () => {
+    const cfg = structuredClone(CONFIG_DEFAULTS) as any;
+    expect(resolvePhaseLevelParallelism(cfg)).toBe(false);
+    expect(resolveMaxConcurrentPhases(cfg)).toBe(3);
+  });
+  it('reads nested overrides', () => {
+    const cfg = { parallelization: { enabled: true, phase_level: true, max_concurrent_phases: 5 } } as any;
+    expect(resolvePhaseLevelParallelism(cfg)).toBe(true);
+    expect(resolveMaxConcurrentPhases(cfg)).toBe(5);
+  });
+  it('tolerates the flat boolean form (phase_level off, default cap)', () => {
+    const cfg = { parallelization: true } as any;
+    expect(resolvePhaseLevelParallelism(cfg)).toBe(false);
+    expect(resolveMaxConcurrentPhases(cfg)).toBe(3);
+  });
+  it('resolvePlanLevelParallel: flat false and enabled:false both disable; defaults on', () => {
+    expect(resolvePlanLevelParallel({ parallelization: false } as any)).toBe(false);
+    expect(resolvePlanLevelParallel({ parallelization: { enabled: false } } as any)).toBe(false);
+    expect(resolvePlanLevelParallel({ parallelization: true } as any)).toBe(true);
+    expect(resolvePlanLevelParallel({ parallelization: { enabled: true } } as any)).toBe(true);
+  });
+});
