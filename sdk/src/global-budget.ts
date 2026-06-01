@@ -1,10 +1,18 @@
 /**
- * ADR 0014 D5 — ONE process-wide agent budget shared across phase + plan
- * dispatch. Both the per-plan DAG (phase-runner.runPlanDag) and the cross-phase
- * wave loop (parallel-runner) acquire from this single Semaphore so N phases × M
+ * ADR 0014 D5 — ONE process-wide agent budget bounding total LEAF (plan) agent
+ * dispatch. EVERY plan across every concurrent phase acquires from this single
+ * Semaphore inside the per-plan DAG (phase-runner.runPlanDag) — so N phases × M
  * plans cannot oversubscribe CPU/API. The total is min(16, cores-2)
- * (resolveConcurrencyCap with parallelization enabled). parallel-runner ALSO
- * applies a max_concurrent_phases sub-cap on top of this global budget.
+ * (resolveConcurrencyCap with parallelization enabled).
+ *
+ * The cross-phase wave loop (parallel-runner) does NOT take a permit per phase:
+ * a phase is an orchestrator, not an agent, so holding a permit for a whole
+ * phase body while its plans contend for the same pool would hold-and-wait
+ * deadlock (min(max_concurrent_phases, waveSize) ≥ this cap drains the pool with
+ * none left for any plan). Instead parallel-runner bounds concurrent PHASES with
+ * a separate max_concurrent_phases sub-cap, and this budget bounds the leaves —
+ * a real, observable bound on concurrent agent dispatch enforced where the
+ * agents actually run.
  */
 import { Semaphore, resolveConcurrencyCap } from './execution-engine.js';
 
