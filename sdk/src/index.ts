@@ -19,11 +19,12 @@
  * ```
  */
 
-import { readFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { readFile, mkdir, rm, writeFile, rename } from 'node:fs/promises';
+import { join, resolve, dirname } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 
 const execFileAsync = promisify(execFile);
 
@@ -42,7 +43,7 @@ import { PromptFactory } from './phase-prompt.js';
 import { detectRuntime, normalizePhaseName } from './query/helpers.js';
 import { runParallelWaves } from './parallel-runner.js';
 import { pushBranchAndOpenPr, adminMergeOnGreen, defaultRunners } from './pr-merge.js';
-import { integrationBranchFor } from './query/phase-checkpoint.js';
+import { integrationBranchFor, baseTagFor, checkpointDirFor } from './query/phase-checkpoint.js';
 import { buildGitExecutionEngineFactory } from './build-execution-engine.js';
 import { classifyAgentFailure } from './query/agent-failure-classifier.js';
 import { rollbackTier1, cascadeRollbackTier2, resumeIncompleteRollback } from './query/rollback-engine.js';
@@ -51,7 +52,7 @@ import { readPhaseManifest } from './query/phase-manifest.js';
 import { classifyCascade } from './query/tier2-cascade-classifier.js';
 import { readPhaseDependsOn } from './query/phase-depends-on.js';
 import { relPlanningPath } from './workstream-utils.js';
-import { GitMergeSerializer } from './execution-engine.js';
+import { GitMergeSerializer, GitPhaseIntegrationManager, Mutex } from './execution-engine.js';
 import { stateSignalWaiting, stateSignalResume } from './query/state-mutation.js';
 
 export { PlanningJournal } from './planning-journal.js';
@@ -72,6 +73,17 @@ export class GSD {
   private readonly strictSdk?: boolean;
   private readonly allowFallbackToSubprocess?: boolean;
   readonly eventStream: GSDEventStream;
+  /**
+   * Serializes per-phase worktree add/remove ops across concurrent wave members
+   * (ADR 0014, finding 5). Two concurrent `git worktree add` collide on the
+   * `.git/worktrees/<name>/commondir` admin file (`fatal: failed to read ...
+   * commondir`), spuriously failing a phase. Serializing the add/remove ops
+   * removes that race without affecting the phases' concurrent EXECUTION (each
+   * runs in its own already-created worktree once the brief add completes).
+   * Instance-scoped so it covers BOTH the orchestrator's createPhaseWorktree and
+   * the driver's informed-retry addDetachedWorktreeAt.
+   */
+  private readonly worktreeOpMutex = new Mutex();
 
   constructor(options: GSDOptions) {
     this.projectDir = resolve(options.projectDir);
@@ -174,7 +186,20 @@ export class GSD {
    * @param options - Per-phase overrides for budget, turns, model, and callbacks
    * @returns PhaseRunnerResult with per-step results, overall success, cost, and timing
    */
-  async runPhase(phaseNumber: string, options?: PhaseRunnerOptions): Promise<PhaseRunnerResult> {
+  async runPhase(
+    phaseNumber: string,
+    options?: PhaseRunnerOptions,
+    phaseDir?: string,
+  ): Promise<PhaseRunnerResult> {
+    // Chunk C PR-1 (#13 gap 2): under the parallel wave executor `phaseDir` is the
+    // phase's OWN linked worktree. The runner drives segment (a) (checkpoint /
+    // begin-integration / execute / verify) inside it so two concurrent wave
+    // members never race the shared projectDir's HEAD / index, and DEFERS the
+    // promote (segment b) to the orchestrator. Absent (sequential `GSD.run`) →
+    // runDir is the shared projectDir and the runner promotes in-process,
+    // byte-identical to before. The prompt factory / context engine stay rooted at
+    // the real projectDir (they read .planning, which the linked worktree shares).
+    const runDir = phaseDir ?? this.projectDir;
     const tools = this.createTools();
     const promptFactory = new PromptFactory({ projectDir: this.projectDir });
     const contextEngine = new ContextEngine(this.projectDir, undefined, undefined, this.workstream);
@@ -200,13 +225,16 @@ export class GSD {
     }
 
     const runner = new PhaseRunner({
-      projectDir: this.projectDir,
+      projectDir: runDir,
       tools,
       promptFactory,
       contextEngine,
       eventStream: this.eventStream,
       config,
       ...(executionEngineFactory && { executionEngineFactory }),
+      // In the phase-worktree path defer the promote (segment b) to the
+      // orchestrator; the worktree cannot check out protected.
+      ...(phaseDir && { deferPromotion: true }),
     });
 
     return runner.run(phaseNumber, options);
@@ -410,6 +438,15 @@ export class GSD {
     const protectedBranch = await this.resolveProtectedBranch(config);
     const runners = options?.prRunners ?? defaultRunners(this.projectDir);
 
+    // Chunk C PR-1 (#13 gap 2): per-phase worktree isolation. Each wave member
+    // runs segment (a) in its OWN linked worktree (created on demand below, off
+    // the wave base SHA), so two concurrent phases never race the shared
+    // projectDir's HEAD / index. Deterministic root OUTSIDE the working tree
+    // (shares the object store via the linked worktree); keyed by projectDir so
+    // parallel runs of different repos never collide.
+    const phaseWtHash = createHash('sha1').update(this.projectDir).digest('hex').slice(0, 12);
+    const phaseWtRoot = join(tmpdir(), 'gsd-sdk-phase-worktrees', phaseWtHash);
+
     return runParallelWaves(phaseNumbers, options, {
       projectDir: this.projectDir,
       ...(this.workstream && { workstream: this.workstream }),
@@ -421,13 +458,23 @@ export class GSD {
         }
         return found;
       },
-      runPhase: (phase) => this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts),
+      runPhase: (phase, phaseDir) =>
+        this.runPhaseWithRollbackRetry(phase, options, maxPhaseAttempts, phaseDir),
+      createPhaseWorktree: (phase) => this.createPhaseWorktree(phaseWtRoot, phase),
+      removePhaseWorktree: (phaseDir) => this.removePhaseWorktree(phaseDir),
       onWaveStart: async () => {
         // D3: ensure the working tree is on protected before this wave's phases
         // build their engines, so each captures the current protected HEAD as
         // its per-phase base SHA (a prior wave's promotes have advanced it, and
         // may have parked the tree on an integration branch). Best-effort: a
         // fresh repo with no protected ref yet is a no-op.
+        //
+        // NOTE (completed in PR-2): under openPullRequests:true, promotion lands
+        // on ORIGIN/protected via the per-phase PR admin-merge, so local protected
+        // goes stale between waves. PR-2 (the /gsd-execute-parallel command) adds
+        // the origin-sync here (fetch + ff-only align) and tests it via M1. The
+        // openPullRequests:false path advances local protected by the local merge,
+        // so this local checkout already suffices for it (and for these tests).
         await execFileAsync('git', ['checkout', protectedBranch], {
           cwd: this.projectDir,
         }).catch(() => undefined);
@@ -470,23 +517,193 @@ export class GSD {
           return [];
         }
       },
-      ...(openPrs && {
-        promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
-          const branch = integrationBranchFor(phase.number);
-          const url = await pushBranchAndOpenPr(
-            {
-              branch,
-              baseBranch: protectedBranch,
-              title: `Phase ${phase.number}: ${result.phaseName}`,
-              body: 'Auto-generated parallel phase PR (ADR 0014). Closes the phase backlog item.',
+      ...(openPrs
+        ? {
+            promotePhasePr: async (phase: RoadmapPhaseInfo, result: PhaseRunnerResult) => {
+              const branch = integrationBranchFor(phase.number);
+              const url = await pushBranchAndOpenPr(
+                {
+                  branch,
+                  baseBranch: protectedBranch,
+                  title: `Phase ${phase.number}: ${result.phaseName}`,
+                  body: 'Auto-generated parallel phase PR (ADR 0014). Closes the phase backlog item.',
+                },
+                runners,
+              );
+              await adminMergeOnGreen(url, runners);
+              return url;
             },
-            runners,
-          );
-          await adminMergeOnGreen(url, runners);
-          return url;
-        },
-      }),
+          }
+        : {
+            // openPullRequests:false (tests / non-remote): no PR, so promotion is
+            // the LOCAL GitPhaseIntegrationManager.promote() — `git checkout
+            // protected && merge <int>` in the shared projectDir. Safe under the
+            // promoteMutex (serialized, single-writer): projectDir holds protected
+            // and `git merge <int>` reads the integration branch's commits without
+            // checking it out, so no worktree conflict. The phase's worktree was
+            // already removed in the member's settle path. A vacuous phase whose
+            // integration branch never advanced past LAST_GOOD is a no-op merge.
+            promoteLocal: async (phase: RoadmapPhaseInfo) => {
+              const integrationBranch = integrationBranchFor(phase.number);
+              // The integration branch must exist (a green phase begun + accumulated
+              // onto it). Absent (e.g. a vacuous run with no real engine) → nothing
+              // to promote; skip rather than throw.
+              const exists = await execFileAsync(
+                'git',
+                ['rev-parse', '--verify', `refs/heads/${integrationBranch}`],
+                { cwd: this.projectDir },
+              )
+                .then(() => true)
+                .catch(() => false);
+              if (!exists) return;
+              const lastGoodSha = (
+                await execFileAsync('git', ['rev-parse', protectedBranch], {
+                  cwd: this.projectDir,
+                })
+              ).stdout.trim();
+              const serializer = new GitMergeSerializer(
+                this.projectDir,
+                protectedBranch,
+                async () => 0,
+              );
+              const manager = new GitPhaseIntegrationManager(this.projectDir, serializer);
+              await manager.promote(integrationBranch, protectedBranch, lastGoodSha);
+            },
+          }),
     });
+  }
+
+  /**
+   * Create a phase's OWN linked worktree for the parallel wave executor (Chunk C
+   * PR-1, #13 gap 2). Forked off the wave base SHA (protected HEAD — onWaveStart
+   * parked the shared tree on protected), DETACHED: the runner's
+   * beginPhaseIntegration checks it out onto the integration branch
+   * `gsd-phase-<N>-int` in place. The worktree shares the object store, so the
+   * base commit + protected ref are reachable from it. Deterministic path (keyed
+   * by phase) so a crash-resume reattaches rather than leaking; a stale dir is
+   * reaped best-effort before re-adding. Returns the worktree's absolute path.
+   */
+  private async createPhaseWorktree(worktreeRoot: string, phase: RoadmapPhaseInfo): Promise<string> {
+    const dir = join(worktreeRoot, `phase-${normalizePhaseName(phase.number)}`);
+    await mkdir(worktreeRoot, { recursive: true });
+    await this.addDetachedWorktreeAt(dir);
+    return dir;
+  }
+
+  /**
+   * (Re-)create a detached linked worktree at exactly `dir`, off the shared
+   * projectDir's current HEAD (= the wave base / protected, re-established by
+   * onWaveStart and, after a Tier-1 rollback, reset back to LAST_GOOD). Reaps any
+   * stale registration/dir first so `git worktree add` cannot fail on it. Used at
+   * phase start AND to re-establish the worktree for an informed-retry attempt
+   * after Tier-1 removed it.
+   *
+   * Serialized under worktreeOpMutex (finding 5): two concurrent wave members'
+   * `git worktree add` collide on the `.git/worktrees/<name>/commondir` admin
+   * file (`fatal: failed to read ... commondir`). Remove-then-add runs as ONE
+   * critical section so a concurrent member never observes a half-registered
+   * worktree. Carries a single retry on the commondir admin-file race as a belt-
+   * and-braces guard.
+   */
+  private async addDetachedWorktreeAt(dir: string): Promise<void> {
+    await this.worktreeOpMutex.runExclusive(async () => {
+      await this.removePhaseWorktreeUnguarded(dir);
+      const baseSha = (
+        await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: this.projectDir })
+      ).stdout.trim();
+      try {
+        await execFileAsync('git', ['worktree', 'add', '--detach', dir, baseSha], {
+          cwd: this.projectDir,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/commondir|index\.lock/.test(msg)) {
+          // Admin-file race lost to a concurrent git op — reap and retry once.
+          await this.removePhaseWorktreeUnguarded(dir);
+          await execFileAsync('git', ['worktree', 'add', '--detach', dir, baseSha], {
+            cwd: this.projectDir,
+          });
+        } else {
+          throw err;
+        }
+      }
+    });
+  }
+
+  /**
+   * Remove a phase worktree (Chunk C PR-1). Best-effort + idempotent — never
+   * throws. Called after a phase settles (orchestrator) AND before a Tier-1
+   * rollback (the driver, so deleting the integration branch the worktree holds
+   * cannot fail on "branch is checked out at <worktree>"). Serialized under
+   * worktreeOpMutex (finding 5) vs concurrent worktree adds.
+   */
+  private async removePhaseWorktree(phaseDir: string): Promise<void> {
+    await this.worktreeOpMutex.runExclusive(() => this.removePhaseWorktreeUnguarded(phaseDir));
+  }
+
+  /**
+   * The unguarded worktree-removal primitive. Callers that already hold
+   * worktreeOpMutex (addDetachedWorktreeAt) use this directly to avoid a non-
+   * re-entrant-mutex deadlock; external callers go through removePhaseWorktree.
+   */
+  private async removePhaseWorktreeUnguarded(phaseDir: string): Promise<void> {
+    await execFileAsync('git', ['worktree', 'remove', '--force', phaseDir], {
+      cwd: this.projectDir,
+    }).catch(() => undefined);
+    await rm(phaseDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  /**
+   * Discard a FAILED parallel-wave member's own integration artifacts (ADR 0014
+   * D4, Design B). On the parallel/deferred-promotion path a wave member NEVER
+   * promoted — its work lives entirely in its own linked worktree + integration
+   * branch `gsd-phase-<N>-int` + base tag `gsd/phase-<N>-base`, all forked off the
+   * wave base SHA and isolated by the conflict-graph disjointness invariant. The
+   * correct rollback for it is to DISCARD those, NOT to run the shared-projectDir
+   * Tier-1 (`git checkout protected` / restore `.planning` docs / assert
+   * protected === LAST_GOOD), which would (a) collide on `.git/index.lock` with a
+   * sibling's promote and (b) false-positive HALT once a sibling legitimately
+   * advanced protected (rollback-engine.ts:142 invariant). The phase's worktree is
+   * already removed by the orchestrator's settle path; here we delete the phase's
+   * OWN refs. `git branch -D` / `git tag -d` mutate only `.git/refs/*` (one file
+   * per distinct ref) — never the working tree or `index.lock` — so two concurrent
+   * members deleting their DISTINCT branches never race. Best-effort, never throws.
+   */
+  private async discardParallelPhaseIntegration(phaseNumber: string): Promise<void> {
+    const git = (args: string[]) =>
+      execFileAsync('git', args, { cwd: this.projectDir }).catch(() => undefined);
+    const integrationBranch = integrationBranchFor(phaseNumber);
+    const baseTag = baseTagFor(phaseNumber);
+    // -D (force) deletes regardless of merge status — the integration branch
+    // carries the failed phase's commits and is NOT merged into protected.
+    await git(['branch', '-D', integrationBranch]);
+    await git(['tag', '-d', baseTag]);
+  }
+
+  /**
+   * Persist a parallel-wave member's per-phase failure ledger (ADR 0014 D4,
+   * Design B, finding 3). Written to the phase's OWN checkpoint dir
+   * (`.planning/.checkpoints/phase-<N>/ROLLBACK.json`, already git-ignored), NOT
+   * the shared `.planning/ROLLBACK.json`. The shared ledger doubles as the Tier-2
+   * crash-resume journal that `resumeIncompleteRollback` replays; concurrent wave
+   * members writing it would clobber each other (last-writer-wins) and corrupt
+   * that journal. A per-phase path makes each member's ledger conflict-free.
+   * Best-effort — a ledger write failure must never fail the phase.
+   */
+  private async writeParallelPhaseLedger(
+    phaseNumber: string,
+    ledger: { attempt_count: number; failure_context: PhaseFailureContext[]; status: 'retrying' | 'halted' },
+  ): Promise<void> {
+    const path = join(checkpointDirFor(this.projectDir, phaseNumber), 'ROLLBACK.json');
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      const tmp = `${path}.tmp`;
+      await writeFile(tmp, `${JSON.stringify({ failed_phase: phaseNumber, ...ledger }, null, 2)}\n`);
+      await rename(tmp, path);
+    } catch {
+      // Best-effort: the orchestrator's skip-dependents (D4) drives behaviour, not
+      // this ledger; a write failure must not fail the phase.
+    }
   }
 
   /**
@@ -508,6 +725,7 @@ export class GSD {
     phase: RoadmapPhaseInfo,
     options: MilestoneRunnerOptions | undefined,
     maxPhaseAttempts: number,
+    phaseDir?: string,
   ): Promise<{ result: PhaseRunnerResult; halted: boolean }> {
     const failureContext: PhaseFailureContext[] = [];
     let attempt = 1;
@@ -522,13 +740,22 @@ export class GSD {
       let result: PhaseRunnerResult;
       let threw = false;
       try {
-        result = await this.runPhase(phase.number, {
+        const phaseOptions = {
           ...options,
           // Pass a SNAPSHOT copy, not the live array — the driver mutates
           // failureContext across attempts; the executor must see only the
           // failures known at THIS attempt's start.
           ...(failureContext.length > 0 && { priorFailureContext: [...failureContext] }),
-        });
+        };
+        // Chunk C PR-1: pass the phase's OWN linked worktree (parallel wave path)
+        // — segment (a) runs in it; rollback/promote (segment b) target the shared
+        // projectDir. On the SEQUENTIAL path phaseDir is undefined: call runPhase
+        // with the ORIGINAL 2-arg shape (no trailing undefined) so GSD.run's
+        // pass-through to runPhase is byte-identical to pre-Chunk-C behaviour.
+        result =
+          phaseDir !== undefined
+            ? await this.runPhase(phase.number, phaseOptions, phaseDir)
+            : await this.runPhase(phase.number, phaseOptions);
       } catch (err) {
         threw = true;
         result = {
@@ -613,6 +840,54 @@ export class GSD {
       consecutiveTransient = 0;
       await stateSignalResume([], this.projectDir, this.workstream);
 
+      // ── ADR 0014 D4 (Design B): PARALLEL/deferred-promotion failure path ──────
+      // On the parallel wave path (phaseDir set) the phase ran segment (a) in its
+      // OWN linked worktree and DEFERRED its promote (deferPromotion:true) — so it
+      // NEVER advanced protected. Its work is fully isolated on its own integration
+      // branch + worktree (disjoint by the conflict-graph invariant). Running the
+      // shared-projectDir Tier-1 (`git checkout protected` / restore `.planning`
+      // docs / assert protected === LAST_GOOD) and Tier-2 here would, under cap>=2,
+      // (1) collide on `.git/index.lock` with a sibling's promote or another
+      // member's failure handling, (2) false-positive HALT once a sibling
+      // legitimately promoted and advanced protected (rollback-engine.ts:142
+      // invariant: "A non-green phase appears to have moved protected"), and (3)
+      // clobber the shared `.planning/ROLLBACK.json` Tier-2 crash-resume journal.
+      // The CORRECT rollback for a never-promoted parallel member is to DISCARD its
+      // own integration branch + worktree (the orchestrator's settle path removes
+      // the worktree; here we delete the refs) and record the failure to a
+      // per-phase-scoped ledger. Across-wave / already-promoted cascades stay the
+      // orchestrator's job (D4: "Across-wave failures use the existing sequential
+      // Tier-1/Tier-2 rollback unchanged at wave boundaries").
+      if (phaseDir) {
+        await this.removePhaseWorktree(phaseDir);
+        await this.discardParallelPhaseIntegration(phase.number);
+
+        failureContext.push({ attempt, signal, detail });
+
+        if (attempt >= maxPhaseAttempts) {
+          await this.writeParallelPhaseLedger(phase.number, {
+            attempt_count: attempt,
+            failure_context: failureContext,
+            status: 'halted',
+          });
+          return { result, halted: true };
+        }
+
+        attempt += 1;
+        await this.writeParallelPhaseLedger(phase.number, {
+          attempt_count: attempt,
+          failure_context: failureContext,
+          status: 'retrying',
+        });
+        // Re-establish a fresh per-phase worktree off the current protected/wave
+        // base for the informed-retry attempt (the discarded branch is recreated by
+        // the next runPhase's beginPhaseIntegration). addDetachedWorktreeAt only
+        // touches refs + creates the linked worktree dir — it does not check out or
+        // mutate the shared projectDir working tree.
+        await this.addDetachedWorktreeAt(phaseDir);
+        continue;
+      }
+
       if (result.rollbackContext) {
         try {
           await rollbackTier1({
@@ -682,6 +957,11 @@ export class GSD {
         failure_context: failureContext,
         status: 'retrying',
       });
+      // Chunk C PR-1: Tier-1 above removed this phase's worktree (to delete its
+      // integration branch). Re-establish it off the now-restored protected/
+      // LAST_GOOD HEAD so the informed-retry attempt runs in isolation again.
+      // Sequential path (phaseDir undefined) → no-op.
+      if (phaseDir) await this.addDetachedWorktreeAt(phaseDir);
     }
   }
 

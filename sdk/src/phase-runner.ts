@@ -227,6 +227,18 @@ export interface PhaseRunnerDeps {
   logger?: GSDLogger;
   /** Optional git-direct execution engine. Default: shared-cwd no-op. */
   executionEngineFactory?: ExecutionEngineFactory;
+  /**
+   * Defer the per-phase promote to the orchestrator (Chunk C PR-1, #13 gap 2).
+   * Set when this runner drives a phase inside its OWN linked worktree under the
+   * parallel wave executor: segment (a) (checkpoint / begin-integration / execute
+   * / verify) runs here, but the promote-onto-protected (segment b) is the
+   * orchestrator's job under `promoteMutex` against the shared projectDir — a
+   * phase worktree CANNOT `git checkout <protected>` (the main projectDir holds
+   * it). On green the runner leaves the integration branch in place for the
+   * orchestrator to promote; the non-green rollback path is unchanged. Absent
+   * (sequential `GSD.run`) → the runner promotes in-process exactly as before.
+   */
+  deferPromotion?: boolean;
 }
 
 // ─── PhaseRunner ─────────────────────────────────────────────────────────────
@@ -240,6 +252,7 @@ export class PhaseRunner {
   private readonly config: GSDConfig;
   private readonly logger?: GSDLogger;
   private readonly executionEngineFactory?: ExecutionEngineFactory;
+  private readonly deferPromotion: boolean;
 
   /**
    * Active per-phase integration context (ADR 0013 option 4). Set at the FIRST
@@ -275,6 +288,7 @@ export class PhaseRunner {
     this.config = deps.config;
     this.logger = deps.logger;
     this.executionEngineFactory = deps.executionEngineFactory;
+    this.deferPromotion = deps.deferPromotion ?? false;
   }
 
   /**
@@ -487,8 +501,25 @@ export class PhaseRunner {
     // runner recovered IN-PLACE (reset protected to LAST_GOOD, integration branch
     // preserved). Signals the driver to HALT for recovery WITHOUT Tier-1.
     let promoteRecoveryHalt: PhaseRunnerResult['promoteRecoveryHalt'];
+    // Set when a green phase's promote was deferred to the orchestrator (parallel
+    // wave isolation, Chunk C PR-1): the ROADMAP/STATE advance is the
+    // orchestrator's job AFTER it promotes (the D2 sole-writer invariant), so the
+    // runner must not advance the worktree's ledgers onto the integration branch.
+    let promoteDeferred = false;
     if (this.phaseIntegration?.phaseNumber === phaseNumber) {
-      if (phaseGreen) {
+      if (phaseGreen && this.deferPromotion) {
+        // Chunk C PR-1: parallel wave executor. Segment (a) ran in this phase's
+        // OWN linked worktree; the promote-onto-protected (segment b) is the
+        // orchestrator's job under promoteMutex against the shared projectDir — a
+        // phase worktree cannot `git checkout <protected>`. Leave the integration
+        // branch in place at LAST_GOOD..HEAD for the orchestrator to promote, drop
+        // the active context (the phase settled), and report green.
+        this.logger?.info(
+          `Phase ${phaseNumber} green — promote deferred to the orchestrator (parallel wave isolation)`,
+        );
+        this.phaseIntegration = null;
+        promoteDeferred = true;
+      } else if (phaseGreen) {
         // Snapshot the context + LAST_GOOD before promote so a failed promote can
         // capture rollback context and assert protected actually moved.
         const ctx = this.phaseIntegration;
@@ -616,9 +647,13 @@ export class PhaseRunner {
     // GROUP-G fix): advancing would mark the ROADMAP complete for work that never
     // reached protected. (rollbackContext is only set under the isolated engine;
     // the no-op shared-cwd path leaves it undefined and advances as before.)
-    if (!halted && verifyPassed && !rollbackContext && !promoteRecoveryHalt) {
+    if (!halted && verifyPassed && !rollbackContext && !promoteRecoveryHalt && !promoteDeferred) {
       const advanceResult = await this.runAdvanceStep(phaseNumber, sessionOpts, callbacks);
       steps.push(advanceResult);
+    } else if (!halted && promoteDeferred) {
+      this.logger?.info(
+        `Skipping advance for phase ${phaseNumber}: promote deferred to the orchestrator (advances after promotion)`,
+      );
     } else if (!halted && !verifyPassed) {
       this.logger?.warn(`Skipping advance for phase ${phaseNumber}: verification found gaps`);
     } else if (!halted && rollbackContext) {
