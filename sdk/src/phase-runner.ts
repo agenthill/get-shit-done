@@ -22,6 +22,7 @@ import type {
 } from './types.js';
 import { PhaseStepType, PhaseType, GSDEventType } from './types.js';
 import type { GSDConfig } from './config.js';
+import { resolvePlanLevelParallel } from './config.js';
 import type { GSDTools } from './gsd-tools.js';
 import type { GSDEventStream } from './event-stream.js';
 import type { PromptFactory } from './phase-prompt.js';
@@ -35,8 +36,6 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { checkResearchGate } from './research-gate.js';
 import { buildPlanDag, type PlanDag, type DagNode } from './plan-dag.js';
 import {
-  Semaphore,
-  resolveConcurrencyCap,
   SharedCwdWorktreeManager,
   NoopMergeSerializer,
   NoopPhaseIntegrationManager,
@@ -44,6 +43,7 @@ import {
   type MergeSerializer,
   type PhaseIntegrationManager,
 } from './execution-engine.js';
+import { getGlobalBudget } from './global-budget.js';
 import {
   createPhaseCheckpoint,
   ensureCheckpointGitignore,
@@ -1113,9 +1113,12 @@ export class PhaseRunner {
     sessionOpts: SessionOptions,
     dag: PlanDag,
   ): Promise<{ planResults: PlanResult[]; dispositions: PlanDisposition[] }> {
-    const parallel = this.config.parallelization !== false;
-    const cap = resolveConcurrencyCap(this.config.parallelization);
-    const semaphore = new Semaphore(cap);
+    const parallel = resolvePlanLevelParallel(this.config);
+    // ADR 0014 D5: plan dispatch acquires from the ONE process-wide agent budget
+    // shared with cross-phase wave dispatch (parallel-runner), so N phases × M
+    // plans cannot oversubscribe CPU/API. The budget is sized at the global cap
+    // (min(16, cores−2)); a single-phase sequential run still observes it.
+    const semaphore = getGlobalBudget();
 
     // Build (or default) the git-direct execution engine. The no-op engine runs
     // every plan in the shared project cwd with no merge step — today's SDK path.

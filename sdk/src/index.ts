@@ -31,7 +31,7 @@ const execFileAsync = promisify(execFile);
 import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo, PhaseFailureContext, ParallelRunnerOptions, ParallelRunnerResult } from './types.js';
 import { GSDEventType, PhaseStepType } from './types.js';
 import { parsePlan, parsePlanFile } from './plan-parser.js';
-import { loadConfig } from './config.js';
+import { loadConfig, resolveMaxConcurrentPhases } from './config.js';
 import { GSDTools, resolveGsdToolsPath } from './gsd-tools.js';
 import { runPlanSession } from './session-runner.js';
 import { buildExecutorPrompt, parseAgentTools } from './prompt-builder.js';
@@ -450,7 +450,8 @@ export class GSD {
     return runParallelWaves(phaseNumbers, options, {
       projectDir: this.projectDir,
       ...(this.workstream && { workstream: this.workstream }),
-      parallelization: config.parallelization !== false,
+      // D5: the per-run phase sub-cap on top of the ONE global agent budget.
+      maxConcurrentPhases: resolveMaxConcurrentPhases(config),
       resolvePhase: async (waveToken) => {
         const found = byNormalized.get(normalizePhaseName(waveToken));
         if (!found) {

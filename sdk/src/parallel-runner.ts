@@ -26,14 +26,16 @@ import type {
   RoadmapPhaseInfo,
 } from './types.js';
 import { scheduleWavesForPhases } from './query/wave-scheduler.js';
-import { Semaphore, Mutex, resolveConcurrencyCap } from './execution-engine.js';
+import { Semaphore, Mutex } from './execution-engine.js';
+import { getGlobalBudget } from './global-budget.js';
 import { canonicalizePhaseId } from './query/phase-depends-on.js';
 
 /** The orchestration surface the GSD class supplies to the wave loop. */
 export interface ParallelDriverContext {
   projectDir: string;
   workstream?: string;
-  parallelization: boolean;
+  /** Sub-cap on in-flight phases (D5 max_concurrent_phases). */
+  maxConcurrentPhases: number;
   /** Resolve a phase's roadmap metadata by wave token (reconciles normalization). */
   resolvePhase: (waveToken: string) => Promise<RoadmapPhaseInfo>;
   /**
@@ -120,10 +122,14 @@ export async function runParallelWaves(
   const startTime = Date.now();
   const schedule = await scheduleWavesForPhases(phaseNumbers, ctx.projectDir, ctx.workstream);
 
-  // One nested global Semaphore caps in-flight phase-agents (D5 lifts it to a
-  // process-wide singleton in chunk C).
-  const cap = resolveConcurrencyCap(ctx.parallelization);
-  const semaphore = new Semaphore(cap);
+  // ADR 0014 D5: ONE global agent budget shared with plan dispatch (so N phases
+  // × M plans never oversubscribe), plus a per-run phase sub-cap. A wave member
+  // acquires the phase sub-cap FIRST (bounds concurrent phases) then the global
+  // budget (bounds total agents across phase + plan dispatch).
+  const globalBudget = getGlobalBudget();
+  const phaseSubCap = new Semaphore(Math.max(1, ctx.maxConcurrentPhases));
+  const acquireSlot = <T>(fn: () => Promise<T>): Promise<T> =>
+    phaseSubCap.run(() => globalBudget.run(fn));
   // Serialize PR auto-merges in wave order — preserves the single-writer (D2)
   // property: ordered promotes onto protected, never concurrent.
   const promoteMutex = new Mutex();
@@ -242,7 +248,7 @@ export async function runParallelWaves(
           return { phaseNumber, result, promoted: false, skippedReason };
         }
 
-        return semaphore.run(async (): Promise<PhaseParallelOutcome> => {
+        return acquireSlot(async (): Promise<PhaseParallelOutcome> => {
           // FIX 2: a thrown/rejected resolvePhase or runPhase must NOT reject the
           // wave's Promise.all — that would abort concurrent siblings, record no
           // outcome, and make the post-wave assertLedgersClean unreachable. Catch
