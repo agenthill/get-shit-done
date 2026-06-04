@@ -257,6 +257,7 @@ Priority: Context7 > Exa (verified) > Firecrawl (official docs) > Official GitHu
 - [ ] Confidence levels assigned honestly
 - [ ] "What might I have missed?" review completed
 - [ ] **If rename/refactor phase:** Runtime State Inventory completed — all 5 categories answered explicitly (not left blank)
+- [ ] **If SDK-codegen'd encoding or externally-returned artifact in scope:** External Encoding Contracts captured — pinned encodings tagged `[VERIFIED]` from codegen (never recomputed), artifact version + host mismatch flagged, returned-artifact shape probed with a typed-refusal fallback noted for any frozen-binding incompatibility
 - [ ] Security domain included (or `security_enforcement: false` confirmed)
 - [ ] ASVS categories verified against phase tech stack
 
@@ -448,6 +449,36 @@ src/
 | Build artifacts | [e.g., "scripts/devos-cli/devos_cli.egg-info/ — stale after pyproject.toml rename"] | [reinstall package] |
 
 **Nothing found in category:** State explicitly ("None — verified by X").
+
+## External Encoding Contracts
+
+> Include this section for any phase that encodes/decodes against a third-party SDK-codegen'd wire format (on-chain program, ABI, codec, schema) or consumes an artifact an external system RETURNS. Omit entirely otherwise. The planner MUST consume the pinned values here verbatim — it must NOT re-derive any encoding this section pins.
+
+### Pinned Encodings (consume, never recompute)
+
+| Encoding | Pinned value (bytes/selector) | Pin source | Tag |
+|----------|-------------------------------|------------|-----|
+| [e.g., `deposit` instruction discriminator] | [exact bytes from codegen, e.g., `0xf2 0x23 …`] | [SDK codegen / IDL file that emitted it] | [VERIFIED] |
+
+**Nothing in scope:** State explicitly ("None — no SDK-codegen'd encodings in this phase").
+
+### Artifact Version / Toolchain
+
+| Fetched artifact | Embedded codegen/toolchain version | Host toolchain version | Mismatch? |
+|------------------|-----------------------------------|------------------------|-----------|
+| [e.g., klend IDL] | [e.g., anchor 0.28] | [e.g., anchor 0.30] | [YES — preimage casing differs → pin from artifact codegen, do NOT recompute under host] |
+
+**Nothing in scope:** State explicitly ("None — no external IDL/ABI/schema fetched").
+
+### Returned-Artifact Shape (probe before designing)
+
+| External system | Returned artifact | Probed shape/version | Compatible with binding? | Fallback |
+|-----------------|-------------------|----------------------|--------------------------|----------|
+| [e.g., bridge inbound leg] | [e.g., VersionedTransaction] | [VERIFIED: v0, byte-0 `0xd3`] | [NO — legacy-only signing binding is FROZEN] | [typed-refusal — direction ships as honest refusal] |
+
+**Typed-refusal note:** When a returned shape is incompatible with a frozen/invariant binding, name the conservative typed-refusal the plan should design (so the direction ships as an explicit refusal, not a stall). The `[VERIFIED]` returned-shape probe above is the pin that authorizes the planner to take that refusal — it is not an open-ended permission to descope.
+
+**Nothing in scope:** State explicitly ("None — no external system returns an artifact in this phase").
 
 ## Common Pitfalls
 
@@ -775,6 +806,29 @@ docker info 2>/dev/null | head -3
 
 **Skip condition:** If the phase is purely code/config changes with no external dependencies (e.g., refactoring, documentation), output: "Step 2.6: SKIPPED (no external dependencies identified)" and move on.
 
+## Step 2.7: External Encoding & Returned-Artifact Contracts
+
+**Trigger:** Any phase that encodes/decodes against a third-party on-chain program, ABI, codec, schema, or wire format whose bytes are produced by SDK codegen — OR that signs/consumes an artifact some external system RETURNS.
+
+A grep finds the SDK call site. It does NOT tell you whether the bytes the SDK emits match what you'd compute by hand, nor what version the fetched artifact was generated under, nor the shape of an artifact the external system hands back. Recomputing an encoding under your own assumptions instead of consuming the SDK's own output is a documented silently-wrong-bytes vector. For these phases you MUST capture each contract below before moving to Step 3:
+
+| Axis | What to capture | Pin source |
+|------|-----------------|------------|
+| **Pinned encodings (bytes)** | The EXACT emitted bytes/selectors taken FROM the SDK's own codegen/IDL output — never re-derived under a default formula | Tag `[VERIFIED]` with the codegen/IDL source that emitted them |
+| **Artifact version / toolchain** | The codegen/schema/toolchain version embedded in any fetched IDL/ABI/schema, plus a host-vs-artifact MISMATCH flag | The artifact's own metadata + the host toolchain version |
+| **Returned-artifact shape / version** | The version/shape of any artifact an external system RETURNS, probed BEFORE designing around it | `[VERIFIED]` probe of an actual returned sample |
+
+**Canonical examples (the principle is domain-agnostic — these are illustrations, not the rule):**
+- An Anchor program's instruction discriminator may diverge from the default `sha256("global:<ix>")`, so a coder that recomputes it emits wrong calldata. Pin the discriminator FROM the SDK's codegen/IDL output, not the formula.
+- An IDL generated under anchor 0.28 vs a host on anchor 0.30 changes the `sha256` preimage (camelCase ↔ snake_case) → different discriminator bytes. Capture the IDL's embedded anchor version, flag the mismatch, and pin the derived encodings from the artifact's own codegen rather than recomputing under the host toolchain.
+- A bridge returns a v0 `VersionedTransaction` (byte-0 `0xd3`) with no legacy fallback, against a legacy-only signing binding. Probe the returned version up front.
+
+**Frozen-binding incompatibility → typed-refusal fallback:** When a returned artifact's shape/version is incompatible with a FROZEN or invariant binding (one that cannot be relaxed without breaking a security/cryptographic invariant), do NOT leave the direction as a stall. Document a conservative TYPED-REFUSAL fallback so the planner can ship that direction as an explicit, honest refusal. Record the pinned incompatibility as `[VERIFIED]` — this pin is the trust source that lets the planner and plan-checker treat the refusal as a sanctioned outcome rather than illicit scope reduction.
+
+For each contract found: record it in the `## External Encoding Contracts` section of RESEARCH.md (below). If an axis does not apply, say so explicitly ("None — no SDK-codegen'd encodings in scope" / "None — no external system returns an artifact here"). Leaving it blank is not acceptable; the planner cannot distinguish "checked and found nothing" from "not checked."
+
+**Skip condition:** If the phase neither encodes/decodes against an SDK-codegen'd wire format nor consumes an externally-returned artifact, output: "Step 2.7: SKIPPED (no external encoding contracts in scope)" and move on.
+
 ## Step 3: Execute Research Protocol
 
 For each domain: Context7 first → Official docs → WebSearch → Cross-verify. Document findings with confidence levels as you go.
@@ -909,6 +963,7 @@ Research is complete when:
 - [ ] Architecture patterns documented
 - [ ] Don't-hand-roll items listed
 - [ ] Common pitfalls catalogued
+- [ ] External encoding contracts captured (pinned encodings, artifact version, returned-artifact shape) or skipped with reason
 - [ ] Environment availability audited (or skipped with reason)
 - [ ] Code examples provided
 - [ ] Source hierarchy followed (Context7 → Official → WebSearch)
