@@ -108,4 +108,54 @@ describe('ADR 0014 D5 — global-budget self-deadlock (BLOCKER 1)', () => {
     // (D5 oversubscription prevention): never more than 2 plans run at once.
     expect(maxPlansInFlight).toBeLessThanOrEqual(2);
   }, 5000);
+
+  // ── issue #24 item 1 — Falsifier 1: single-agent leaf permit + nested execute ──
+  it('a phase that takes a single-agent STEP-LEAF permit then runs a NESTED execute fan-out COMPLETES (cap=2)', async () => {
+    // Mirrors runVerifyStep's gap-closure: the verify LEAF acquires one global
+    // permit around just its own query() (dispatchStepLeaf), RELEASES it, then the
+    // gap-closure execute fan-out (runPlanDag) acquires a permit per plan.
+    //
+    // The deadlock-safety contract being falsified: if the leaf permit were held
+    // ACROSS the nested execute (e.g. wrapping runVerifyStep as a whole), then with
+    // globalCap=2 and 2 concurrent phases both verify-leaves would hold the only
+    // two permits and every nested execute plan would block forever for a permit
+    // none would release → hold-and-wait. W = the wave promise never resolves
+    // within the per-test timeout.
+    resetGlobalBudgetForTest(2);
+    schedule.value = { waves: [['20', '21']] };
+
+    // dispatchStepLeaf's exact gate: parallel → the shared global budget singleton.
+    const dispatchStepLeaf = <T>(fn: () => Promise<T>): Promise<T> =>
+      getGlobalBudget().run(fn);
+
+    let executePlansRun = 0;
+    const ctx = {
+      projectDir: '/tmp/par-deadlock-unused',
+      maxConcurrentPhases: 3,
+      resolvePhase: async (t: string) => phaseInfo(t),
+      runPhase: async (phase: RoadmapPhaseInfo) => {
+        // 1. Single-agent step LEAF (verify): acquire + await one query + RELEASE.
+        await dispatchStepLeaf(async () => {
+          await new Promise((r) => setTimeout(r, 10));
+        });
+        // 2. Gap-closure NESTED execute fan-out: each plan acquires its own permit
+        //    (runPlanDag's per-plan acquire) — NO leaf permit is held here.
+        const budget = getGlobalBudget();
+        const runPlan = () =>
+          budget.run(async () => {
+            executePlansRun++;
+            await new Promise((r) => setTimeout(r, 10));
+          });
+        await Promise.all([runPlan(), runPlan(), runPlan()]);
+        return { result: greenResult(phase.number), halted: false };
+      },
+    };
+
+    const res = await runParallelWaves(['20', '21'], undefined, ctx);
+
+    expect(res.phases.every((p) => p.promoted)).toBe(true);
+    // 2 phases × (1 verify leaf released + 3 execute plans) — the execute fan-out
+    // ran to completion, proving no hold-and-wait stalled it.
+    expect(executePlansRun).toBe(6);
+  }, 5000);
 });
