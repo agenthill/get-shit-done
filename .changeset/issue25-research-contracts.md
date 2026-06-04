@@ -1,6 +1,6 @@
 ---
 type: Changed
-pr: 0
+pr: 27
 ---
 <!-- docs-exempt: prompt-template changes only — no user-facing API or SDK surface changed -->
 **Research external-encoding contracts (part of issue #25, gaps 4/10/11):** Hardens the RESEARCH phase against silently-wrong external encodings and un-shippable returned artifacts. Domain-agnostic principle; Anchor discriminators / IDL anchor-version / bridge v0-tx are canonical examples only.
