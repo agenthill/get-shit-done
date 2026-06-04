@@ -29,6 +29,7 @@ GSD stores project settings in `.planning/config.json`. Created during `/gsd-new
     "plan_check": true,
     "verifier": true,
     "auto_advance": false,
+    "unattended": false,
     "nyquist_validation": true,
     "ui_phase": true,
     "ui_safety_gate": true,
@@ -224,6 +225,7 @@ All workflow toggles follow the **absent = enabled** pattern. If a key is missin
 | `workflow.plan_check` | boolean | `true` | Plan verification loop (up to 3 iterations) |
 | `workflow.verifier` | boolean | `true` | Post-execution verification against phase goals |
 | `workflow.auto_advance` | boolean | `false` | Auto-chain discuss → plan → execute without stopping |
+| `workflow.unattended` | boolean | `false` | Operator's affirmation that NO human is reachable for the run (a background/UNATTENDED run). DISTINCT from `auto_advance` — `auto_advance` only avoids pausing for routine confirmations; it does NOT promise a human is unreachable. `unattended` is the dedicated trust source that lets a NON-security `resolution="auto"` checkpoint (`checkpoint:human-verify` / `checkpoint:human-action`) self-resolve when no deterministic resolver is available: it takes its declared conservative `<fallback>` (safe/refusal) branch and continues instead of hanging forever. Default `false` keeps interactive and interactive-autonomous runs unchanged — they still pause for humans (zero hang-risk regression). NEVER bypasses a `gate="blocking-human"` auth/security checkpoint: those HALT and defer to end-of-phase human UAT even when `unattended` is `true`. See [Checkpoints Reference](../get-shit-done/references/checkpoints.md#checkpoint_types) `<auto_determination>`. |
 | `workflow.nyquist_validation` | boolean | `true` | Test coverage mapping during plan-phase research |
 | `workflow.ui_phase` | boolean | `true` | Generate UI design contracts for frontend phases |
 | `workflow.ui_safety_gate` | boolean | `true` | Prompt to run /gsd-ui-phase for frontend phases during plan-phase |
