@@ -131,6 +131,9 @@ After completion, create SUMMARY.md with:
 **No implementation details:**
 - Good: Test public API, observable behavior
 - Bad: Mock internals, test private methods, assert on internal state
+
+**No live network/RPC — mock at the client boundary; file-scoped + timeout:**
+When `<files>` or the SDK surface touches a network client (`WsProvider`, `Connection`, `Provider`, HTTP-RPC, or any socket), the test MUST: (a) mock at the client/registry/`Connection`/`Provider` construction boundary — never open a live socket; (b) be file-scoped (run only the new test file, e.g. `vitest run path/x.test.ts`); (c) carry an explicit per-run timeout.
 </test_quality>
 
 <framework_setup>
