@@ -84,6 +84,24 @@ export interface WorkflowConfig {
    */
   human_verify_mode: 'mid-flight' | 'end-of-phase';
   auto_advance: boolean;
+  /**
+   * Issue #25 (gap 12). Operator's affirmation that NO human is reachable for
+   * the duration of the run (a true UNATTENDED/background run). Default false.
+   * DISTINCT from `auto_advance` — `auto_advance` only says "don't pause for
+   * routine confirmations," it does NOT promise a human is unreachable. This is
+   * the dedicated trust source that gates auto-determination of human
+   * checkpoints: a NON-security `human-verify`/`human-action` checkpoint with no
+   * deterministic resolution takes its declared conservative `<fallback>`
+   * (safe/refusal) branch and CONTINUES *only* when `unattended === true`, so a
+   * background run never hangs on a checkpoint nobody can answer. Default-false
+   * keeps interactive and interactive-autonomous runs UNCHANGED (they still
+   * pause for humans — zero hang-risk regression). It NEVER bypasses a
+   * `gate="blocking-human"` auth/security checkpoint: those HALT and defer to
+   * end-of-phase human UAT even when unattended (a halt is the safe branch for
+   * an auth/security gate). Only meaningful alongside auto-mode; the composition
+   * is resolved in `query/check-auto-mode.ts`.
+   */
+  unattended: boolean;
   /** Internal auto-chain flag used by workflow routing. */
   _auto_chain_active?: boolean;
   node_repair: boolean;

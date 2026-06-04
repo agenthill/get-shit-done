@@ -18,6 +18,7 @@
     "workflow.ui_phase",
     "workflow.ui_safety_gate",
     "workflow.auto_advance",
+    "workflow.unattended",
     "workflow.node_repair",
     "workflow.node_repair_budget",
     "workflow.tdd_mode",

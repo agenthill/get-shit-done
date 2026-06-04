@@ -174,6 +174,7 @@ function buildNewProjectConfig(userChoices) {
       verifier: true,
       nyquist_validation: true,
       auto_advance: false,
+      unattended: false,
       node_repair: true,
       node_repair_budget: 2,
       ui_phase: true,

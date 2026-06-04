@@ -32,6 +32,7 @@
     "tdd_mode": false,
     "human_verify_mode": "end-of-phase",
     "auto_advance": false,
+    "unattended": false,
     "_auto_chain_active": false,
     "node_repair": true,
     "node_repair_budget": 2,

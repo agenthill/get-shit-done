@@ -274,14 +274,15 @@ Do NOT continue reading. Analysis without action is a stuck signal.
 </authentication_gates>
 
 <auto_mode_detection>
-Check if auto mode is active at executor start (chain flag or user preference):
+Check if auto mode is active at executor start (chain flag or user preference), and whether the run is UNATTENDED:
 
 ```bash
 AUTO_CHAIN=$(gsd-sdk query config-get workflow._auto_chain_active 2>/dev/null || echo "false")
 AUTO_CFG=$(gsd-sdk query config-get workflow.auto_advance 2>/dev/null || echo "false")
+UNATTENDED=$(gsd-sdk query check auto-mode --pick unattended 2>/dev/null || echo "false")
 ```
 
-Auto mode is active if either `AUTO_CHAIN` or `AUTO_CFG` is `"true"`. Store the result for checkpoint handling below.
+Auto mode is active if either `AUTO_CHAIN` or `AUTO_CFG` is `"true"`. `UNATTENDED` is a DISTINCT flag (operator affirms NO human is reachable) — it is the trust source for auto-determining `resolution="auto"` checkpoints below, NOT `AUTO_CFG`. Store all three for checkpoint handling below.
 </auto_mode_detection>
 
 <checkpoint_protocol>
@@ -296,6 +297,13 @@ For full automation-first patterns, server lifecycle, CLI handling:
 **Quick reference:** Users NEVER run CLI commands. Users ONLY visit URLs, click UI, evaluate visuals, provide secrets. Claude does all automation.
 
 ---
+
+**Auto-determination of `resolution="auto"` checkpoints** (evaluated FIRST, before the auto-mode behavior below). When a checkpoint task carries the `resolution="auto"` attribute:
+
+1. If it is `gate="blocking-human"` → **HALT** (return checkpoint_return_format for explicit human confirmation / end-of-phase UAT). NEVER auto-resolve an auth/security gate, even when `UNATTENDED` is `"true"`. Skip the rest.
+2. Else if it has a `<resolver>` criterion → run the criterion. On a definitive result, resolve with it and continue (this fires in any mode). On an inconclusive result, fall to step 3/4.
+3. Else if `UNATTENDED` is `"true"` → take the task's **REQUIRED `<fallback>`** (conservative safe/refusal) branch and CONTINUE. Log `⚡ Auto-determined (fallback): [decision]`. A `resolution="auto"` task with no `<fallback>` is invalid — STOP and report it as a malformed plan rather than guessing.
+4. Else (`UNATTENDED` is not `"true"` — a human is reachable) → behave as today: fall through to the standard/auto-mode checkpoint behavior below (do NOT take the fallback). This keeps interactive runs unchanged.
 
 **Auto-mode checkpoint behavior** (when `AUTO_CFG` is `"true"`):
 

@@ -9,6 +9,7 @@ Plans execute autonomously. Checkpoints formalize interaction points where human
 3. **User only does what requires human judgment** - Visual checks, UX evaluation, "does this feel right?"
 4. **Secrets come from user, automation comes from Claude** - Ask for API keys, then Claude uses them via CLI
 5. **Auto-mode bypasses verification/decision checkpoints** — When `workflow._auto_chain_active` or `workflow.auto_advance` is true in config: human-verify auto-approves, decision auto-selects first option, human-action still stops (auth gates cannot be automated)
+6. **Unattended runs auto-determine NON-security checkpoints, never hang** — When `workflow.unattended` is true (operator affirms NO human is reachable), a `resolution="auto"` checkpoint resolves deterministically if a criterion is available, else takes its declared conservative `<fallback>` (safe/refusal) branch and CONTINUES instead of blocking forever. `unattended` is the dedicated trust source (DISTINCT from `auto_advance`); default false ⇒ interactive runs are unchanged. `gate="blocking-human"` auth/security checkpoints are EXCLUDED — they HALT even when unattended. See `<auto_determination>` below.
 </overview>
 
 <checkpoint_types>
@@ -275,10 +276,50 @@ Plans execute autonomously. Checkpoints formalize interaction points where human
 </type>
 </checkpoint_types>
 
+<auto_determination>
+
+## resolution="auto" — auto-determination checkpoint (UNATTENDED runs)
+
+**Problem:** a background / UNATTENDED run can reach a `checkpoint:human-verify` or `checkpoint:human-action` that nobody is present to answer, and HANG forever. `resolution="auto"` is the contract that lets such a checkpoint resolve itself safely instead of blocking.
+
+It is an **attribute on an existing checkpoint type** (like `gate="blocking-human"`), NOT a new checkpoint type. Apply it to NON-security `checkpoint:human-verify` / `checkpoint:human-action` tasks.
+
+**Trust source — `workflow.unattended` (NOT `auto_advance`):** auto-determination fires ONLY when `workflow.unattended` is `true` (the operator's affirmation that NO human is reachable for the run). This is a DEDICATED flag, distinct from `auto_advance` — `auto_advance` means "don't pause for routine confirmations," it does NOT promise a human is unreachable. Read it via `gsd-sdk query check auto-mode` (`unattended` / `human_reachable` fields). Default `false` ⇒ interactive and interactive-autonomous runs are UNCHANGED: they still pause/present to a human exactly as today (zero hang-risk regression).
+
+**Two-branch contract:**
+1. **Resolve deterministically** if a resolver/criterion is available — run the criterion, take its result, and continue. This branch fires in EVERY mode (it needs no human and no `unattended` affirmation): a checkpoint that can be answered by a machine check is not really a human checkpoint.
+2. **Else, ONLY when `unattended`,** take the declared conservative `<fallback>` (safe/refusal) branch and CONTINUE. When NOT `unattended`, behave as today: pause and present the checkpoint to the human.
+
+**`<fallback>` is REQUIRED.** A `resolution="auto"` checkpoint with no `<fallback>` is INVALID — there is nothing safe to fall back to, so it would hang exactly like a plain checkpoint. The fallback must be a CONSERVATIVE safe/refusal branch: leave the feature off, skip the optional step, refuse the risky action — never "assume approved and proceed with the risky path."
+
+**`gate="blocking-human"` is EXCLUDED.** An auth/security checkpoint NEVER auto-resolves — even when `unattended` is `true` and even if a `<fallback>` is present, it HALTS and defers to end-of-phase human UAT. A halt is the correct safe branch for an auth/security gate; auto-bypassing one is unsafe. `resolution="auto"` and `gate="blocking-human"` must not appear on the same task.
+
+**Structure:**
+```xml
+<task type="checkpoint:human-verify" gate="blocking" resolution="auto">
+  <what-built>[What Claude automated]</what-built>
+  <how-to-verify>[Exact steps a human would take]</how-to-verify>
+  <resolver>[Optional: a deterministic criterion Claude can run to self-resolve — e.g. "fetch /health returns 200". Omit if none exists.]</resolver>
+  <fallback decision="refuse">
+    [REQUIRED conservative safe/refusal branch taken ONLY when unattended and the resolver is absent/inconclusive — e.g. "leave the new dashboard route behind a default-off feature flag and record the unverified state in SUMMARY.md".]
+  </fallback>
+  <resume-signal>Type "approved" or describe issues</resume-signal>
+</task>
+```
+
+**Resolution order (executor / orchestrator):**
+1. If `gate="blocking-human"` → HALT (present to human / defer to UAT). Stop here.
+2. Else if a `<resolver>` criterion is present → run it; on a definitive result, resolve with that result and continue.
+3. Else if `unattended` is `true` → take the `<fallback>` branch and continue; log `⚡ Auto-determined (fallback): [decision]`.
+4. Else (a human is reachable) → pause and present the checkpoint as today.
+
+</auto_determination>
+
 <execution_protocol>
 
 When Claude encounters `type="checkpoint:*"`:
 
+0. **Auto-determination pre-check (`resolution="auto"` only):** if the task carries `resolution="auto"` AND it is not `gate="blocking-human"`, apply the `<auto_determination>` resolution order BEFORE stopping — a deterministic `<resolver>` self-resolves in any mode, and when `workflow.unattended` is true a missing/inconclusive resolver takes the `<fallback>` branch and CONTINUES (no halt). A `gate="blocking-human"` task skips this step and always halts. If auto-determination does not apply (not unattended, no resolver), fall through to the standard steps below.
 1. **Stop immediately** - do not proceed to next task
 2. **Display checkpoint clearly** using the format below
 3. **Wait for user response** - do not hallucinate completion

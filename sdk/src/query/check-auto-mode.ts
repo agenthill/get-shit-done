@@ -36,6 +36,17 @@ export const checkAutoMode: QueryHandler = async (_args, projectDir) => {
   };
   const autoAdvance = Boolean(wf.auto_advance ?? false);
   const autoChainActive = Boolean(wf._auto_chain_active ?? false);
+  // Issue #25 (gap 12). `unattended` is the dedicated trust source affirming NO
+  // human is reachable — distinct from auto_advance. It is the ONLY flag that
+  // licenses a non-security human checkpoint with no deterministic resolution to
+  // take its declared `<fallback>` and continue (so a background run never hangs
+  // on a checkpoint nobody can answer). `human_reachable` is its negation,
+  // surfaced explicitly so checkpoint-handling consumers (executor agent,
+  // execute-phase orchestrator) gate the auto-resolve+fallback path on a single
+  // signal. It NEVER applies to `gate="blocking-human"` auth/security
+  // checkpoints — those halt and defer to end-of-phase human UAT even when
+  // unattended.
+  const unattended = Boolean(wf.unattended ?? false);
   const { active, source } = resolveSource(autoChainActive, autoAdvance);
 
   return {
@@ -44,6 +55,8 @@ export const checkAutoMode: QueryHandler = async (_args, projectDir) => {
       source,
       auto_chain_active: autoChainActive,
       auto_advance: autoAdvance,
+      unattended,
+      human_reachable: !unattended,
     },
   };
 };

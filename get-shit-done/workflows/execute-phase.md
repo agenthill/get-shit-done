@@ -1082,12 +1082,19 @@ increases monotonically across waves. `{status}` is `complete` (success),
 <step name="checkpoint_handling">
 Plans with `autonomous: false` require user interaction.
 **Auto-mode checkpoint handling:**
-Read auto-advance config (chain flag OR user preference — same boolean as `check.auto-mode`):
+Read auto-advance config (chain flag OR user preference — same boolean as `check.auto-mode`) AND the UNATTENDED trust source (distinct flag — operator affirms NO human is reachable):
 ```bash
 AUTO_MODE=$(gsd-sdk query check auto-mode --pick active 2>/dev/null || echo "false")
+UNATTENDED=$(gsd-sdk query check auto-mode --pick unattended 2>/dev/null || echo "false")
 ```
 
-When executor returns a checkpoint AND `AUTO_MODE` is `true`:
+**Auto-determination (`resolution="auto"`) — evaluated FIRST.** When the returned checkpoint task carries the `resolution="auto"` attribute:
+- If `gate="blocking-human"` → present/HALT (existing behavior below). NEVER auto-resolve an auth/security gate, even when `UNATTENDED` is `true`.
+- Else if it has a `<resolver>` criterion → run it; on a definitive result, auto-spawn the continuation with `{user_response}` = the resolver outcome and continue (any mode).
+- Else if `UNATTENDED` is `true` → auto-spawn the continuation with `{user_response}` = the task's REQUIRED `<fallback>` (conservative safe/refusal) branch. Log `⚡ Auto-determined (fallback): [decision]`. A `resolution="auto"` task with no `<fallback>` is a malformed plan — surface it, do not guess.
+- Else (`UNATTENDED` not `true`) → present to user as today (fall through). Interactive runs are unchanged.
+
+When executor returns a checkpoint AND `AUTO_MODE` is `true` (and auto-determination above did not already resolve it):
 - **human-verify** → Auto-spawn continuation agent with `{user_response}` = `"approved"`. Log `⚡ Auto-approved checkpoint`.
 - **decision** → Auto-spawn continuation agent with `{user_response}` = first option from checkpoint details. Log `⚡ Auto-selected: [option]`.
 - **human-action** → Present to user (existing behavior below). Auth gates cannot be automated.

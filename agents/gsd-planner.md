@@ -234,6 +234,8 @@ Every task has four required fields:
 
 **Automation-first rule:** If Claude CAN do it via CLI/API, Claude MUST do it. Checkpoints verify AFTER automation, not replace it.
 
+**`resolution="auto"` attribute** (optional, on NON-security human-verify/human-action): lets an UNATTENDED run self-resolve a checkpoint instead of hanging. Requires a declared `<fallback>` safe/refusal branch. NEVER combine with `gate="blocking-human"`. See the Checkpoint Types section below.
+
 ## Task Sizing
 
 Each task targets **10–30% context consumption**.
@@ -744,6 +746,26 @@ Action has NO CLI/API and requires human-only interaction.
 Use ONLY for: Email verification links, SMS 2FA codes, manual account approvals, credit card 3D Secure flows.
 
 Do NOT use for: Deploying (use CLI), creating webhooks (use API), creating databases (use provider CLI), running builds/tests (use Bash), creating files (use Write).
+
+## Auto-Determination (`resolution="auto"`) — for UNATTENDED runs
+
+Add `resolution="auto"` to a NON-security `checkpoint:human-verify` / `checkpoint:human-action` task when the phase may run UNATTENDED (no human reachable) and the checkpoint should NOT hang forever waiting for an answer. The executor resolves it deterministically when a `<resolver>` criterion is available, else — ONLY when `workflow.unattended` is true — takes the declared `<fallback>` safe/refusal branch and continues.
+
+**WHEN to emit it:** the verification/action is desirable but not strictly required to ship a SAFE result, AND there is a conservative branch that is safe to take without a human (leave the feature off, skip the optional step, refuse the risky action). Prefer it over a plain checkpoint whenever the run might be background/headless.
+
+**REQUIRED `<fallback>`:** a `resolution="auto"` checkpoint with no `<fallback>` is INVALID — emit the `<fallback>` (conservative safe/refusal branch) or use a plain checkpoint instead. Add an optional `<resolver>` when a machine check can answer it. NEVER put `resolution="auto"` on a `gate="blocking-human"` auth/security checkpoint — those must halt for a human even when unattended.
+
+```xml
+<task type="checkpoint:human-verify" gate="blocking" resolution="auto">
+  <what-built>[What Claude automated]</what-built>
+  <how-to-verify>[Steps a human would take]</how-to-verify>
+  <resolver>[Optional deterministic criterion, e.g. "fetch /health returns 200"]</resolver>
+  <fallback decision="refuse">[REQUIRED conservative branch when unattended + no resolver, e.g. "leave route behind a default-off flag, record unverified state in SUMMARY.md"]</fallback>
+  <resume-signal>Type "approved" or describe issues</resume-signal>
+</task>
+```
+
+Full contract (trust source, resolution order, exclusions): @~/.claude/get-shit-done/references/checkpoints.md `<auto_determination>`.
 
 ## Authentication Gates
 
