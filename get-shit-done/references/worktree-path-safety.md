@@ -87,3 +87,33 @@ fi
 **Prefer relative paths** for all Edit/Write operations. When an absolute path is
 unavoidable, always derive it from `git rev-parse --show-toplevel` run inside the
 worktree — never from `pwd` captured in the orchestrator context.
+
+---
+
+## Post-Edit/Write verification — step 0b-verify
+
+After each `Edit` or `Write` in worktree mode, verify the file landed inside the
+assigned worktree before proceeding. A `Write` using an incorrectly constructed
+absolute path can silently resolve to the main checkout:
+
+```bash
+# Verify the file exists at the expected worktree-relative location
+[ -f "$WT_ROOT/<relative-path>" ] || echo "WARNING: file not found inside worktree after Write — check path"
+```
+
+---
+
+## Parent stray-file check (post-subagent, ADVISORY)
+
+After a subagent completes (returns or is verified), the PARENT orchestrator runs
+`git status` on the MAIN checkout and inspects for unexpected untracked or modified
+files. This check is ADVISORY — on any stray file, warn and record the finding, then
+continue. Do NOT halt the workflow on stray files; they may be benign side-effects.
+Stray files on the main checkout that match a subagent's task scope should be
+investigated (the subagent may have written to the wrong location) but are not
+a hard blocker.
+
+```bash
+STRAY=$(git status --short 2>/dev/null | grep -v '^?? .planning/' || true)
+[ -n "$STRAY" ] && echo "ADVISORY: stray files on main checkout after subagent: $STRAY"
+```

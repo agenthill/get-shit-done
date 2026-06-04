@@ -31,4 +31,6 @@ Args: two or more phase tokens (`43 44 45`). Requires `git.sdk_worktree_executio
 
 <process>
 Resolve config + runtime gate, then invoke `GSD.runParallel(<phases>)`. Surface the per-wave schedule and each phase's PR url. Preserve all workflow gates (checkpoint, Tier-1/Tier-2 rollback, skip-dependents).
+
+**Liveness:** A spawned phase-agent's `.output` mtime can freeze while the agent is still alive. Authoritative liveness = new git commits on the agent's branch/worktree + worktree FILE mtimes. Never `TaskStop` on a stale `.output` mtime alone — confirm via worktree file mtimes and/or a non-destructive probe first.
 </process>

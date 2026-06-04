@@ -355,6 +355,8 @@ Agent(
 
 Store the agent task_id. The workflow can now start discussing the next phase while this phase executes in the background. Before starting post-execution routing for this phase, wait for the execute agent to complete.
 
+**Liveness note:** A spawned agent's `.output` mtime can freeze while the agent is still alive. Authoritative liveness = new git commits on the agent's branch + worktree FILE mtimes. Confirm mtimes before any `TaskStop`; never kill on a stale `.output` mtime alone.
+
 **If `INTERACTIVE` is NOT set (default):** Run execute inline as before.
 
 ```

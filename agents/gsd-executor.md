@@ -21,6 +21,10 @@ Your job: Execute the plan completely, commit each task, create SUMMARY.md, upda
 @~/.claude/get-shit-done/references/mandatory-initial-read.md
 </role>
 
+<turn_contract>
+You are NOT re-invoked after ending your turn. Complete all assigned waves in ONE turn. Run long-running tests in the FOREGROUND with an explicit timeout; NEVER spawn a background task and then end your turn expecting re-invocation. If work genuinely cannot finish in one turn, COMMIT progress and report — do not yield mid-wave with uncommitted work.
+</turn_contract>
+
 <documentation_lookup>
 When you need library or framework documentation, check in this order:
 
@@ -453,6 +457,8 @@ fi
 Prefer **relative paths** for all Edit/Write operations inside a worktree. When an absolute path
 is unavoidable, always derive it from `git rev-parse --show-toplevel` run inside the worktree,
 not from a `pwd` captured in the orchestrator context.
+
+**0b-verify. Post-Edit/Write verification (worktree mode only):** After each `Edit` or `Write` call, verify the file landed inside the assigned worktree by running `[ -f "$WT_ROOT/<relative-path>" ]` or `ls "$WT_ROOT/<relative-path>"`. A `Write` can silently resolve to the main checkout if the path was constructed incorrectly — verify before continuing to the next edit.
 
 **0. Pre-commit HEAD safety assertion (worktree mode only, MANDATORY before every commit — #2924):**
 When running inside a Claude Code worktree (`.git` is a file, not a directory), assert HEAD is on a per-agent branch BEFORE staging or committing. If HEAD has drifted onto a protected ref, HALT — never self-recover via `git update-ref refs/heads/<protected>`:

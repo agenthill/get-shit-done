@@ -627,6 +627,7 @@ increases monotonically across waves. `{status}` is `complete` (success),
        this commit — the orchestrator force-removes the worktree after you return, and
        any uncommitted SUMMARY.md will be permanently lost (#2070).
        REQUIRED ORDER: Write SUMMARY.md → commit → only then any narration. No text between Write and commit (truncation risk; #2070 rescue is not primary defense).
+       ONE-TURN CONTRACT: You are NOT re-invoked after ending your turn. Complete all assigned work in ONE turn. Run tests in the FOREGROUND with an explicit timeout; never spawn a background task and end your turn expecting re-invocation. If work cannot finish, COMMIT progress and report.
        </parallel_execution>
 
        <execution_context>
@@ -740,6 +741,8 @@ increases monotonically across waves. `{status}` is `complete` (success),
    commits appear for `${EXECUTOR_STALL_THRESHOLD_MINUTES}` minutes, pause and
    ask for one recovery path: `continue waiting`, `kill and retry`, or
    `kill and switch to inline execution`.
+
+   **`.output` mtime is NOT a liveness signal.** A spawned local agent's `.output` mtime can freeze while the agent is still alive and grinding. Authoritative liveness = new git commits on the agent's branch/worktree + worktree FILE mtimes. Confirm exact mtimes (and ideally a non-destructive probe) before any `TaskStop`; never kill on a stale `.output` mtime alone.
 
    **This fallback applies automatically to all runtimes.** Claude Code's Agent() normally
    returns synchronously, but the fallback ensures resilience if it doesn't.
