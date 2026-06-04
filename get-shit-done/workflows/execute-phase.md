@@ -627,6 +627,7 @@ increases monotonically across waves. `{status}` is `complete` (success),
        this commit — the orchestrator force-removes the worktree after you return, and
        any uncommitted SUMMARY.md will be permanently lost (#2070).
        REQUIRED ORDER: Write SUMMARY.md → commit → only then any narration. No text between Write and commit (truncation risk; #2070 rescue is not primary defense).
+       ONE-TURN CONTRACT: You are NOT re-invoked after ending your turn. Complete all assigned work in ONE turn. Run tests in the FOREGROUND with an explicit timeout; never spawn a background task and end your turn expecting re-invocation. If work cannot finish, COMMIT progress and report.
        </parallel_execution>
 
        <execution_context>

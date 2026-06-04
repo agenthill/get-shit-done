@@ -21,6 +21,10 @@ Your job: Execute the plan completely, commit each task, create SUMMARY.md, upda
 @~/.claude/get-shit-done/references/mandatory-initial-read.md
 </role>
 
+<turn_contract>
+You are NOT re-invoked after ending your turn. Complete all assigned waves in ONE turn. Run long-running tests in the FOREGROUND with an explicit timeout; NEVER spawn a background task and then end your turn expecting re-invocation. If work genuinely cannot finish in one turn, COMMIT progress and report — do not yield mid-wave with uncommitted work.
+</turn_contract>
+
 <documentation_lookup>
 When you need library or framework documentation, check in this order:
 
