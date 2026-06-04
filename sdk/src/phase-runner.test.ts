@@ -63,6 +63,7 @@ vi.mock('./plan-parser.js', () => ({
 
 import { runPhaseStepSession } from './session-runner.js';
 import { parsePlanFile } from './plan-parser.js';
+import { resetGlobalBudgetForTest } from './global-budget.js';
 
 const mockRunPhaseStepSession = vi.mocked(runPhaseStepSession);
 const mockParsePlanFile = vi.mocked(parsePlanFile);
@@ -3664,4 +3665,50 @@ describe('PHASE_WORKFLOW_MAP', () => {
   it('execute phase maps to execute-plan.md (not execute-phase.md)', () => {
     expect(PHASE_WORKFLOW_MAP[PhaseType.Execute]).toBe('execute-plan.md');
   });
+});
+
+// ─── issue #24 item 1 — Falsifier 2: single-agent step leaves bounded by globalCap ──
+describe('single-agent phase-step leaf dispatch is bounded by the global agent budget (issue #24 item 1)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    resetGlobalBudgetForTest();
+  });
+
+  it('≥3 concurrent single-agent steps never exceed globalCap=2 in-flight runPhaseStepSession dispatches', async () => {
+    // Force the process-wide budget to cap=2.
+    resetGlobalBudgetForTest(2);
+
+    // Instrument the LEAF: increment a shared in-flight counter on entry, hold
+    // briefly so concurrent dispatches overlap, decrement on exit, record the max.
+    // With the wrap, dispatchStepLeaf gates each leaf through getGlobalBudget()
+    // (cap=2), so the max can never exceed 2. W (falsifier) = max > 2.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    mockRunPhaseStepSession.mockImplementation(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 25));
+      inFlight--;
+      return makePlanResult();
+    });
+
+    // Drive ≥3 concurrent single-agent phase steps. Each runStep dispatches exactly
+    // one runPhaseStepSession leaf via dispatchStepLeaf (default config →
+    // resolvePlanLevelParallel true → the shared global budget). Distinct runner
+    // instances model distinct concurrent phases sharing the one process budget.
+    const STEP_COUNT = 5;
+    const runners = Array.from({ length: STEP_COUNT }, () => new PhaseRunner(makeDeps()));
+    await Promise.all(
+      runners.map((runner, i) =>
+        (runner as any).runStep(PhaseStepType.Plan, String(i + 1), {} as SessionOptions),
+      ),
+    );
+
+    // All five leaves actually dispatched.
+    expect(mockRunPhaseStepSession).toHaveBeenCalledTimes(STEP_COUNT);
+    // The bound holds: never more than globalCap=2 concurrent in-flight.
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+  }, 10000);
 });
