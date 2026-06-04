@@ -519,6 +519,66 @@ If FAIL: return to planner with specific fixes. Same revision loop as other dime
 
 **Severity:** WARNING for potential conflicts. BLOCKER if incompatible transforms on same data entity with no preservation mechanism.
 
+## Dimension 9a: Cross-Plan Data-Contract Ordering
+
+**Question:** When one plan ASSERTS against shared data (a fixture / allowlist / golden / snapshot) that another plan PRODUCES, does the producer run BEFORE the consumer?
+
+**Process:**
+1. Identify every shared data artifact referenced by >1 plan — fixtures, allowlists, golden files, snapshots — in their `key_links`, `read_first`, `<action>`, or `<acceptance_criteria>`.
+2. For each, classify each referencing plan as PRODUCER (commits/writes/generates the artifact) or CONSUMER (asserts against it — diffs, matches, "expects", "must contain").
+3. Compute the execution order across plans from `wave` + `depends_on`.
+4. Compare: the CONSUMER's wave/order must be >= the PRODUCER's. A consumer that asserts against data the producer commits in a LATER wave is asserting against data that does not yet exist.
+
+**Red flags:**
+- A plan's task asserts a fixture/golden/snapshot value while a higher-wave (or `depends_on`-later) plan is the one that commits/generates it
+- A plan asserts membership in an allowlist that a later plan is the one to add
+- Consumer and producer share no wave/`depends_on` edge that forces the producer first
+
+**Severity:** BLOCKER when a plan asserts against shared data that a later plan (by wave/dependency order) is the one to produce/commit. WARNING when producer and consumer are in the same wave with no explicit ordering edge.
+
+**Example — consumer precedes producer (BLOCKER):**
+```yaml
+issue:
+  dimension: cross_plan_data_contract_ordering
+  severity: blocker
+  description: "Plan 01 (wave 1) asserts the golden output in fixtures/selectors.json, but Plan 03 (wave 2) is the plan that generates and commits fixtures/selectors.json — Plan 01 asserts against data that does not yet exist"
+  plans: ["01", "03"]
+  artifact: "fixtures/selectors.json"
+  consumer: { plan: "01", wave: 1, action: "assert output matches fixtures/selectors.json" }
+  producer: { plan: "03", wave: 2, action: "generate + commit fixtures/selectors.json" }
+  fix_hint: "Move the producer (Plan 03) to an earlier wave than the consumer, or add depends_on so Plan 01 runs after Plan 03 commits the fixture"
+```
+
+## Dimension 9b: Canary/Negative-Test Allowlist Invariant
+
+**Question:** Does any plan newly allowlist a target that an earlier or sibling plan asserts is REFUSED — silently inverting a negative test from testing-refusal to passing-by-accident?
+
+**Process:**
+1. Scan all plans for negative/refusal tests — tasks asserting a target is REFUSED, NOT allowlisted, rejected, blocked, or deferred (a "deferral canary"). Look in `<acceptance_criteria>` and `<action>` for phrasing like "must reject", "not in allowlist", "asserts refusal", "expects deny/error".
+2. For each canary, record the target it guards (selector, address, chain, capability, path, flag).
+3. Scan every plan for tasks that ADD that same target to the allowlist / enable it / mark it supported.
+4. BLOCKER if any plan allowlists a target that a deferral canary asserts is refused: once allowlisted, the negative test passes because the target IS now allowed — it no longer tests refusal, so the canary silently dies without failing.
+
+**Red flags:**
+- "deny"/"refuse"/"not-allowlisted"/"deferred" assertion on a target + an "allowlist"/"enable"/"support" task on the same target across the plan set
+- A negative test whose subject becomes a positive capability later in the phase
+- Allowlist expansion with no paired update/removal of the canary that guarded the now-allowed target
+
+**Severity:** BLOCKER when a later plan allowlists a target an existing negative test asserts is refused (the canary inverts to passing-by-accident). WARNING when the allowlist change and the canary are in the same wave with no clear precedence.
+
+**Example — allowlisting kills a deferral canary (BLOCKER):**
+```yaml
+issue:
+  dimension: canary_allowlist_invariant
+  severity: blocker
+  description: "Plan 02 asserts chain 'arbitrum' is REFUSED (deferral canary), but Plan 04 adds 'arbitrum' to SUPPORTED_CHAINS — the Plan 02 negative test then passes by accident because arbitrum IS now allowed, silently no longer testing refusal"
+  plans: ["02", "04"]
+  target: "chain: arbitrum"
+  canary: { plan: "02", assertion: "send to arbitrum is rejected / not-allowlisted" }
+  allowlisting: { plan: "04", action: "add 'arbitrum' to SUPPORTED_CHAINS allowlist" }
+  fix_hint: "Update or remove the Plan 02 refusal canary in the same wave that allowlists arbitrum — convert it to a positive support assertion, or gate it behind the still-deferred set"
+```
+
 ## Dimension 10: CLAUDE.md Compliance
 
 **Question:** Do plans respect project-specific conventions, constraints, and requirements from CLAUDE.md?
@@ -1012,6 +1072,8 @@ Plan verification complete when:
 - [ ] Overall status determined (passed | issues_found)
 - [ ] Architectural tier compliance checked (tasks match responsibility map tiers)
 - [ ] Cross-plan data contracts checked (no conflicting transforms on shared data)
+- [ ] Cross-plan data-contract ordering checked (no plan asserts against shared data a later plan is the one to produce/commit)
+- [ ] Canary/negative-test allowlist invariant checked (no later plan allowlists a target an existing refusal canary asserts is refused)
 - [ ] External Encoding Contracts checked (plans consume pinned encodings, never recompute; returned-artifact incompatibilities have a typed-refusal design)
 - [ ] CLAUDE.md compliance checked (plans respect project conventions)
 - [ ] Structured issues returned (if any found)

@@ -36,13 +36,18 @@ const DEFAULT_BUDGET = 500;
 const XL_AGENTS = new Set([
   'gsd-debugger',
   'gsd-planner',
+  // gsd-plan-checker owns the full cross-plan verification rubric (12 numbered
+  // dimensions + sub-checks). Promoted LARGE→XL when #25 added the cross-plan
+  // data-contract-ordering (9a) and canary/allowlist-invariant (9b) dimensions
+  // atop group C's External Encoding Contracts sub-check — it was already at
+  // 1020 lines (over the 1000 LARGE budget) on the base.
+  'gsd-plan-checker',
 ]);
 
 const LARGE_AGENTS = new Set([
   'gsd-phase-researcher',
   'gsd-verifier',
   'gsd-doc-writer',
-  'gsd-plan-checker',
   'gsd-executor',
   'gsd-code-fixer',
   'gsd-codebase-mapper',
