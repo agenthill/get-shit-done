@@ -42,6 +42,11 @@ async function setupRepo(): Promise<string> {
   await writeFile(join(dir, '.planning', 'phases', '02-b', '02-PLAN.md'), plan('02-b', 'src/b.ts'));
   await writeFile(join(dir, '.planning', 'STATE.md'), 'status: ready\n');
   await writeFile(join(dir, '.planning', 'ROADMAP.md'), '### Phase 1: A\n### Phase 2: B\n');
+  // ADR 0014 D5 opt-in: phase_level:true is required by the runParallel gate.
+  await writeFile(
+    join(dir, '.planning', 'config.json'),
+    JSON.stringify({ parallelization: { enabled: true, phase_level: true } }),
+  );
   await git(['add', '-A']);
   await git(['commit', '-q', '--no-verify', '-m', 'base']);
   return dir;
@@ -503,6 +508,33 @@ describe('GSD.runParallel — schedule-validity guards + fail-closed wave loop (
       gsd.runParallel(['1', '2'], { openPullRequests: false }),
     ).rejects.toThrow(/D2 violation.*ROADMAP/);
   }, 8000);
+
+  // ─── phase_level gate falsifier (item 2, #24) ────────────────────────────
+  // FALSIFIER (W): if the gate is absent the call resolves instead of throwing.
+  // Verifies resolvePhaseLevelParallelism is wired into GSD.runParallel
+  // fail-closed (ADR 0014 D5 opt-in). A repo with no config.json (or one that
+  // explicitly sets phase_level:false) must cause runParallel to reject.
+  it('rejects when phase_level is false/unset — phase-level parallelism is opt-in (gate falsifier)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    // Overwrite the config written by setupRepo: explicitly disable phase_level.
+    // This exercises both the false and the "enabled but not phase_level" cases.
+    await writeFile(
+      join(dir, '.planning', 'config.json'),
+      JSON.stringify({ parallelization: { enabled: true, phase_level: false } }),
+    );
+    const gsd = new GSD({ projectDir: dir });
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry').mockImplementation(
+      async (phase: any) => ({ result: greenResult(phase.number), halted: false }),
+    );
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue(twoPhaseRoadmap()),
+    } as never);
+
+    await expect(
+      gsd.runParallel(['1', '2'], { openPullRequests: false }),
+    ).rejects.toThrow(/runParallel requires parallelization\.phase_level: true/);
+  });
 });
 
 /** Project-relative POSIX path of `abs` under `root` (for `git show <ref>:<rel>`). */
@@ -661,8 +693,9 @@ describe('ADR 0014 measure of success (release gate)', () => {
     // N's. The `^[0-9a-f]{40}$` shape match is always-true on any real repo and
     // the `has('47')` check is a D4 skip-path proxy, not D3. D3's actual binding
     // (wave N+1 forks off wave N's PROMOTED HEAD) is falsified by the dedicated
-    // tests: the local-promote D3 test (~line 134) and the multi-wave
-    // origin-sync Gap A test (~line 800). Kept here as cheap regression coverage.
+    // tests: 'captures a fresh base SHA per wave (D3): wave 1 forks off wave 0
+    // promotes' and 'fast-forwards local protected to origin between waves so wave
+    // 1 bases off wave 0 promoted output'. Kept here as cheap regression coverage.
     for (const [, sha] of baseShaByPhase) expect(sha).toMatch(/^[0-9a-f]{40}$/);
     // 47 was skipped (never ran) so it captured no base SHA — D4 skip-path proxy.
     expect(baseShaByPhase.has('47')).toBe(false);
@@ -683,9 +716,10 @@ describe('ADR 0014 measure of success (release gate)', () => {
     // no M1 wave member mutates an orchestrator-owned ledger, so this "no conflict
     // markers on protected" assertion is always-true within this run. The D2
     // tripwire's actual falsifier (a phase corrupts a ledger mid-wave → the run
-    // FAILS CLOSED) lives in the dedicated tests: the root-path tripwire (~line
-    // 212) and the workstream-scoped tripwire (~line 457). Kept here so a
-    // regression that DID let a marker through would still trip the gate.
+    // FAILS CLOSED) lives in the dedicated tests: 'fails closed when a phase
+    // mutates an orchestrator-owned ledger mid-wave (D2 tripwire)' and 'fires the
+    // D2 tripwire under a workstream when a phase corrupts the workstream ROADMAP'.
+    // Kept here so a regression that DID let a marker through would still trip the gate.
     const { stdout: roadmap } = await git(['show', 'HEAD:.planning/ROADMAP.md']);
     expect(roadmap).not.toMatch(/^<{7}[\s\S]*?^={7}$[\s\S]*?^>{7}/m);
 

@@ -31,7 +31,7 @@ const execFileAsync = promisify(execFile);
 import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo, PhaseFailureContext, ParallelRunnerOptions, ParallelRunnerResult } from './types.js';
 import { GSDEventType, PhaseStepType } from './types.js';
 import { parsePlan, parsePlanFile } from './plan-parser.js';
-import { loadConfig, resolveMaxConcurrentPhases } from './config.js';
+import { loadConfig, resolveMaxConcurrentPhases, resolvePhaseLevelParallelism } from './config.js';
 import { GSDTools, resolveGsdToolsPath } from './gsd-tools.js';
 import { runPlanSession } from './session-runner.js';
 import { buildExecutorPrompt, parseAgentTools } from './prompt-builder.js';
@@ -422,6 +422,12 @@ export class GSD {
   ): Promise<ParallelRunnerResult> {
     const tools = this.createTools();
     const config = await loadConfig(this.projectDir, this.workstream);
+    if (!resolvePhaseLevelParallelism(config)) {
+      throw new Error(
+        'runParallel requires parallelization.phase_level: true (phase-level parallelism is opt-in); ' +
+          'enable it in .planning/config.json',
+      );
+    }
     const maxPhaseAttempts = config.git?.sdk_max_phase_attempts ?? 5;
 
     // Resolve roadmap metadata once; the wave loop looks phases up by token. The
@@ -605,6 +611,14 @@ export class GSD {
    * base commit + protected ref are reachable from it. Deterministic path (keyed
    * by phase) so a crash-resume reattaches rather than leaking; a stale dir is
    * reaped best-effort before re-adding. Returns the worktree's absolute path.
+   *
+   * DELIBERATE DIVERGENCE from execution-engine.ts GitWorktreeManager (#24 item 3):
+   * this path uses raw `git worktree --detach` rather than GitWorktreeManager
+   * because GitWorktreeManager is branch-centric (`add -b <branch>`) and lacks
+   * (a) detached-HEAD-at-commit, (b) worktreeOpMutex serialization, and
+   * (c) the commondir/index.lock retry added in #22/#23 for per-phase orchestration.
+   * Consolidation is tracked in #24 item 3, gated on GitWorktreeManager gaining all
+   * three properties.
    */
   private async createPhaseWorktree(worktreeRoot: string, phase: RoadmapPhaseInfo): Promise<string> {
     const dir = join(worktreeRoot, `phase-${normalizePhaseName(phase.number)}`);

@@ -82,6 +82,11 @@ async function setupRepo(): Promise<string> {
   }
   await writeFile(join(dir, '.planning', 'STATE.md'), 'status: ready\n');
   await writeFile(join(dir, '.planning', 'ROADMAP.md'), '### Phase 1: A\n### Phase 2: B\n### Phase 3: C\n');
+  // ADR 0014 D5 opt-in: phase_level:true is required by the runParallel gate.
+  await writeFile(
+    join(dir, '.planning', 'config.json'),
+    JSON.stringify({ parallelization: { enabled: true, phase_level: true } }),
+  );
   await ensureCheckpointGitignore(dir);
   await git(['add', '-A']);
   await git(['commit', '-q', '--no-verify', '-m', 'base']);
