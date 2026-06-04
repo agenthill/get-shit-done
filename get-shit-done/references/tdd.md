@@ -134,6 +134,9 @@ After completion, create SUMMARY.md with:
 
 **No live network/RPC — mock at the client boundary; file-scoped + timeout:**
 When `<files>` or the SDK surface touches a network client (`WsProvider`, `Connection`, `Provider`, HTTP-RPC, or any socket), the test MUST: (a) mock at the client/registry/`Connection`/`Provider` construction boundary — never open a live socket; (b) be file-scoped (run only the new test file, e.g. `vitest run path/x.test.ts`); (c) carry an explicit per-run timeout.
+
+**Deterministic ENV-mode forcing — no ambient defaults:**
+When a task's behavior depends on an ENV-resolved global mode or flag, the test MUST force that mode deterministically in setup (`beforeEach` env override, restored in `afterEach`) rather than relying on the ambient/default value. Relying on the ambient default causes the test to pass locally but flip (e.g. `WRONG_MODE`) in CI where the default may differ.
 </test_quality>
 
 <framework_setup>
