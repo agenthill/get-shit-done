@@ -994,7 +994,7 @@ cat "$phase_dir"/*-DISCOVERY.md 2>/dev/null  # From mandatory discovery
 
 **If CONTEXT.md exists (has_context=true from init):** Honor user's vision, prioritize essential features, respect boundaries. Locked decisions — do not revisit.
 
-**If RESEARCH.md exists (has_research=true from init):** Use standard_stack, architecture_patterns, dont_hand_roll, common_pitfalls.
+**If RESEARCH.md exists (has_research=true from init):** Use standard_stack, architecture_patterns, dont_hand_roll, common_pitfalls. If it has `## External Encoding Contracts`, CONSUME its pinned `[VERIFIED]` encodings verbatim — never recompute them — and design the named typed-refusal for any returned-artifact marked incompatible with a frozen binding.
 
 **Architectural Responsibility Map sanity check:** If RESEARCH.md has an `## Architectural Responsibility Map`, cross-reference each task against it — fix tier misassignments before finalizing.
 </step>

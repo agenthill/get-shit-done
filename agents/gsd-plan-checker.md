@@ -367,6 +367,13 @@ issue:
 
 **Severity:** ALWAYS BLOCKER. Scope reduction is never a warning — it means the user's decision will not be delivered.
 
+**Sanctioned exception — pinned typed-refusal of a known-incompatible external direction:** A plan that ships an external direction as a documented TYPED-REFUSAL (rather than delivering it) is NOT illicit scope reduction WHEN, and only when, ALL of the following hold:
+1. RESEARCH.md `## External Encoding Contracts` pins the incompatibility with a `[VERIFIED]` returned-artifact-shape probe (the **trust source** — an actual probed sample, not an assumption), AND
+2. the incompatibility is against a FROZEN or invariant binding (one that cannot be relaxed without breaking a security/cryptographic invariant), AND
+3. the plan ships the refusal as an EXPLICIT typed refusal — a deliberate, surfaced outcome, not a silent omission or stub.
+
+When all three hold, do NOT flag the refusal under this dimension — it is a sanctioned honest-refusal outcome that the research authorized. If ANY condition is missing (no `[VERIFIED]` pin, the binding is not actually frozen, or the "refusal" is really a silent omission), the exception does NOT apply and the reduction is a BLOCKER as usual. The gate on the `[VERIFIED]` pin is what prevents this exception from being abused as a generic scope escape: only an incompatibility the research empirically probed can license the refusal.
+
 **Example:**
 ```yaml
 issue:
@@ -593,6 +600,40 @@ issue:
 
 1. **Hash prefix** — RESOLVED: Use "guest_contract:"
 2. **Cache TTL** — RESOLVED: 5 minutes with Redis
+```
+
+### External Encoding Contracts sub-check
+
+**Skip if:** RESEARCH.md has no `## External Encoding Contracts` section.
+
+**If the section exists, also verify the plans CONSUME the pinned contracts rather than re-deriving them:**
+
+1. Read the `## External Encoding Contracts` section and extract every pinned encoding (byte/selector value + its `[VERIFIED]` codegen pin source), every artifact-version mismatch flag, and every returned-artifact shape with its compatibility verdict.
+2. **Recompute check (BLOCKER):** For each pinned encoding, scan the plan tasks that touch that encoding. If a task RE-DERIVES the value (recomputes a discriminator/selector from a default formula such as `sha256("global:<ix>")`, regenerates an IDL/ABI under the host toolchain, or otherwise computes bytes the research already pinned) instead of consuming the pinned `[VERIFIED]` value, that is a BLOCKER. The plan MUST consume the pinned contract verbatim — recomputing reintroduces the silently-wrong-bytes vector the pin exists to close. An artifact-version mismatch flagged `YES` makes this mandatory: the plan must pin from the artifact's own codegen, never recompute under the host toolchain.
+3. **Returned-artifact incompatibility check (BLOCKER):** For each returned-artifact row whose compatibility verdict is `NO` against a frozen/invariant binding, verify the plan designs the conservative TYPED-REFUSAL the research named — the direction ships as an explicit refusal, not a stall and not a silent omission. A `NO`-verdict row with no typed-refusal design (and no implementing/refusing task) is a BLOCKER.
+
+**Example — recomputed encoding (BLOCKER):**
+```yaml
+issue:
+  dimension: research_resolution
+  severity: blocker
+  description: "Plan recomputes the deposit discriminator from sha256(\"global:deposit\") but RESEARCH External Encoding Contracts pins it [VERIFIED] from the SDK codegen — plan must consume the pinned value, not re-derive it"
+  plan: "03"
+  task: 1
+  pinned_value: "0xf2 0x23 … (from klend IDL codegen)"
+  plan_action: "compute discriminator via BorshInstructionCoder default"
+  fix_hint: "Replace the recompute with the pinned [VERIFIED] discriminator from RESEARCH ## External Encoding Contracts"
+```
+
+**Example — missing typed-refusal (BLOCKER):**
+```yaml
+issue:
+  dimension: research_resolution
+  severity: blocker
+  description: "RESEARCH pins the bridge inbound leg returns a v0 tx incompatible with the FROZEN legacy-only signing binding, but no plan task designs the typed-refusal fallback — the direction stalls instead of shipping an honest refusal"
+  plan: "02"
+  returned_shape: "[VERIFIED: v0 VersionedTransaction, byte-0 0xd3]"
+  fix_hint: "Add a task implementing the conservative typed-refusal named in RESEARCH ## External Encoding Contracts so the direction ships as an explicit refusal"
 ```
 
 ## Dimension 12: Pattern Compliance (#1861)
@@ -971,6 +1012,7 @@ Plan verification complete when:
 - [ ] Overall status determined (passed | issues_found)
 - [ ] Architectural tier compliance checked (tasks match responsibility map tiers)
 - [ ] Cross-plan data contracts checked (no conflicting transforms on shared data)
+- [ ] External Encoding Contracts checked (plans consume pinned encodings, never recompute; returned-artifact incompatibilities have a typed-refusal design)
 - [ ] CLAUDE.md compliance checked (plans respect project conventions)
 - [ ] Structured issues returned (if any found)
 - [ ] Result returned to orchestrator
