@@ -91,53 +91,19 @@ describe('checkAutoMode', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue #25 (gap 12) — auto-determination checkpoint FALSIFIER.
+// Issue #25 (gap 12) — auto-determination checkpoint falsifier.
 //
-// Three assertions that encode the two LOCKED design decisions. Each must FAIL
-// if its decision is mis-implemented. The checkpoint-resolution policy is the
-// behavioral contract documented in checkpoints.md / gsd-executor.md /
-// execute-phase.md; `resolveCheckpoint` below is the executable model of that
-// contract, gated on the resolver's `unattended` / `human_reachable` output —
-// the SINGLE trust source. If the policy ever proxied `auto_advance` as the
-// trust source, or defaulted `unattended` true, or auto-resolved a
-// `gate="blocking-human"` checkpoint, one of these assertions breaks.
+// Guards the real `checkAutoMode` flag-derivation contract: `unattended` is
+// the dedicated trust source, derived independently from `auto_advance`; and
+// `human_reachable` is its strict negation. These assertions exercise the
+// production module (check-auto-mode.ts) — mutating the `unattended` or
+// `human_reachable` derivation there breaks them.
+//
+// The checkpoint resolution ORDER (blocking-human halt → deterministic resolver
+// → unattended-gated fallback → else pause) is enforced in the prose handlers
+// (checkpoints.md / gsd-executor.md / execute-phase.md) — it is NOT in SDK
+// code and is NOT re-stated here.
 // ─────────────────────────────────────────────────────────────────────────────
-
-type CheckpointKind = 'human-verify' | 'human-action' | 'decision';
-interface Checkpoint {
-  kind: CheckpointKind;
-  /** Auth/security gate — NEVER auto-resolves, even when unattended. */
-  gate?: 'blocking' | 'blocking-human';
-  /** A deterministic resolver/criterion is available for this checkpoint. */
-  deterministicResolution?: 'approved' | 'done' | string | null;
-  /** Declared conservative safe/refusal branch. resolution="auto" requires it. */
-  fallback?: string | null;
-}
-type CheckpointOutcome =
-  | { action: 'resolve'; via: 'deterministic' | 'fallback'; response: string; continues: true }
-  | { action: 'halt'; reason: string; continues: false };
-
-/**
- * Executable model of the locked auto-determination checkpoint contract.
- * `unattended` is the resolver-derived trust source (NOT auto_advance).
- */
-function resolveCheckpoint(cp: Checkpoint, unattended: boolean): CheckpointOutcome {
-  // Decision 2 (LOCKED): a blocking-human auth/security gate NEVER auto-resolves
-  // — even when unattended it HALTS and defers to end-of-phase human UAT.
-  if (cp.gate === 'blocking-human') {
-    return { action: 'halt', reason: 'blocking-human gate — defer to human UAT', continues: false };
-  }
-  // (a) Resolve deterministically if a resolver/criterion is available.
-  if (cp.deterministicResolution != null) {
-    return { action: 'resolve', via: 'deterministic', response: cp.deterministicResolution, continues: true };
-  }
-  // (b) Else take the declared fallback — but ONLY when unattended. Otherwise
-  //     behave as today: pause/present to the human.
-  if (unattended && cp.fallback != null) {
-    return { action: 'resolve', via: 'fallback', response: cp.fallback, continues: true };
-  }
-  return { action: 'halt', reason: 'no deterministic resolution and a human is reachable', continues: false };
-}
 
 describe('auto-determination checkpoint policy (#25 gap 12 falsifier)', () => {
   let projectDir: string;
@@ -151,79 +117,43 @@ describe('auto-determination checkpoint policy (#25 gap 12 falsifier)', () => {
     await rm(projectDir, { recursive: true, force: true });
   });
 
-  // Assertion 1 — NO-HANG: unattended:true + non-security human checkpoint with
-  // a declared fallback and no deterministic resolution → resolves to the safe
-  // fallback and the phase CONTINUES (does not block/hang).
-  it('unattended + non-security checkpoint with fallback → resolves to fallback and continues', async () => {
+  // Assertion 1: unattended:true → checkAutoMode surfaces unattended=true and
+  // human_reachable=false (the two signals checkpoint consumers gate on).
+  it('workflow.unattended:true → unattended=true and human_reachable=false', async () => {
     await writeFile(
       join(projectDir, '.planning', 'config.json'),
       JSON.stringify({ workflow: { unattended: true } }),
       'utf-8',
     );
     const { data } = await checkAutoMode([], projectDir);
-    const unattended = (data as { unattended: boolean }).unattended;
-    expect(unattended).toBe(true);
-
-    const cp: Checkpoint = {
-      kind: 'human-verify',
-      gate: 'blocking',
-      deterministicResolution: null,
-      fallback: 'refuse: leave feature behind a default-off flag',
-    };
-    const outcome = resolveCheckpoint(cp, unattended);
-    expect(outcome.action).toBe('resolve');
-    expect(outcome).toMatchObject({ via: 'fallback', continues: true });
-    expect((outcome as { response: string }).response).toContain('refuse');
+    const d = data as { unattended: boolean; human_reachable: boolean };
+    expect(d.unattended).toBe(true);
+    expect(d.human_reachable).toBe(false);
   });
 
-  // Assertion 2 — AUTH GATE INVIOLABLE: unattended:true + gate="blocking-human"
-  // → still HALTS / defers (is NOT auto-resolved).
-  it('unattended + blocking-human gate → still HALTS, never auto-resolved', async () => {
-    await writeFile(
-      join(projectDir, '.planning', 'config.json'),
-      JSON.stringify({ workflow: { unattended: true } }),
-      'utf-8',
-    );
+  // Assertion 2: no unattended config → unattended=false and human_reachable=true.
+  it('default config (no unattended) → unattended=false and human_reachable=true', async () => {
     const { data } = await checkAutoMode([], projectDir);
-    const unattended = (data as { unattended: boolean }).unattended;
-    expect(unattended).toBe(true);
-
-    const authGate: Checkpoint = {
-      kind: 'human-action',
-      gate: 'blocking-human',
-      deterministicResolution: null,
-      // Even WITH a fallback present, the auth gate must not auto-resolve.
-      fallback: 'refuse',
-    };
-    const outcome = resolveCheckpoint(authGate, unattended);
-    expect(outcome.action).toBe('halt');
-    expect(outcome.continues).toBe(false);
-  });
-
-  // Assertion 3 — OPT-IN ONLY / NO REGRESSION: unattended:false (default) even
-  // with auto_advance ON → a human checkpoint still pauses for the human
-  // (auto-resolution does NOT fire; auto_advance is NOT the trust source).
-  it('auto_advance:true but unattended:false → human checkpoint still HALTS', async () => {
-    await writeFile(
-      join(projectDir, '.planning', 'config.json'),
-      JSON.stringify({ workflow: { auto_advance: true } }),
-      'utf-8',
-    );
-    const { data } = await checkAutoMode([], projectDir);
-    const d = data as { unattended: boolean; human_reachable: boolean; auto_advance: boolean };
-    // auto_advance on, but unattended NOT proxied from it.
-    expect(d.auto_advance).toBe(true);
+    const d = data as { unattended: boolean; human_reachable: boolean };
     expect(d.unattended).toBe(false);
     expect(d.human_reachable).toBe(true);
+  });
 
-    const cp: Checkpoint = {
-      kind: 'human-verify',
-      gate: 'blocking',
-      deterministicResolution: null,
-      fallback: 'refuse',
-    };
-    const outcome = resolveCheckpoint(cp, d.unattended);
-    expect(outcome.action).toBe('halt');
-    expect(outcome.continues).toBe(false);
+  // Assertion 3 — SECURITY-CRITICAL: auto_advance:true (and/or _auto_chain_active)
+  // with unattended unset → unattended MUST remain false. Fails if someone makes
+  // checkAutoMode derive `unattended` from `auto_advance` (wrong trust source).
+  it('auto_advance:true with unattended unset → unattended=false (auto_advance is NOT proxied as trust source)', async () => {
+    await writeFile(
+      join(projectDir, '.planning', 'config.json'),
+      JSON.stringify({ workflow: { auto_advance: true, _auto_chain_active: true } }),
+      'utf-8',
+    );
+    const { data } = await checkAutoMode([], projectDir);
+    const d = data as { unattended: boolean; human_reachable: boolean; auto_advance: boolean; auto_chain_active: boolean };
+    expect(d.auto_advance).toBe(true);
+    expect(d.auto_chain_active).toBe(true);
+    // The critical invariant: auto_advance/chain does NOT set unattended.
+    expect(d.unattended).toBe(false);
+    expect(d.human_reachable).toBe(true);
   });
 });
