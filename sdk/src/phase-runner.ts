@@ -744,13 +744,15 @@ export class PhaseRunner {
       // Supplement with plan-checker instructions
       prompt += '\n\n## Plan Checker Instructions\n\nYou are a plan checker. Review the plans for this phase and verify they are well-formed, complete, and achievable. If all plans pass, output "VERIFICATION PASSED". If any issues are found, output "ISSUES FOUND" followed by a description of each issue.';
 
-      planResult = await runPhaseStepSession(
-        prompt,
-        PhaseStepType.PlanCheck,
-        this.config,
-        sessionOpts,
-        this.eventStream,
-        { phase: PhaseType.Verify, planName: undefined },
+      planResult = await this.dispatchStepLeaf(() =>
+        runPhaseStepSession(
+          prompt,
+          PhaseStepType.PlanCheck,
+          this.config,
+          sessionOpts,
+          this.eventStream,
+          { phase: PhaseType.Verify, planName: undefined },
+        ),
       );
     } catch (err) {
       const durationMs = Date.now() - stepStart;
@@ -852,13 +854,15 @@ export class PhaseRunner {
       ].join('\n');
       prompt = selfDiscussOverride + prompt;
 
-      planResult = await runPhaseStepSession(
-        prompt,
-        PhaseStepType.Discuss,
-        this.config,
-        sessionOpts,
-        this.eventStream,
-        { phase: PhaseType.Discuss, planName: undefined },
+      planResult = await this.dispatchStepLeaf(() =>
+        runPhaseStepSession(
+          prompt,
+          PhaseStepType.Discuss,
+          this.config,
+          sessionOpts,
+          this.eventStream,
+          { phase: PhaseType.Discuss, planName: undefined },
+        ),
       );
     } catch (err) {
       const durationMs = Date.now() - stepStart;
@@ -907,6 +911,26 @@ export class PhaseRunner {
   }
 
   /**
+   * Route an INDIVIDUAL single-agent phase-step LEAF dispatch through the same
+   * agent budget runPlanDag uses for EXECUTE leaves (ADR 0014 D5 / issue #24
+   * item 1). A leaf acquires exactly ONE permit, awaits one query(), releases —
+   * so total concurrent single-agent phase-step agents across all concurrent
+   * phases are bounded by the process-wide globalCap, not just phaseSubCap.
+   *
+   * Deadlock-safety: this wraps ONLY a single leaf query() that acquires-and-
+   * releases around itself. It must NOT wrap EXECUTE (runPlanDag already
+   * acquires per-plan — a second wrap would hold-and-wait) nor a verify body
+   * whose gap-closure re-executes (the leaf permit is released before the
+   * nested execute fan-out runs). When parallelization is disabled, fall back to
+   * a private sequential Semaphore(1) so sequential single-phase runs stay
+   * behavior-equivalent — exactly mirroring runPlanDag's gate.
+   */
+  private async dispatchStepLeaf<T>(fn: () => Promise<T>): Promise<T> {
+    const semaphore = resolvePlanLevelParallel(this.config) ? getGlobalBudget() : new Semaphore(1);
+    return semaphore.run(fn);
+  }
+
+  /**
    * Run a single phase step session (discuss, research, plan).
    * Emits step start/complete events and captures errors.
    */
@@ -932,13 +956,15 @@ export class PhaseRunner {
       const contextFiles = await this.contextEngine.resolveContextFiles(phaseType);
       const prompt = await this.promptFactory.buildPrompt(phaseType, null, contextFiles);
 
-      planResult = await runPhaseStepSession(
-        prompt,
-        step,
-        this.config,
-        sessionOpts,
-        this.eventStream,
-        { phase: phaseType, planName: undefined },
+      planResult = await this.dispatchStepLeaf(() =>
+        runPhaseStepSession(
+          prompt,
+          step,
+          this.config,
+          sessionOpts,
+          this.eventStream,
+          { phase: phaseType, planName: undefined },
+        ),
       );
     } catch (err) {
       const durationMs = Date.now() - stepStart;
@@ -1712,13 +1738,19 @@ export class PhaseRunner {
         const contextFiles = await this.contextEngine.resolveContextFiles(phaseType);
         const prompt = await this.promptFactory.buildPrompt(phaseType, null, contextFiles);
 
-        lastResult = await runPhaseStepSession(
-          prompt,
-          PhaseStepType.Verify,
-          this.config,
-          sessionOpts,
-          this.eventStream,
-          { phase: phaseType },
+        // Acquire the leaf permit around JUST this verify query() and release it
+        // BEFORE the gap-closure execute (~runExecuteStep below) runs — the
+        // nested per-plan execute acquires its own permits, so holding a verify
+        // permit across it would hold-and-wait deadlock (issue #23 / #24 item 1).
+        lastResult = await this.dispatchStepLeaf(() =>
+          runPhaseStepSession(
+            prompt,
+            PhaseStepType.Verify,
+            this.config,
+            sessionOpts,
+            this.eventStream,
+            { phase: phaseType },
+          ),
         );
         allPlanResults.push(lastResult);
       } catch (err) {
