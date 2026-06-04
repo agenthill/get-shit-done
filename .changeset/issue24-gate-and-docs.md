@@ -1,6 +1,6 @@
 ---
 type: Fixed
-pr: 30
+pr: 31
 ---
 
 fix(sdk): enforce phase_level gate in runParallel + document raw-worktree divergence + refresh M1 hints (issue #24 items 2-4)
