@@ -1,6 +1,6 @@
 ---
 type: Changed
-pr: TBD
+pr: 26
 ---
 <!-- docs-exempt: prompt-template changes only — no user-facing API or SDK surface changed -->
 **Process-template hardening (PR-1 of issue #25, gaps 1/2/3/5/9):** Five directive additions to agent/command prompt files.
