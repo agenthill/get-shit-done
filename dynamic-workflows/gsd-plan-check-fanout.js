@@ -155,6 +155,12 @@ thunks.push(() => agent(
     `  cycles, missing/forward references, wave inconsistency (BLOCKER).\n` +
     `- Cross-Plan Data Contracts: incompatible transforms on a shared data entity\n` +
     `  with no preservation mechanism (BLOCKER), potential conflicts (WARNING).\n` +
+    `- Cross-Plan Data-Contract Ordering: a plan ASSERTS against shared data (fixture/\n` +
+    `  allowlist/golden/snapshot) that a LATER plan (by wave/depends_on) is the one to\n` +
+    `  produce/commit — asserting against data that does not yet exist (BLOCKER).\n` +
+    `- Canary/Negative-Test Allowlist Invariant: a LATER plan allowlists a target that\n` +
+    `  an existing refusal/negative test asserts is REFUSED, silently inverting the\n` +
+    `  canary to passing-by-accident (BLOCKER).\n` +
     `- Nyquist cross-plan: Wave-0 cross-reference for <automated>MISSING</automated>\n` +
     `  and sampling continuity across waves.\n` +
     `- Research Resolution: RESEARCH.md "## Open Questions" all resolved.\n` +

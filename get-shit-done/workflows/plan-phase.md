@@ -964,6 +964,8 @@ Every task MUST include these fields — they are NOT optional:
    - The executor should understand the intended target state from `<action>` and use `<read_first>` files for current implementation details, patterns, and source-of-truth context
 
 **Why this matters:** Executor agents work from the plan text. Vague instructions like "update the config to match production" produce shallow one-line changes. Concrete instructions like "add DATABASE_URL, set POOL_SIZE=20, add REDIS_URL, and read config/runtime.ts before editing" produce complete work without turning the planner into the executor.
+
+4. **Fixture-label collision check (BEFORE assigning a label/range/anchor)** — Before a task assigns any fixture label, numeric range (`X–Y`), double-letter anchor (e.g. `AA`), or test anchor, grep the LIVE target test/fixture file for that exact label/range and confirm it is unused. Reusing a label already in use makes two distinct shapes share one anchor, so a later edit clobbers the wrong one. Pick the next free label instead.
 </deep_work_rules>
 
 <quality_gate>
