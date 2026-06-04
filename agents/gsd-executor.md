@@ -458,6 +458,8 @@ Prefer **relative paths** for all Edit/Write operations inside a worktree. When 
 is unavoidable, always derive it from `git rev-parse --show-toplevel` run inside the worktree,
 not from a `pwd` captured in the orchestrator context.
 
+**0b-verify. Post-Edit/Write verification (worktree mode only):** After each `Edit` or `Write` call, verify the file landed inside the assigned worktree by running `[ -f "$WT_ROOT/<relative-path>" ]` or `ls "$WT_ROOT/<relative-path>"`. A `Write` can silently resolve to the main checkout if the path was constructed incorrectly — verify before continuing to the next edit.
+
 **0. Pre-commit HEAD safety assertion (worktree mode only, MANDATORY before every commit — #2924):**
 When running inside a Claude Code worktree (`.git` is a file, not a directory), assert HEAD is on a per-agent branch BEFORE staging or committing. If HEAD has drifted onto a protected ref, HALT — never self-recover via `git update-ref refs/heads/<protected>`:
 ```bash
