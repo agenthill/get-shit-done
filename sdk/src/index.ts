@@ -611,6 +611,14 @@ export class GSD {
    * base commit + protected ref are reachable from it. Deterministic path (keyed
    * by phase) so a crash-resume reattaches rather than leaking; a stale dir is
    * reaped best-effort before re-adding. Returns the worktree's absolute path.
+   *
+   * DELIBERATE DIVERGENCE from execution-engine.ts GitWorktreeManager (#24 item 3):
+   * this path uses raw `git worktree --detach` rather than GitWorktreeManager
+   * because GitWorktreeManager is branch-centric (`add -b <branch>`) and lacks
+   * (a) detached-HEAD-at-commit, (b) worktreeOpMutex serialization, and
+   * (c) the commondir/index.lock retry added in #22/#23 for per-phase orchestration.
+   * Consolidation is tracked in #24 item 3, gated on GitWorktreeManager gaining all
+   * three properties.
    */
   private async createPhaseWorktree(worktreeRoot: string, phase: RoadmapPhaseInfo): Promise<string> {
     const dir = join(worktreeRoot, `phase-${normalizePhaseName(phase.number)}`);
