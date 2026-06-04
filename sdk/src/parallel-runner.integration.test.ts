@@ -42,6 +42,11 @@ async function setupRepo(): Promise<string> {
   await writeFile(join(dir, '.planning', 'phases', '02-b', '02-PLAN.md'), plan('02-b', 'src/b.ts'));
   await writeFile(join(dir, '.planning', 'STATE.md'), 'status: ready\n');
   await writeFile(join(dir, '.planning', 'ROADMAP.md'), '### Phase 1: A\n### Phase 2: B\n');
+  // ADR 0014 D5 opt-in: phase_level:true is required by the runParallel gate.
+  await writeFile(
+    join(dir, '.planning', 'config.json'),
+    JSON.stringify({ parallelization: { enabled: true, phase_level: true } }),
+  );
   await git(['add', '-A']);
   await git(['commit', '-q', '--no-verify', '-m', 'base']);
   return dir;
@@ -503,6 +508,33 @@ describe('GSD.runParallel — schedule-validity guards + fail-closed wave loop (
       gsd.runParallel(['1', '2'], { openPullRequests: false }),
     ).rejects.toThrow(/D2 violation.*ROADMAP/);
   }, 8000);
+
+  // ─── phase_level gate falsifier (item 2, #24) ────────────────────────────
+  // FALSIFIER (W): if the gate is absent the call resolves instead of throwing.
+  // Verifies resolvePhaseLevelParallelism is wired into GSD.runParallel
+  // fail-closed (ADR 0014 D5 opt-in). A repo with no config.json (or one that
+  // explicitly sets phase_level:false) must cause runParallel to reject.
+  it('rejects when phase_level is false/unset — phase-level parallelism is opt-in (gate falsifier)', async () => {
+    const dir = await setupRepo();
+    dirs.push(dir);
+    // Overwrite the config written by setupRepo: explicitly disable phase_level.
+    // This exercises both the false and the "enabled but not phase_level" cases.
+    await writeFile(
+      join(dir, '.planning', 'config.json'),
+      JSON.stringify({ parallelization: { enabled: true, phase_level: false } }),
+    );
+    const gsd = new GSD({ projectDir: dir });
+    vi.spyOn(gsd as any, 'runPhaseWithRollbackRetry').mockImplementation(
+      async (phase: any) => ({ result: greenResult(phase.number), halted: false }),
+    );
+    vi.spyOn(gsd, 'createTools').mockReturnValue({
+      roadmapAnalyze: vi.fn().mockResolvedValue(twoPhaseRoadmap()),
+    } as never);
+
+    await expect(
+      gsd.runParallel(['1', '2'], { openPullRequests: false }),
+    ).rejects.toThrow(/runParallel requires parallelization\.phase_level: true/);
+  });
 });
 
 /** Project-relative POSIX path of `abs` under `root` (for `git show <ref>:<rel>`). */

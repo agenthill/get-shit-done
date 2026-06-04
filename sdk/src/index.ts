@@ -31,7 +31,7 @@ const execFileAsync = promisify(execFile);
 import type { GSDOptions, PlanResult, SessionOptions, GSDEvent, TransportHandler, PhaseRunnerOptions, PhaseRunnerResult, MilestoneRunnerOptions, MilestoneRunnerResult, RoadmapPhaseInfo, PhaseFailureContext, ParallelRunnerOptions, ParallelRunnerResult } from './types.js';
 import { GSDEventType, PhaseStepType } from './types.js';
 import { parsePlan, parsePlanFile } from './plan-parser.js';
-import { loadConfig, resolveMaxConcurrentPhases } from './config.js';
+import { loadConfig, resolveMaxConcurrentPhases, resolvePhaseLevelParallelism } from './config.js';
 import { GSDTools, resolveGsdToolsPath } from './gsd-tools.js';
 import { runPlanSession } from './session-runner.js';
 import { buildExecutorPrompt, parseAgentTools } from './prompt-builder.js';
@@ -422,6 +422,12 @@ export class GSD {
   ): Promise<ParallelRunnerResult> {
     const tools = this.createTools();
     const config = await loadConfig(this.projectDir, this.workstream);
+    if (!resolvePhaseLevelParallelism(config)) {
+      throw new Error(
+        'runParallel requires parallelization.phase_level: true (phase-level parallelism is opt-in); ' +
+          'enable it in .planning/config.json',
+      );
+    }
     const maxPhaseAttempts = config.git?.sdk_max_phase_attempts ?? 5;
 
     // Resolve roadmap metadata once; the wave loop looks phases up by token. The

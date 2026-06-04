@@ -47,6 +47,11 @@ async function setupRepo(): Promise<string> {
   await writeFile(join(dir, '.planning', 'phases', '02-b', '02-PLAN.md'), plan('02-b', 'src/b.ts'));
   await writeFile(join(dir, '.planning', 'STATE.md'), 'status: ready\n');
   await writeFile(join(dir, '.planning', 'ROADMAP.md'), '### Phase 1: A\n### Phase 2: B\n');
+  // ADR 0014 D5 opt-in: phase_level:true is required by the runParallel gate.
+  await writeFile(
+    join(dir, '.planning', 'config.json'),
+    JSON.stringify({ parallelization: { enabled: true, phase_level: true } }),
+  );
   await git(['add', '-A']);
   await git(['commit', '-q', '--no-verify', '-m', 'base']);
   return dir;
