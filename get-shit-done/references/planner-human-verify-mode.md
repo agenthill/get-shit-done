@@ -46,6 +46,8 @@ Set `gsd config-set workflow.human_verify_mode mid-flight` to restore the canoni
 
 Choose `mid-flight` when you genuinely need the work to stop before any subsequent task runs (e.g., the next task depends on visual confirmation of the previous one), and you accept the cold-start cost as the price of that hard barrier.
 
+When emitting a mid-flight `checkpoint:human-verify` / `checkpoint:human-action` that may run UNATTENDED, add the `resolution="auto"` attribute with a REQUIRED `<fallback>` so a background run self-resolves (deterministic `<resolver>` if available, else the conservative `<fallback>` when `workflow.unattended` is true) instead of hanging. NEVER on a `gate="blocking-human"` auth/security checkpoint. Full contract: @~/.claude/get-shit-done/references/checkpoints.md `<auto_determination>`.
+
 ## What is *not* affected
 
 `checkpoint:decision` and `checkpoint:human-action` tasks are still emitted in `end-of-phase` mode. Those gate the work itself (a choice the executor needs from the user, or an auth step only the user can perform), not post-hoc verification of completed work. Only `checkpoint:human-verify` is suppressed.
@@ -55,3 +57,4 @@ Choose `mid-flight` when you genuinely need the work to stop before any subseque
 - **`workflow.tdd_mode`**: orthogonal. TDD tasks still emit `tdd="true"` and `<behavior>`; the `<verify>` block carries the human-check sub-element when `human_verify_mode = end-of-phase`.
 - **`MVP_MODE`**: orthogonal. Vertical-slice ordering is unchanged. The first task remains a failing end-to-end test; later auto tasks may carry `<verify><human-check>` instead of standalone checkpoint tasks.
 - **`workflow.auto_advance` / `_auto_chain_active`**: in mid-flight mode these auto-approve checkpoint:human-verify halts. In end-of-phase mode there are no halts to auto-approve, so the flags have no effect on this code path.
+- **`workflow.unattended`**: orthogonal to `auto_advance`. It is the dedicated trust source (operator affirms NO human is reachable) gating the `resolution="auto"` fallback branch. Default false ⇒ no auto-determination, runs pause for humans as today. `gate="blocking-human"` checkpoints halt even when unattended.
